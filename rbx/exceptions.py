@@ -1,0 +1,2 @@
+class RBXException(Exception):
+    pass

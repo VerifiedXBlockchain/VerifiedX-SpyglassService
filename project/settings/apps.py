@@ -1,0 +1,30 @@
+# Installed Apps
+# https://docs.djangoproject.com/en/4.0/ref/settings/#installed-apps
+
+INSTALLED_APPS = [
+    "admin_auto_filters",
+    "admin_interface",
+    "colorfield",
+    "corsheaders",
+    "django_ace",
+    "django_filters",
+    "rest_framework",
+    "drf_yasg",
+    "rest_framework.authtoken",
+    "django.contrib.admin",
+    "django.contrib.auth",
+    "django.contrib.contenttypes",
+    "django.contrib.messages",
+    "django.contrib.sessions",
+    "django.contrib.staticfiles",
+    # "drf_api_logger",
+    "access.apps.AccessConfig",
+    "admin.apps.AdminConfig",
+    "admin.apps.CacheConfig",
+    "api.apps.ApiConfig",
+    "connect.apps.ConnectConfig",
+    "rbx.apps.RBXConfig",
+    "shop.apps.ShopConfig",
+    "payment.apps.PaymentConfig",
+    "btc.apps.BtcConfig",
+]

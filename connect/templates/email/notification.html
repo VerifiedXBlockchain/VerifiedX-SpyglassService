@@ -1,0 +1,45 @@
+{% extends "email/base.html" %}
+{% block body %}
+    <h1>Wallet {{ uuid }}</h1>
+    <table id="transaction">
+        <thead>
+        <th colspan="2">Transaction</th>
+        </thead>
+        <tr>
+            <td>Hash</td>
+            <td>{{ transaction.hash }}</td>
+        </tr>
+        <tr>
+            <td>Height</td>
+            <td>{{ transaction.height }}</td>
+        </tr>
+        <tr>
+            <td>Type</td>
+            <td>{{ transaction.type }}</td>
+        </tr>
+        <tr>
+            <td>To Address</td>
+            <td>{{ transaction.to_address }}</td>
+        </tr>
+        <tr>
+            <td>From Address</td>
+            <td>{{ transaction.from_address }}</td>
+        </tr>
+        <tr>
+            <td>Total Amount</td>
+            <td>{{ transaction.total_amount }}</td>
+        </tr>
+        <tr>
+            <td>Total Fee</td>
+            <td>{{ transaction.total_fee }}</td>
+        </tr>
+        <tr>
+            <td>Signature</td>
+            <td>{{ transaction.signature }}</td>
+        </tr>
+        <tr>
+            <td>Date Craft</td>
+            <td>{{ transaction.date_crafted }}</td>
+        </tr>
+    </table>
+{% endblock %}

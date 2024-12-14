@@ -1,0 +1,71 @@
+{% extends "email/base.html" %}
+{% block title %}{{ subject }}{%  endblock %}
+{% block body %}
+
+    <h4>Your purchase of {{nft.name}} from {{tx.from_address}} for {{ amount }} RBX has started.</h4>
+    <p>To complete the sale, you will need to sign the transaction.</p>
+
+    <p><a href="{{url}}">Click here</a> to launch the web wallet and finalize the transaction.</p>
+    <small><a href="{{url}}">{{url}}</a></small>
+
+    <p>Please note, if this is a <strong>Buy Now</strong> transaction and your web wallet is still open, it will attempt to complete this automatically.</p>
+
+    <h5>Sale Details:</h5>
+    
+    <table  class="content-table">
+        <tr>
+            <td>Name:</td>
+            <td>{{ nft.name }}</td>
+        </tr>
+        <tr>
+            <td>Description:</td>
+            <td>{{ nft.description }}</td>
+        </tr>
+        <tr>
+            <td>Amount:</td>
+            <td>{{ amount }} RBX</td>
+        </tr>
+    </table>
+
+
+    <h5>Transaction Details:</h5>
+    <table class="content-table">
+
+        <tr>
+            <td>Hash</td>
+            <td>{{ tx.hash }}</td>
+        </tr>
+        <tr>
+            <td>Height</td>
+            <td>{{ tx.height }}</td>
+        </tr>
+        <tr>
+            <td>Type</td>
+            <td>{{ tx.type }}</td>
+        </tr>
+        <tr>
+            <td>To Address</td>
+            <td>{{ tx.to_address }}</td>
+        </tr>
+        <tr>
+            <td>From Address</td>
+            <td>{{ tx.from_address }}</td>
+        </tr>
+        <tr>
+            <td>Total Amount</td>
+            <td>{{ tx.total_amount }}</td>
+        </tr>
+        <tr>
+            <td>Total Fee</td>
+            <td>{{ tx.total_fee }}</td>
+        </tr>
+        <tr>
+            <td>Signature</td>
+            <td>{{ tx.signature }}</td>
+        </tr>
+        <tr>
+            <td>Date Craft</td>
+            <td>{{ tx.date_crafted }}</td>
+        </tr>
+    </table>
+{% endblock %}

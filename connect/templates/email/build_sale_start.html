@@ -1,0 +1,33 @@
+{% extends "email/base.html" %}
+{% block title %}{{ subject }}{%  endblock %}
+{% block body %}
+
+{% if is_buy_now %}
+    <h4>A Buy Now request has been sent from {{address}} for {{name}} ({{amount}} RBX).</h4>
+{% else %}
+    <h4>Your auction for {{name}} has completed and was won by {{address}} for {{amount}} RBX.</h4>
+
+{% endif %}
+    <p><a href="{{url}}">Click here</a> to launch the web wallet and finalize the transaction.</p>
+    <small><a href="{{url}}">{{url}}</a></small>
+
+    <h5>Sale Details:</h5>
+    
+    <table  class="content-table">
+        <tr>
+            <td>Name:</td>
+            <td>{{ name }}</td>
+        </tr>
+        <tr>
+            <td>From:</td>
+            <td>{{ address }}</td>
+        </tr>
+        <tr>
+            <td>Amount:</td>
+            <td>{{ amount }} RBX</td>
+        </tr>
+    </table>
+
+
+ 
+{% endblock %}
