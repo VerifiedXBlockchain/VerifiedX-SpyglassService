@@ -6,12 +6,14 @@ from rest_framework.response import Response
 from django_filters.rest_framework import DjangoFilterBackend
 
 from api import exceptions
-from api.nft.serializers import NftSerializer
+from api.nft.serializers import NftSerializer, VerifyOwnershipSerializer
 from api.transaction.serializers import NftTransactionSerializer
 from api.nft.querysets import ALL_NFTS_QUERYSET
 from rbx.models import Nft
 
 from api.nft.filters import NftFilter
+
+from rbx.client import verify_nft_ownership
 
 
 class NftView(GenericAPIView):
@@ -28,6 +30,21 @@ class NftView(GenericAPIView):
 
 
 class NftListView(ListModelMixin, NftView):
+    def get(self, request, *args, **kwargs):
+        return self.list(request, *args, **kwargs)
+
+
+class NftMultipleAddressesListView(ListModelMixin, NftView):
+
+    def get_queryset(self):
+        addresses: str = self.kwargs.get("addresses", None)
+        if not addresses:
+            return []
+
+        address_list = addresses.split(",")
+
+        return ALL_NFTS_QUERYSET.filter(owner_address__in=address_list)
+
     def get(self, request, *args, **kwargs):
         return self.list(request, *args, **kwargs)
 
@@ -87,3 +104,18 @@ class NftHistoryView(GenericAPIView):
                 "results": serializer.data,
             }
         )
+
+
+class VerifyOwnershipView(GenericAPIView):
+
+    serializer_class = VerifyOwnershipSerializer
+
+    def post(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        signature = serializer.validated_data.get("signature")
+
+        verified = verify_nft_ownership(signature)
+
+        return Response({"verified": verified})

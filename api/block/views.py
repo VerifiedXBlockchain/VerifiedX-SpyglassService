@@ -30,7 +30,7 @@ class BlockView(GenericAPIView):
     filterset_fields = ["master_node"]
 
 
-@method_decorator(cache_request(settings.CACHE_TIMEOUT_MEDIUM), name="get")
+@method_decorator(cache_request(settings.CACHE_TIMEOUT_SHORT), name="get")
 class BlockListView(ListModelMixin, BlockView):
     def get(self, request, *args, **kwargs):
         return self.list(request, *args, **kwargs)
@@ -52,7 +52,7 @@ class BlockHashDetailView(RetrieveModelMixin, BlockView):
         return self.retrieve(request, *args, **kwargs)
 
 
-@method_decorator(cache_request(settings.CACHE_TIMEOUT_MEDIUM), name="get")
+@method_decorator(cache_request(settings.CACHE_TIMEOUT_SHORT), name="get")
 class BlockAddressView(ListModelMixin, GenericAPIView):
     serializer_class = BlockSerializer
     queryset = ALL_BLOCKS_QUERYSET

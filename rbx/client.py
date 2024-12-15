@@ -153,40 +153,47 @@ def get_smart_contract(identifier: str) -> Optional[dict]:
 
 
 def nft_data(payload: dict, *args) -> Optional[dict]:
-    url = join_url(SHOP_BASE_URL, f"txapi/txv1/GetNFTMintData/")
+    url = join_url(SHOP_BASE_URL, f"txapi/txv1/GetSCMintDeployData/")
 
     asset_urls = {}
 
-    primary_asset_url = payload["SmartContractAsset"]["Location"]
-    path = scp_up_url(primary_asset_url)
-    payload["SmartContractAsset"]["Location"] = path
-    asset_urls[payload["SmartContractAsset"]["Name"]] = primary_asset_url
+    if "SmartContractAsset" in payload and payload["SmartContractAsset"]:
+
+        primary_asset_url = payload["SmartContractAsset"]["Location"]
+        if primary_asset_url != "default":
+
+            path = scp_up_url(primary_asset_url)
+            payload["SmartContractAsset"]["Location"] = path
+            asset_urls[payload["SmartContractAsset"]["Name"]] = primary_asset_url
 
     if "Features" in payload:
         feature_i = 0
         for feature in payload["Features"]:
             if feature["FeatureName"] == 2:
-                assets = feature["FeatureFeatures"]
+                assets = feature["FeatureFeatures"] or []
                 asset_i = 0
                 for asset in assets:
                     asset_url = asset["Location"]
-                    path = scp_up_url(asset_url)
-                    payload["Features"][feature_i]["FeatureFeatures"][asset_i][
-                        "Location"
-                    ] = path
-                    asset_urls[asset["FileName"]] = asset_url
+                    if asset_url != "default":
+                        path = scp_up_url(asset_url)
+                        payload["Features"][feature_i]["FeatureFeatures"][asset_i][
+                            "Location"
+                        ] = path
+                        asset_urls[asset["FileName"]] = asset_url
 
                     asset_i += 1
             if feature["FeatureName"] == 0:
                 phases = feature["FeatureFeatures"]
                 asset_i = 0
                 for phase in phases:
-                    asset_url = phase["SmartContractAsset"]["Location"]
-                    path = scp_up_url(asset_url)
-                    payload["Features"][feature_i]["FeatureFeatures"][asset_i][
-                        "SmartContractAsset"
-                    ]["Location"] = path
-                    asset_urls[phase["SmartContractAsset"]["Name"]] = asset_url
+                    if "SmartContractAsset" in phase and phase["SmartContractAsset"]:
+                        asset_url = phase["SmartContractAsset"]["Location"]
+                        if asset_url != "default":
+                            path = scp_up_url(asset_url)
+                            payload["Features"][feature_i]["FeatureFeatures"][asset_i][
+                                "SmartContractAsset"
+                            ]["Location"] = path
+                            asset_urls[phase["SmartContractAsset"]["Name"]] = asset_url
 
                     asset_i += 1
 
@@ -453,6 +460,7 @@ def handle_raw_transaction(tx: dict, execute: bool = False) -> bool:
 
 # endregion
 
+
 # region Nfts
 def get_nft(id: str, *args) -> Tuple[dict, int]:
     url = join_url(SHOP_BASE_URL, f"/scapi/scv1/GetSmartContractData/{id}/")
@@ -467,7 +475,26 @@ def get_nft(id: str, *args) -> Tuple[dict, int]:
         return None
 
 
+def verify_nft_ownership(sig: str) -> bool:
+
+    url = join_url(SHOP_BASE_URL, f"/scapi/scv1/VerifyOwnership/{sig}")
+
+    response = requests.get(url)
+
+    print(url)
+    print(response.text)
+
+    try:
+        data = response.json()
+        if data["Success"] == True:
+            return True
+        return False
+    except:
+        return False
+
+
 # endregion
+
 
 # region Voting
 def get_topics() -> Optional[dict]:
@@ -697,7 +724,7 @@ def connect_to_shop(
 #     return False
 
 
-def _request_auction_data(listing_id: int, shop_url:str):
+def _request_auction_data(listing_id: int, shop_url: str):
     logging.info(f"Requesting auction data for listing {listing_id}")
 
     requests.get(
@@ -710,7 +737,8 @@ def _request_auction_data(listing_id: int, shop_url:str):
     time.sleep(0.25)
     requests.get(
         join_url(
-            SHOP_CRAWLER_BASE_URL, f"wsapi/WebShopV1/GetShopListingBids/{listing_id}/{settings.RBX_SHOP_CRAWLER_KEYPAIR_ADDRESS}/{shop_url}"
+            SHOP_CRAWLER_BASE_URL,
+            f"wsapi/WebShopV1/GetShopListingBids/{listing_id}/{settings.RBX_SHOP_CRAWLER_KEYPAIR_ADDRESS}/{shop_url}",
         )
     )
     time.sleep(0.25)
@@ -948,3 +976,71 @@ def _check_if_bid_is_received(bid: Bid, attempt: int = 0):
 
 
 # endregion
+
+# region BTC
+
+
+def get_vbtc_compile_data(rbx_address: str):
+
+    url = join_url(BASE_URL, f"btcapi/BTCV2/GetTokenizationDetails/{rbx_address}")
+    response = requests.get(url)
+    data = response.json()
+    if "Success" in data and data["Success"] == True:
+        return {
+            "SmartContractUID": data["SmartContractUID"],
+            "DepositAddress": data["DepositAddress"],
+            "PublicKeyProofs": data["ProofJson"],
+        }
+
+    return None
+
+
+def get_default_vbtc_base64_image_data():
+    url = join_url(BASE_URL, f"btcapi/BTCV2/GetDefaultImageBase")
+    response = requests.get(url)
+    data = response.json()
+    if "Success" in data and data["Success"] == True:
+        return data["ImageBase"]
+
+    return None
+
+
+# endregion
+
+
+# region Testnet Faucet
+
+
+def send_testnet_funds(from_address: str, to_address: str, amount: Decimal):
+
+    if settings.FAUCET_ENABLED:
+        url = join_url(
+            BASE_URL, f"api/V1/SendTransaction/{from_address}/{to_address}/{amount}"
+        )
+        response = requests.get(url)
+
+        text = response.text
+
+        if text == "FAIL":
+            return None
+
+        if text == "This is not a valid RBX address to send to. Please verify again.":
+            return None
+
+        hash = text.replace("Success! TxId: ", "")
+        return hash
+
+    return None
+
+
+# endregion
+
+
+def withdraw_btc(payload: dict):
+
+    url = join_url(BASE_URL, f"btcapi/btcv2/WithdrawalCoinRawTX")
+    response = requests.post(url, json=payload)
+
+    data = response.json()
+    print(data)
+    return data

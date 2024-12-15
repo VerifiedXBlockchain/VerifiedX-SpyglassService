@@ -1,3 +1,4 @@
+bitmart-python-sdk-api==2.2.0
 boto3==1.26.102
 celery==5.3.1
 dj-database-url==0.5.0
@@ -10,6 +11,7 @@ django-colorfield==0.7.1
 django-cors-headers==3.13.0
 django-environ==0.9.0
 django-filter==21.1
+django_phonenumber_field==7.3.0
 django-redis==5.2.0
 django==4.0.5
 djangorestframework==3.13.1
@@ -22,6 +24,7 @@ moviepy==1.0.3
 paramiko==2.11.0
 pdf2image==1.16.3
 Pillow==9.1.1
+phonenumbers==8.13.36
 psycopg2-binary==2.9.3
 pytz==2022.1
 python-dateutil==2.8.2

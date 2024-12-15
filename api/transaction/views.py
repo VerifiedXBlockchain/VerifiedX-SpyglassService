@@ -65,6 +65,23 @@ class TransactionQueryListView(ListModelMixin, TransactionView):
         return self.list(request, *args, **kwargs)
 
 
+@method_decorator(cache_request(settings.CACHE_TIMEOUT_SHORT), name="get")
+class TransactionMultiAddressListView(ListModelMixin, TransactionView):
+    def get_queryset(self):
+        addresses: str = self.kwargs.get("addresses", None)
+        if not addresses:
+            return []
+
+        address_list = addresses.split(",")
+
+        return Transaction.objects.filter(
+            Q(to_address__in=address_list) | Q(from_address__in=address_list)
+        )
+
+    def get(self, request, *args, **kwargs):
+        return self.list(request, *args, **kwargs)
+
+
 # @method_decorator(cache_request(settings.CACHE_TIMEOUT_SHORT), name="get")
 # class TransactionAddressView(ListModelMixin, GenericAPIView):
 

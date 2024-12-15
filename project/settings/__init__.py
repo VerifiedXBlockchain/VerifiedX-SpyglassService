@@ -5,6 +5,7 @@ from .apps import *
 from .auth import *
 from .btc import *
 from .cache import *
+from .cmc import *
 from .cors import *
 from .database import *
 from .develop import *
@@ -22,4 +23,5 @@ from .sms import *
 from .storage import *
 from .templates import *
 from .urls import *
+from .socket import *
 from .worker import *

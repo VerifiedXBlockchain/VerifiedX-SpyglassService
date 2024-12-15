@@ -25,14 +25,15 @@ deploy_testnet:
 	heroku git:remote -a rbx-explorer-service-testnet && git push heroku testnet:main
 
 shell_main:
-	heroku run bash -a rbx-explorer-service
+	porter app run rbx-explorer-mainnet -- bash
 
 shell_testnet:
-	heroku run bash -a rbx-explorer-service-testnet
+	porter app run rbx-explorer-testnet -e -- bash
 
 run_cli:
-	/Applications/RBXWallet.app/Contents/Resources/RBXCore/ReserveBlockCore enableapi
+	/Applications/VFXWallet.app/Contents/Resources/RBXCore/ReserveBlockCore enableapi
 
 
 wal_testnet:
-	ssh root@164.92.105.169
+	ssh root@159.203.76.174
+

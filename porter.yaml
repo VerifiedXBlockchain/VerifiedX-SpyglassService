@@ -7,8 +7,8 @@ services:
   - name: worker
     type: worker
     run: "celery --app=project worker --without-heartbeat --without-gossip --without-mingle --loglevel=INFO" 
-  - name: beat
-    type: job
+  - name: runner
+    type: worker
     run: "celery --app=project beat --loglevel=INFO"
 
 predeploy:

@@ -177,3 +177,21 @@ class BeaconAssetsView(GenericAPIView):
             return Response({"success": True}, status=status.HTTP_200_OK)
 
         return Response({}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+class WithdrawVbtcView(GenericAPIView):
+
+    def post(self, request, *args, **kwargs):
+        data = request.data
+
+        result = client.withdraw_btc(data)
+
+        if result:
+            return Response(
+                {"success": True, "result": result}, status=status.HTTP_200_OK
+            )
+
+        return Response(
+            {"success": False, result: None},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
