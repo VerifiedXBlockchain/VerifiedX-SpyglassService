@@ -77,6 +77,9 @@ def lifetime_balance(request):
 
 @api_view(("GET",))
 def applications(request):
+
+    is_testnet = settings.ENVIRONMENT == "testnet"
+
     gui_tag = "beta4.0.3"
     gui_url = f"https://github.com/ReserveBlockIO/rbx-wallet-gui/releases/tag/{gui_tag}"
 
@@ -87,9 +90,11 @@ def applications(request):
 
     snapshot_url = (
         "https://github.com/VerifiedXBlockchain/VerifiedX-Snapshot/releases/download/snapshot1/VFX_TESTNET_snapshot_12_17_2024_19_20_UTC.zip"
-        if settings.ENVIRONMENT == "testnet"
+        if is_testnet
         else "https://github.com/VerifiedXBlockchain/VerifiedX-Snapshot/releases/download/snapshot1/VFX_MAINNET_snapshot_12_17_2024_19_20_UTC.zip"
     )
+
+    snapshot_height = 212050 if is_testnet else 2990776
 
     data = {
         "gui": {
@@ -105,7 +110,7 @@ def applications(request):
             "date": "2023-11-25",
         },
         "snapshot": {
-            "height": 1649720,
+            "height": snapshot_height,
             "url": snapshot_url,
             "date": "2023-06-11",
         },
