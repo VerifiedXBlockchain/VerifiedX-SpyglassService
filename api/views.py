@@ -6,6 +6,7 @@ from rest_framework.decorators import api_view
 from rest_framework.response import Response
 from rbx.models import Circulation, NetworkMetrics
 from rbx.tasks import sync_circulation, sync_network_metrics
+from django.conf import settings
 
 
 @api_view(("GET",))
@@ -84,7 +85,11 @@ def applications(request):
         f"https://github.com/ReserveBlockIO/ReserveBlock-Core/releases/tag/{cli_tag}"
     )
 
-    snapshot_url = "https://github.com/ReserveBlockIO/ReserveBlockSnapshot/releases/download/snap12/rbx_snapshot_11_25_2023.zip"
+    snapshot_url = (
+        "https://github.com/VerifiedXBlockchain/VerifiedX-Snapshot/releases/download/snapshot1/VFX_TESTNET_snapshot_12_17_2024_19_20_UTC.zip"
+        if settings.ENVIRONMENT == "testnet"
+        else "https://github.com/VerifiedXBlockchain/VerifiedX-Snapshot/releases/download/snapshot1/VFX_MAINNET_snapshot_12_17_2024_19_20_UTC.zip"
+    )
 
     data = {
         "gui": {
