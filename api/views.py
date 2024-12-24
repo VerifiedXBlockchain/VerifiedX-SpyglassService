@@ -89,7 +89,7 @@ def applications(request):
     )
 
     snapshot_url = (
-        "https://github.com/VerifiedXBlockchain/VerifiedX-Snapshot/releases/download/snapshot1/VFX_TESTNET_snapshot_12_17_2024_19_20_UTC.zip"
+        None
         if is_testnet
         else "https://github.com/VerifiedXBlockchain/VerifiedX-Snapshot/releases/download/snapshot1/VFX_MAINNET_snapshot_12_17_2024_19_20_UTC.zip"
     )
