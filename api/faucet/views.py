@@ -90,7 +90,7 @@ class RequestFaucetFundsView(GenericAPIView):
                 status=400,
             )
 
-        verification = send_verification_code(phone.as_e1654)
+        verification = send_verification_code(phone.as_e164)
 
         print(verification)
 
