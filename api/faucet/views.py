@@ -127,7 +127,7 @@ class VerifiyFaucetFundsView(GenericAPIView):
         #     return Response({"message": "Invalid verification code"}, status=400)
 
         is_verified = check_verification_code(
-            withdrawl_request.phone, verification_code
+            withdrawl_request.phone.as_e164, verification_code
         )
 
         if not is_verified:

@@ -4,11 +4,6 @@ from twilio.rest import Client
 client = Client(settings.TWILIO_ACCOUNT_SID, settings.TWILIO_AUTH_TOKEN)
 
 
-print(settings.TWILIO_ACCOUNT_SID)
-print(settings.TWILIO_AUTH_TOKEN)
-print(settings.TWILIO_VERIFY_SID)
-
-
 def send_sms(phone, body):
     return client.messages.create(to=phone, from_="+16473603707", body=body)
 
