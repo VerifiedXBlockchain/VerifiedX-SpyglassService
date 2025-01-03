@@ -11,7 +11,7 @@ from rbx.client import send_testnet_funds
 from rbx.models import Address, FaucetWithdrawlRequest, Transaction
 from django.db.models import Sum
 from project.utils.string import get_random_string
-from rbx.sms import send_sms
+from rbx.sms import check_verification_code, send_sms, send_verification_code
 
 MAX_AMOUNT = Decimal("100")
 MIN_AMOUNT = Decimal("0.0001")
@@ -90,19 +90,15 @@ class RequestFaucetFundsView(GenericAPIView):
                 status=400,
             )
 
-        # verification_code = get_random_string("0123456789", 6)
-        verification_code = "1234"
+        verification = send_verification_code(phone.as_e1654)
+
+        print(verification)
 
         withdrawl_request = FaucetWithdrawlRequest.objects.create(
             address=address,
             amount=amount,
             phone=phone,
-            verification_code=verification_code,
         )
-
-        body = f"VFX Verification Code: {verification_code}"
-        # send_sms(phone.as_e164, body)
-        print(verification_code)
 
         return Response(
             {"message": "Verification Required.", "uuid": str(withdrawl_request.uuid)},
@@ -130,6 +126,16 @@ class VerifiyFaucetFundsView(GenericAPIView):
         # if verification_code != withdrawl_request.verification_code:
         #     return Response({"message": "Invalid verification code"}, status=400)
 
+        is_verified = check_verification_code(
+            withdrawl_request.phone, verification_code
+        )
+
+        if not is_verified:
+            return Response({"message": "Invalid verification code"}, status=400)
+
+        withdrawl_request.is_verified = True
+        withdrawl_request.save()
+
         if withdrawl_request.transaction_hash:
             return Response(
                 {
@@ -147,7 +153,6 @@ class VerifiyFaucetFundsView(GenericAPIView):
         if hash:
 
             withdrawl_request.transaction_hash = hash
-            withdrawl_request.is_verified = True
             withdrawl_request.save()
             return Response(
                 {"message": "Funds requested successfully.", "hash": hash}, status=200

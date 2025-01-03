@@ -796,7 +796,6 @@ class FaucetWithdrawlRequest(models.Model):
     address = models.CharField(max_length=64)
     amount = models.DecimalField(default=0.0, decimal_places=16, max_digits=32)
     phone = PhoneNumberField()
-    verification_code = models.CharField(max_length=6)
     is_verified = models.BooleanField(default=False)
     transaction_hash = models.CharField(max_length=255, blank=True, null=True)
 
