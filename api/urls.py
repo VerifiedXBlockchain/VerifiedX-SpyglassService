@@ -29,6 +29,7 @@ urlpatterns = [
     path("circulation/circulating/", circulation_balance),
     path("applications/", applications),
     path("network-metrics/", network_metrics),
+    path("metrics/", include("api.metrics.urls")),
 ]
 
 if settings.FAUCET_ENABLED:

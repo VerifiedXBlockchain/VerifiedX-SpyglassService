@@ -1,0 +1,58 @@
+from decimal import Decimal
+from rest_framework import status
+from rest_framework.generics import GenericAPIView
+from rest_framework.mixins import RetrieveModelMixin, ListModelMixin
+from rest_framework.permissions import AllowAny
+from rest_framework.response import Response
+
+from api import exceptions
+from api.transaction.serializers import TransactionSerializer
+from api.transaction.querysets import ALL_TRANSACTIONS_QUERYSET
+from rbx.models import Transaction, Block, MasterNode
+from django.conf import settings
+from django.db.models import Q, Sum, F
+from django.utils.decorators import method_decorator
+from api.decorators import cache_request
+
+
+class NetworkMetricsView(GenericAPIView):
+
+    def get(self, request, *args, **kwargs):
+
+        data = {
+            "latest_block": Block.objects.all().count(),
+            "total_transactions": Transaction.objects.all().count(),
+            "active_validators": MasterNode.objects.filter(is_active=True).count(),
+            "block_time": 10 * 1000,  # TODO: make dynamic?
+        }
+
+        # burned fees
+        query = Transaction.objects.all().aggregate(Sum("total_fee"))
+        fees = Decimal(query["total_fee__sum"])
+
+        # adnr
+        query = Transaction.objects.filter(type=Transaction.Type.ADDRESS).aggregate(
+            Sum("total_amount")
+        )
+        adnr_burned_sum = Decimal(query["total_amount__sum"])
+
+        # decshop
+        query = Transaction.objects.filter(
+            type=Transaction.Type.DST_REGISTRATION
+        ).aggregate(Sum("total_amount"))
+        dst_burned_sum = Decimal(query["total_amount__sum"])
+
+        data["total_burned"] = fees + adnr_burned_sum + dst_burned_sum
+
+        # circulating supply
+        query = Transaction.objects.filter(height=0).aggregate(Sum("total_amount"))
+        total = Decimal(query["total_amount__sum"])
+
+        block_count = Block.objects.count()
+        total = total + (Decimal(32.0) * block_count)
+
+        total = total - fees - adnr_burned_sum - dst_burned_sum
+
+        data["circulating_supply"] = total
+
+        return Response(data, status=200)
