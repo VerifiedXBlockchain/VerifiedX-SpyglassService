@@ -15,6 +15,7 @@ from django.utils.decorators import method_decorator
 from api.decorators import cache_request
 
 
+@method_decorator(cache_request(settings.CACHE_TIMEOUT_SHORT), name="get")
 class NetworkMetricsView(GenericAPIView):
 
     def get(self, request, *args, **kwargs):
