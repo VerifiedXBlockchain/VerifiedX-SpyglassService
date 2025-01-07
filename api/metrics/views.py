@@ -49,10 +49,12 @@ class NetworkMetricsView(GenericAPIView):
         query = Transaction.objects.filter(height=0).aggregate(Sum("total_amount"))
         total = Decimal(query["total_amount__sum"])
 
-        block_count = Block.objects.count()
-        total = total + (Decimal(32.0) * block_count)
+        rewards = Transaction.objects.filter(from_address="Coinbase_BlkRwd").aggregate(
+            Sum("total_amount")
+        )
+        rewards_total = Decimal(rewards["total_amount__sum"])
 
-        total = total - fees - adnr_burned_sum - dst_burned_sum
+        total = total - fees - adnr_burned_sum - dst_burned_sum + rewards_total
 
         data["circulating_supply"] = total
 
