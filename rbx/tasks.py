@@ -234,24 +234,24 @@ def sync_block(height: int) -> None:
             )
             from_address.save()
 
-        if block_created:
-            b = None
-            try:
-                b = Block.objects.get(height=block.height)
-            except Block.DoesNotExist:
-                pass
-            if b:
+    if block_created:
+        b = None
+        try:
+            b = Block.objects.get(height=block.height)
+        except Block.DoesNotExist:
+            pass
+        if b:
 
-                socket_payload = json.dumps(
-                    {
-                        "type": "new_block",
-                        "data": BlockSerializer(b).data,
-                        "message": f"block {b.height}",
-                    },
-                    cls=DecimalEncoder,
-                )
+            socket_payload = json.dumps(
+                {
+                    "type": "new_block",
+                    "data": BlockSerializer(b).data,
+                    "message": f"block {b.height}",
+                },
+                cls=DecimalEncoder,
+            )
 
-                notify_socket_service(socket_payload)
+            notify_socket_service(socket_payload)
 
     end = time.time()
     logging.info(f"Synchronized Block {height} [elapsed: {end - start}]")
