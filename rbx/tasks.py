@@ -1211,11 +1211,12 @@ def notify_socket_service(payload: dict):
 
     if settings.SOCKET_BASE_URL and settings.SOCKET_TOKEN:
 
+        payload["api_key"] = settings.SOCKET_TOKEN
+
         requests.post(
             f"{settings.SOCKET_BASE_URL}/event/",
             data=payload,
             headers={
-                "Authorization": f"Bearer {settings.SOCKET_TOKEN}",
                 "Content-Type": "application/json",
             },
         )
