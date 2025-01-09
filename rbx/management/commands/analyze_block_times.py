@@ -7,7 +7,7 @@ from django.utils.timezone import now
 class Command(BaseCommand):
 
     def handle(self, *args, **options):
-        time_threshold = now() - timedelta(hours=2)
+        time_threshold = now() - timedelta(hours=6)
 
         blocks = Block.objects.filter(date_crafted__gte=time_threshold).order_by(
             "date_crafted"
@@ -18,7 +18,7 @@ class Command(BaseCommand):
             time_diff = (
                 blocks[i].date_crafted - blocks[i - 1].date_crafted
             ).total_seconds()
-            if time_diff > 60:
+            if time_diff > 30:
                 gaps.append(
                     {
                         "start_block": blocks[i - 1],

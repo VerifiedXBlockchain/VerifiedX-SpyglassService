@@ -832,6 +832,10 @@ class FungibleToken(models.Model):
 
     def get_address_balance(self, address):
 
+        initial_supply_owned = Decimal(0)
+        if self.initial_supply > Decimal(0) and address == self.owner_address:
+            initial_supply_owned = self.initial_supply
+
         minted = FungibleTokenTx.objects.filter(
             token=self,
             type=FungibleTokenTx.Type.MINT,
@@ -861,7 +865,8 @@ class FungibleToken(models.Model):
         transferred_from_amount = transferred_from["amount__sum"] or Decimal(0)
 
         return (
-            minted_amount
+            initial_supply_owned
+            + minted_amount
             + transferred_to_amount
             - burned_amount
             - transferred_from_amount
