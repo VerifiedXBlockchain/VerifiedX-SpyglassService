@@ -403,6 +403,7 @@ def process_transaction(tx: Transaction):
                         token.image_url = token_info["TokenImageURL"]
                         token.image_base64 = token_info["TokenImageBase"]
                         token.owner_address = tx.from_address
+                        token.original_owner_address = tx.from_address
 
                         token.save()
 

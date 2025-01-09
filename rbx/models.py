@@ -812,6 +812,7 @@ class FungibleToken(models.Model):
     name = models.CharField(max_length=64)
     ticker = models.CharField(max_length=64)
     owner_address = models.CharField(max_length=64)
+    original_owner_address = models.CharField(max_length=64)
 
     smart_contract = models.ForeignKey(Nft, on_delete=models.CASCADE)
     create_transaction = models.ForeignKey(Transaction, on_delete=models.CASCADE)
@@ -833,7 +834,7 @@ class FungibleToken(models.Model):
     def get_address_balance(self, address):
 
         initial_supply_owned = Decimal(0)
-        if self.initial_supply > Decimal(0) and address == self.owner_address:
+        if self.initial_supply > Decimal(0) and address == self.original_owner_address:
             initial_supply_owned = self.initial_supply
 
         minted = FungibleTokenTx.objects.filter(
@@ -895,7 +896,7 @@ class FungibleToken(models.Model):
         total_minted_amount = total_minted["amount__sum"] or Decimal(0)
         total_burned_amount = total_burned["amount__sum"] or Decimal(0)
 
-        return total_minted_amount - total_burned_amount
+        return self.initial_supply + total_minted_amount - total_burned_amount
 
 
 class FungibleTokenTx(models.Model):
