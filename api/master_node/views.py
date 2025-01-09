@@ -100,20 +100,6 @@ class SendMasterNodesView(ListModelMixin, CreateModelMixin, GenericAPIView):
 
         print("SendMasterNodesView")
 
-        if settings.RBX_SEND_MASTER_NODES_REQUIRES_WHITELIST:
-            ips = settings.RBX_SEND_MASTER_NODES_WHITELIST
-
-            ip = get_client_ip_address(request)
-
-            if ip not in ips:
-                print("--------------")
-                print("IP ADDRESS NOT WHITE LISTED:")
-                print(ip)
-                print("--------------")
-                return Response(
-                    {"success": False, "message": "Not Authorized"}, status=403
-                )
-
         try:
             data = self.request.data
 
