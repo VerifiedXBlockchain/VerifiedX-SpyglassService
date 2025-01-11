@@ -12,4 +12,3 @@ services:
     run: "celery --app=project beat --loglevel=INFO"
 # predeploy:
 #   run: "python manage.py migrate"
-
