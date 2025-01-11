@@ -964,9 +964,11 @@ def sync_circulation():
     amount = query["total_amount__sum"]
     total = amount
 
-    # plus 32 rbx per block
-    block_count = Block.objects.count()
-    total = total + (Decimal(32.0) * block_count)
+    rewards = Transaction.objects.filter(from_address="Coinbase_BlkRwd").aggregate(
+        Sum("total_amount")
+    )
+
+    total = total + Decimal(rewards["total_amount__sum"])
 
     # burn fees
     query = Transaction.objects.all().aggregate(Sum("total_fee"))
@@ -991,13 +993,13 @@ def sync_circulation():
     active_master_nodes = MasterNode.objects.filter(is_active=True).count()
     total_master_nodes = MasterNode.objects.all().count()
 
-    stake = active_master_nodes * 12000
+    stake = active_master_nodes * 50000
     total_addresses = Address.objects.all().count()
 
     total_burned = fees + adnr_burned_sum + dst_burned_sum
 
     circulation.balance = total
-    circulation.lifetime_supply = Decimal(372000000) - total_burned
+    circulation.lifetime_supply = Decimal(200000000) - total_burned
     circulation.fees_burned_sum = total_burned
     circulation.fees_burned = fees_burned
     circulation.total_staked = stake
