@@ -30,7 +30,7 @@ class Command(BaseCommand):
                     bid.save()
                     continue
 
-                balance = a.get_balance()
+                balance, _, __ = a.get_balance()
 
                 if balance < amount:
                     print("Balance is less than bid amount. Cancelling bid.")

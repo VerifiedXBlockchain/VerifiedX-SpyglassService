@@ -13,4 +13,6 @@ class AdnrSerializer(serializers.ModelSerializer):
             "address",
             "domain",
             "create_transaction",
+            "is_btc",
+            "btc_address",
         ]

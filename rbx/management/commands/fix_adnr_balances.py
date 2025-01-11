@@ -18,7 +18,7 @@ class Command(BaseCommand):
                 print("Address not found")
                 continue
 
-            b = address.get_balance()
+            b, _, __ = address.get_balance()
             address.balance = b
 
             address.save()

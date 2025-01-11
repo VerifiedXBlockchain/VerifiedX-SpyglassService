@@ -1,3 +1,5 @@
+import base64
+import gzip
 from django.conf import settings
 from django.contrib.gis.geoip2 import GeoIP2
 from django.core.cache import cache
@@ -59,3 +61,10 @@ def get_client_ip_address(request):
 
 def is_signature_valid(message, address, signature):
     return validate_signature(message, address, signature)
+
+
+def decode_payload(data: str):
+    data.replace("\x00", "\uFFFD")
+    b64_decoded = base64.b64decode(data)
+    code = str(gzip.decompress(b64_decoded), "utf-8")
+    return code

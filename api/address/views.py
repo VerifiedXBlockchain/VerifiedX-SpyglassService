@@ -5,6 +5,7 @@ from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 
 from api import exceptions
+from api.fungible_token.serializers import FungibleTokenSerializer
 from rbx.models import Address
 from api.address.serializers import AddressSerializer
 from api.address.querysets import ALL_ADDRESSES_QUERYSET
@@ -73,6 +74,30 @@ class AddressDetailView(RetrieveModelMixin, AddressView):
         }
 
         # serializer = AddressSerializer(payload)
+
+        return Response(data, status=200)
+
+
+class AddressTokensDetailView(RetrieveModelMixin, AddressView):
+    lookup_field = "address"
+
+    def get(self, request, *args, **kwargs):
+        address: Address = self.get_object()
+
+        results = address.get_fungible_token_balances(serialize_token=True)
+
+        token_balances = [
+            {
+                "token": FungibleTokenSerializer(result["token"]).data,
+                "balance": result["balance"],
+            }
+            for result in results
+        ]
+
+        data = {
+            "address": address.address,
+            "tokens": token_balances,
+        }
 
         return Response(data, status=200)
 

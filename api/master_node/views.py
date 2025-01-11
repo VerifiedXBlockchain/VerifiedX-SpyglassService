@@ -98,38 +98,19 @@ class SendMasterNodesView(ListModelMixin, CreateModelMixin, GenericAPIView):
 
     def post(self, request, *args, **kwargs):
 
-        """
-        Note: in order to provide validator information to the community,
-        the adjudicators broadcast their info to the explorer's API.
-
-        Once we are fully atonmous, the only way to track validators will be
-        by watching for block reward transactions. This will work perfectly well
-        but will not be as real time for obvious reasons.
-
-        The current approach works well for beta to help provide close to realtime
-        feedback about validator status.
-        """
-
-        if settings.RBX_SEND_MASTER_NODES_REQUIRES_WHITELIST:
-            ips = settings.RBX_SEND_MASTER_NODES_WHITELIST
-
-            ip = get_client_ip_address(request)
-
-            if ip not in ips:
-                print("--------------")
-                print("IP ADDRESS NOT WHITE LISTED:")
-                print(ip)
-                print("--------------")
-                return Response(
-                    {"success": False, "message": "Not Authorized"}, status=403
-                )
+        print("SendMasterNodesView")
 
         try:
             data = self.request.data
+
+            print(data)
             if not data:
                 return Response({"success": False, "message": "No data"}, status=400)
 
             for d in data:
+                print("----")
+                print(d)
+                print("----")
 
                 try:
                     mn = SentMasterNode.objects.get(address=d["Address"])

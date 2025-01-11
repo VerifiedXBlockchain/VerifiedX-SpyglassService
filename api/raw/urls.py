@@ -16,6 +16,7 @@ from api.raw.views import (
     LocatorsView,
     BeaconAssetsView,
     BeaconUploadRequestView,
+    WithdrawVbtcView,
 )
 
 urlpatterns = [
@@ -49,5 +50,6 @@ urlpatterns = [
         "beacon-assets/<str:id>/<str:locators>/<str:address>/<path:signature>/",
         BeaconAssetsView.as_view(),
     ),
+    path("withdraw-vbtc/", WithdrawVbtcView.as_view()),
     # path("smart-contract-mint/", MintSmartContractView.as_view()),
 ]

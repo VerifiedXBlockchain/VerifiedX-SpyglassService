@@ -295,7 +295,7 @@ class CreateBidView(GenericAPIView):
                 {"message": "Listing not found."}, status=status.HTTP_200_OK
             )
 
-        balance = a.get_balance()
+        balance, _, __ = a.get_balance()
 
         if listing.is_sale_complete:
             return Response(

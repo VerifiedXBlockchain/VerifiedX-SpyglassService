@@ -11,6 +11,7 @@ INSTALLED_APPS = [
     "rest_framework",
     "drf_yasg",
     "rest_framework.authtoken",
+    "phonenumber_field",
     "django.contrib.admin",
     "django.contrib.auth",
     "django.contrib.contenttypes",
@@ -27,4 +28,5 @@ INSTALLED_APPS = [
     "shop.apps.ShopConfig",
     "payment.apps.PaymentConfig",
     "btc.apps.BtcConfig",
+    "price.apps.PriceConfig",
 ]

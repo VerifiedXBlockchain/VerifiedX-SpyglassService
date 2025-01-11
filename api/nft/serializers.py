@@ -23,3 +23,8 @@ class NftSerializer(serializers.ModelSerializer):
             "asset_urls",
             "is_listed",
         ]
+
+
+class VerifyOwnershipSerializer(serializers.Serializer):
+
+    signature = serializers.CharField()

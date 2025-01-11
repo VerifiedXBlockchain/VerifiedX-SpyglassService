@@ -6,6 +6,7 @@ from rest_framework.decorators import api_view
 from rest_framework.response import Response
 from rbx.models import Circulation, NetworkMetrics
 from rbx.tasks import sync_circulation, sync_network_metrics
+from django.conf import settings
 
 
 @api_view(("GET",))
@@ -76,6 +77,9 @@ def lifetime_balance(request):
 
 @api_view(("GET",))
 def applications(request):
+
+    is_testnet = settings.ENVIRONMENT == "testnet"
+
     gui_tag = "beta4.0.3"
     gui_url = f"https://github.com/ReserveBlockIO/rbx-wallet-gui/releases/tag/{gui_tag}"
 
@@ -84,7 +88,13 @@ def applications(request):
         f"https://github.com/ReserveBlockIO/ReserveBlock-Core/releases/tag/{cli_tag}"
     )
 
-    snapshot_url = "https://github.com/ReserveBlockIO/ReserveBlockSnapshot/releases/download/snap12/rbx_snapshot_11_25_2023.zip"
+    snapshot_url = (
+        None
+        if is_testnet
+        else "https://github.com/VerifiedXBlockchain/VerifiedX-Snapshot/releases/download/snapshot2/VFX_MAINNET_snapshot_1_10-2025_11_30_UTC.zip"
+    )
+
+    snapshot_height = 212050 if is_testnet else 3074180
 
     data = {
         "gui": {
@@ -100,7 +110,7 @@ def applications(request):
             "date": "2023-11-25",
         },
         "snapshot": {
-            "height": 1649720,
+            "height": snapshot_height,
             "url": snapshot_url,
             "date": "2023-06-11",
         },

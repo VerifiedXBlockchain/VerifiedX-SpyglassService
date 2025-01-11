@@ -6,6 +6,7 @@ from admin.utils.urls import admin_model_view_link
 from rbx.models import (
     MasterNode,
     Block,
+    TokenVoteTopicVote,
     Transaction,
     Address,
     Nft,
@@ -17,12 +18,18 @@ from rbx.models import (
     NetworkMetrics,
     Callback,
     Recovery,
+    FaucetWithdrawlRequest,
+    TokenVoteTopic,
+    FungibleToken,
+    FungibleTokenTx,
+    VbtcToken,
+    VbtcTokenAmountTransfer,
 )
 from django.contrib.admin.utils import model_ngettext
 
 
 class RbxModelAdmin(ModelAdmin):
-    actions = None
+    # actions = None
 
     def has_add_permission(self, request, obj=None):
         return True
@@ -281,7 +288,7 @@ class TopicAdmin(RbxModelAdmin):
 class AdnrAdmin(RbxModelAdmin):
     search_fields = ["domain", "address"]
 
-    list_display = ["domain", "address", "created_at"]
+    list_display = ["domain", "address", "is_btc", "created_at"]
 
     readonly_fields = ["created_at"]
 
@@ -292,6 +299,8 @@ class AdnrAdmin(RbxModelAdmin):
                 "fields": [
                     "domain",
                     "address",
+                    "is_btc",
+                    "btc_address",
                     "created_at",
                 ]
             },
@@ -367,3 +376,72 @@ class RecoveryAdmin(RbxModelAdmin):
     readonly_fields = ["outstanding_transactions"]
 
     autocomplete_fields = ["transaction"]
+
+
+@admin.register(FaucetWithdrawlRequest)
+class FaucetWithdrawlRequestAdmin(RbxModelAdmin):
+
+    readonly_fields = ["uuid"]
+
+    list_display = [
+        "address",
+        "amount",
+        "phone",
+        "is_verified",
+        "uuid",
+    ]
+
+
+@admin.register(FungibleToken)
+class FungibleTokenAdmin(RbxModelAdmin):
+    search_fields = ["name", "ticker"]
+
+    list_display = ["name", "ticker", "can_mint", "can_burn", "can_vote"]
+
+    list_filter = ["can_mint", "can_burn", "can_vote"]
+
+    autocomplete_fields = ["smart_contract", "create_transaction"]
+
+
+@admin.register(FungibleTokenTx)
+class FungibleTokenAdmin(RbxModelAdmin):
+    search_fields = ["sc_identifier"]
+
+    list_display = ["token", "type"]
+
+    list_filter = ["type"]
+
+    autocomplete_fields = ["token"]
+
+
+@admin.register(TokenVoteTopic)
+class TokenVoteTopicAdmin(RbxModelAdmin):
+    search_fields = ["sc_identifier"]
+
+    list_display = ["token", "name", "sc_identifier"]
+
+    list_filter = ["token"]
+
+    autocomplete_fields = ["token"]
+
+
+@admin.register(TokenVoteTopicVote)
+class TokenVoteTopicVoteAdmin(RbxModelAdmin):
+
+    list_display = ["topic", "address", "value", "created_at"]
+    autocomplete_fields = ["topic"]
+    list_filter = ["topic"]
+
+
+@admin.register(VbtcToken)
+class VbtcTokenAdmin(RbxModelAdmin):
+    search_fields = ["sc_identifier", "owner_address"]
+    list_display = ["sc_identifier", "deposit_address", "global_balance"]
+    autocomplete_fields = ["nft"]
+
+
+@admin.register(VbtcTokenAmountTransfer)
+class VbtcTokenAmountTransferAdmin(RbxModelAdmin):
+    search_fields = ["address"]
+    list_display = ["token", "address", "amount", "created_at"]
+    autocomplete_fields = ["token", "transaction"]

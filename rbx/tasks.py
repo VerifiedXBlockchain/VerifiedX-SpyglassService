@@ -2,6 +2,7 @@ import os
 import logging
 import time
 import json
+import requests
 from tqdm import tqdm
 import base64
 import gzip
@@ -11,13 +12,19 @@ import pytz
 from django.db.models import Q, Sum, F
 from django.db.transaction import atomic as atomic_transaction
 from django.utils import timezone
+from api.block.serializers import BlockSerializer
 from project.celery import app
+from project.utils.encoders import DecimalEncoder
 from rbx.client import get_master_nodes, get_block, get_nft, get_topics
 from shop.media import scp_down_folder, upload_to_s3
 from rbx.exceptions import RBXException
 from rbx.models import (
+    FungibleToken,
+    FungibleTokenTx,
     MasterNode,
     Block,
+    TokenVoteTopic,
+    TokenVoteTopicVote,
     Transaction,
     Address,
     Nft,
@@ -27,6 +34,8 @@ from rbx.models import (
     Adnr,
     NetworkMetrics,
     Callback,
+    VbtcToken,
+    VbtcTokenAmountTransfer,
 )
 from rbx.utils import get_ip_location, network_metrics
 from dateutil import parser
@@ -82,8 +91,8 @@ def sync_master_nodes(update_blocks: bool = False) -> None:
                 region=location["region"] if location else None,
                 country=location["country_name"] if location else None,
                 time_zone=location["time_zone"] if location else None,
-                latitude=location["latitude"] if location else None,
-                longitude=location["longitude"] if location else None,
+                latitude=location["latitude"] if location else Decimal(0),
+                longitude=location["longitude"] if location else Decimal(0),
             )
 
             active_nodes.append(mn)
@@ -115,8 +124,8 @@ def sync_master_nodes(update_blocks: bool = False) -> None:
         n.region = node.region
         n.country = node.country
         n.time_zone = node.time_zone
-        n.latitude = node.latitude
-        n.longitude = node.longitude
+        n.latitude = node.latitude or Decimal(0)
+        n.longitude = node.longitude or Decimal(0)
         n.save()
 
     if update_blocks:
@@ -150,7 +159,7 @@ def sync_block(height: int) -> None:
     except MasterNode.DoesNotExist:
         master_node = None
 
-    block, created = Block.objects.get_or_create(
+    block, block_created = Block.objects.get_or_create(
         height=height,
         defaults={
             "master_node": master_node,
@@ -225,6 +234,25 @@ def sync_block(height: int) -> None:
             )
             from_address.save()
 
+    if block_created:
+        b = None
+        try:
+            b = Block.objects.get(height=block.height)
+        except Block.DoesNotExist:
+            pass
+        if b:
+
+            socket_payload = json.dumps(
+                {
+                    "type": "new_block",
+                    "data": BlockSerializer(b).data,
+                    "message": f"block {b.height}",
+                },
+                cls=DecimalEncoder,
+            )
+
+            notify_socket_service(socket_payload)
+
     end = time.time()
     logging.info(f"Synchronized Block {height} [elapsed: {end - start}]")
 
@@ -285,7 +313,7 @@ def resync_balances() -> None:
 
 
 def process_transaction(tx: Transaction):
-    if tx.type == Transaction.Type.NFT_MINT:
+    if tx.type in [Transaction.Type.NFT_MINT, Transaction.Type.TKNZ_MINT]:
         logging.info(f"NFT Mint: {tx.hash}")
 
         parsed = json.loads(tx.data)[0]
@@ -295,11 +323,10 @@ def process_transaction(tx: Transaction):
 
         function = parsed["Function"]
 
-        if function == "TokenDeploy()":
-            print("TOKEN DEPLOY DETECTED: TODO") # TODO
-            return
-
         data = get_nft(identifier)
+        print("-------")
+        print(data)
+        print("-------")
         if not data:
             # handle_unavailable_nft(tx, parsed)
             logging.error("No SC data found.")
@@ -351,9 +378,73 @@ def process_transaction(tx: Transaction):
         tx.nft = nft
         tx.save()
 
+        if function == "TokenDeploy()":
+
+            features = smart_contract_data["Features"]
+            if features:
+
+                for feature in features:
+                    if feature["FeatureName"] == 13:
+                        token_info = feature["FeatureFeatures"]
+                        try:
+                            token = FungibleToken.objects.get(sc_identifier=identifier)
+                        except FungibleToken.DoesNotExist:
+                            token = FungibleToken(sc_identifier=identifier)
+
+                        token.smart_contract = nft
+                        token.create_transaction = tx
+                        token.name = token_info["TokenName"]
+                        token.ticker = token_info["TokenTicker"]
+                        token.decimal_places = token_info["TokenDecimalPlaces"]
+                        token.initial_supply = token_info["TokenSupply"]
+                        token.can_burn = token_info["TokenBurnable"]
+                        token.can_vote = token_info["TokenVoting"]
+                        token.can_mint = token_info["TokenMintable"]
+                        token.image_url = token_info["TokenImageURL"]
+                        token.image_base64 = token_info["TokenImageBase"]
+                        token.owner_address = tx.from_address
+                        token.original_owner_address = tx.from_address
+
+                        token.save()
+
+                        nft.is_fungible_token = True
+                        nft.save()
+
+                        handle_token_icon_upload.apply_async(args=[identifier])
+
+        if function == "Mint()":
+
+            features = smart_contract_data["Features"]
+            if features:
+
+                for feature in features:
+                    if feature["FeatureName"] == 3:
+                        vbtc_info = feature["FeatureFeatures"]
+
+                        try:
+                            vbtc_token = VbtcToken.objects.get(sc_identifier=identifier)
+                        except VbtcToken.DoesNotExist:
+                            vbtc_token = VbtcToken(sc_identifier=identifier)
+
+                        vbtc_token.nft = nft
+                        vbtc_token.name = nft.name
+                        vbtc_token.description = nft.description
+                        vbtc_token.owner_address = nft.owner_address
+                        vbtc_token.image_base64 = vbtc_info["ImageBase"]
+                        vbtc_token.deposit_address = vbtc_info["DepositAddress"]
+                        vbtc_token.public_key_proofs = vbtc_info["PublicKeyProofs"]
+                        vbtc_token.global_balance = Decimal(0)
+                        vbtc_token.created_at = tx.date_crafted
+                        vbtc_token.save()
+
+                        nft.is_vbtc = True
+                        nft.save()
+
+                        handle_vbtc_icon_upload.apply_async(args=[identifier])
+
         return
 
-    if tx.type == Transaction.Type.NFT_TX:
+    elif tx.type == Transaction.Type.NFT_TX:
         logging.info(f"NFT Transfer: {tx.hash}")
 
         parsed = json.loads(tx.data)[0]
@@ -380,7 +471,7 @@ def process_transaction(tx: Transaction):
 
         nft.save()
 
-    if tx.type == Transaction.Type.NFT_SALE:
+    elif tx.type == Transaction.Type.NFT_SALE:
         logging.info(f"NFT Sale: {tx.hash}")
 
         parsed = json.loads(tx.data)
@@ -429,7 +520,7 @@ def process_transaction(tx: Transaction):
                     )
                     return
 
-    if tx.type == Transaction.Type.NFT_BURN:
+    elif tx.type == Transaction.Type.NFT_BURN:
         logging.info(f"NFT Burn: {tx.hash}")
 
         parsed = json.loads(tx.data)[0]
@@ -444,13 +535,13 @@ def process_transaction(tx: Transaction):
         nft.burn_transaction = tx
         nft.save()
 
-    if tx.type == Transaction.Type.ADDRESS:
+    elif tx.type == Transaction.Type.ADDRESS:
         process_adnr(tx)
 
-    if tx.type == Transaction.Type.DST_REGISTRATION:
+    elif tx.type == Transaction.Type.DST_REGISTRATION:
         process_shop(tx)
 
-    if tx.type == Transaction.Type.RESERVE:
+    elif tx.type == Transaction.Type.RESERVE:
         parsed = json.loads(tx.data)
         func = parsed["Function"]
         if func == "CallBack()":
@@ -552,6 +643,163 @@ def process_transaction(tx: Transaction):
                 owner_address=new_address
             )
 
+    elif tx.type in [
+        Transaction.Type.FTKN_TX,
+        Transaction.Type.FTKN_BURN,
+        Transaction.Type.FTKN_MINT,
+    ]:
+
+        parsed = json.loads(tx.data)
+
+        if isinstance(parsed, list):
+            parsed = parsed[0]
+
+        func = parsed["Function"]
+        sc_identifier = parsed["ContractUID"]
+
+        try:
+            token = FungibleToken.objects.get(sc_identifier=sc_identifier)
+        except FungibleToken.DoesNotExist:
+            print(f"FT doesn't exist with id of {sc_identifier}")
+            return
+
+        if func in ["TokenMint()", "TokenBurn()"]:
+
+            type = (
+                FungibleTokenTx.Type.MINT
+                if func == "TokenMint()"
+                else FungibleTokenTx.Type.BURN
+            )
+
+            from_address = parsed["FromAddress"]
+            amount = parsed["Amount"]
+
+            ftt = FungibleTokenTx(
+                type=type,
+                sc_identifier=sc_identifier,
+                token=token,
+                receiving_address=from_address,
+                sending_address=None,
+                amount=amount,
+            )
+
+            ftt.save()
+
+        elif func == "TokenTransfer()":
+            from_address = parsed["FromAddress"]
+            to_address = parsed["ToAddress"]
+            amount = parsed["Amount"]
+
+            ftt = FungibleTokenTx(
+                type=FungibleTokenTx.Type.TRANSFER,
+                sc_identifier=sc_identifier,
+                token=token,
+                receiving_address=to_address,
+                sending_address=from_address,
+                amount=amount,
+            )
+            ftt.save()
+
+        elif func == "TokenContractOwnerChange()":
+            from_address = parsed["FromAddress"]
+            to_address = parsed["ToAddress"]
+
+            token.owner_address = to_address
+            token.save()
+
+        elif func == "TokenPause()":
+            token.is_paused = parsed["Pause"]
+            token.save()
+        elif func == "TokenBanAddress()":
+            address = parsed["BanAddress"]
+            token.banned_addresses.append(address)
+            token.save()
+
+        elif func == "TokenVoteTopicCreate()":
+            sc_identifier = parsed["ContractUID"]
+            from_address = parsed["FromAddress"]
+            topic_data = parsed["TokenVoteTopic"]
+
+            try:
+                topic = TokenVoteTopic.objects.get(
+                    sc_identifier=sc_identifier, topic_id=topic_data["TopicUID"]
+                )
+            except TokenVoteTopic.DoesNotExist:
+                topic = TokenVoteTopic(
+                    sc_identifier=sc_identifier, topic_id=topic_data["TopicUID"]
+                )
+
+            try:
+                token = FungibleToken.objects.get(sc_identifier=sc_identifier)
+            except FungibleToken.DoesNotExist:
+                print(
+                    f"token with sc_identifier of {sc_identifier} not found when creating vote topic."
+                )
+                return
+
+            topic.token = token
+            topic.from_address = from_address
+            topic.topic_id = topic_data["TopicUID"]
+            topic.name = topic_data["TopicName"]
+            topic.description = topic_data["TopicDescription"]
+            topic.vote_requirement = topic_data["MinimumVoteRequirement"]
+            topic.created_at = timezone.make_aware(
+                datetime.fromtimestamp(topic_data["TopicCreateDate"])
+            )
+            topic.voting_ends_at = timezone.make_aware(
+                datetime.fromtimestamp(topic_data["VotingEndDate"])
+            )
+
+            topic.save()
+
+        elif func == "TokenVoteTopicCast()":
+            topic_id = parsed["TopicUID"]
+            try:
+                topic = TokenVoteTopic.objects.get(topic_id=topic_id)
+
+            except TokenVoteTopic.DoesNotExist:
+                print(f"TokenVoteTopic with topic id of {topic_id} not found.")
+                return
+
+            TokenVoteTopicVote.objects.create(
+                topic=topic,
+                address=parsed["FromAddress"],
+                value=parsed["VoteType"] == 1,
+                created_at=tx.date_crafted,
+            )
+
+    elif tx.type == Transaction.Type.TKNZ_TX:
+        parsed = json.loads(tx.data)[0]
+        func = parsed["Function"]
+        sc_identifier = parsed["ContractUID"]
+
+        if func == "TransferCoin()":
+            amount = Decimal(parsed["Amount"])
+            try:
+                token = VbtcToken.objects.get(sc_identifier=sc_identifier)
+            except VbtcToken.DoesNotExist:
+                print(f"VbtcToken with sc id of{sc_identifier} not found.")
+                return
+
+            transfer = VbtcTokenAmountTransfer(
+                token=token,
+                transaction=tx,
+                address=tx.to_address,
+                amount=amount,
+                created_at=tx.date_crafted,
+            )
+            transfer.save()
+
+        elif func == "Transfer()":
+            try:
+                token = VbtcToken.objects.get(sc_identifier=sc_identifier)
+            except VbtcToken.DoesNotExist:
+                print(f"VbtcToken with sc id of{sc_identifier} not found.")
+                return
+
+            token.owner_address = tx.to_address
+            token.save()
+
 
 # def handle_unavailable_nft(tx: Transaction, data: dict):
 
@@ -586,22 +834,41 @@ def process_adnr(tx):
 
     parsed = json.loads(tx.data)
     kind = parsed["Function"]
-    domain = parsed["Name"]
+    domain = parsed["Name"] if "Name" in parsed else None
 
-    domain = domain if ".rbx" in domain else f"{domain}.rbx"
     address = tx.from_address
+    is_btc = kind in ["BTCAdnrCreate()", "BTCAdnrTransfer()", "BTCAdnrDelete()"]
 
-    if kind == "AdnrCreate()":
+    btc_address = None
+    if domain:
+        if is_btc:
+            domain = domain if ".btc" in domain else f"{domain}.btc"
+        else:
+            domain = domain if ".vfx" in domain else f"{domain}.vfx"
+
+    if kind == "AdnrCreate()" or kind == "BTCAdnrCreate()":
+
+        btc_address = None
+        if is_btc and "BTCAddress" in parsed:
+            btc_address = parsed["BTCAddress"]
+
         adnr = Adnr.objects.create(
-            address=address, domain=domain, create_transaction=tx
+            address=address,
+            domain=domain,
+            create_transaction=tx,
+            is_btc=is_btc,
+            btc_address=btc_address,
         )
-        try:
-            address = Address.objects.get(address=tx.from_address)
-            address.adnr = adnr
-            address.save()
-        except Address.DoesNotExist:
-            pass
-    if kind == "AdnrTransfer()":
+        if not is_btc:
+            try:
+                address = Address.objects.get(address=tx.from_address)
+                address.adnr = adnr
+                address.save()
+            except Address.DoesNotExist:
+                pass
+
+    elif kind == "AdnrTransfer()":
+
         try:
             adnr = Adnr.objects.get(domain=domain)
             adnr.transfer_transactions.add(tx)
@@ -623,12 +890,35 @@ def process_adnr(tx):
 
         except Adnr.DoesNotExist:
             print(f"ADNR not found with domain {domain}")
-    if kind == "AdnrDelete()":
+
+    elif kind == "BTCAdnrTransfer()":
+
+        btc_to_address = parsed["BTCToAddress"]
+        btc_from_address = parsed["BTCFromAddress"]
+
         try:
+            adnr = Adnr.objects.get(btc_address=btc_from_address)
+            adnr.btc_address = btc_to_address
+            adnr.save()
+        except Adnr.DoesNotExist:
+            print(f"ADNR with btc_address of {btc_from_address} not found.")
+            pass
+
+    elif kind == "AdnrDelete()":
+        try:
+
             adnr = Adnr.objects.get(domain=domain)
             adnr.delete()
         except Adnr.DoesNotExist:
             print(f"ADNR not found with domain {domain}.")
+
+    elif kind == "BTCAdnrDelete()":
+        if "BTCFromAddress" in parsed:
+            try:
+                adnr = Adnr.objects.get(btc_address=parsed["BTCFromAddress"])
+                adnr.delete()
+            except Adnr.DoesNotExist:
+                print(f"ADNR not found with domain {domain}.")
 
 
 def process_shop(tx):
@@ -674,9 +964,11 @@ def sync_circulation():
     amount = query["total_amount__sum"]
     total = amount
 
-    # plus 32 rbx per block
-    block_count = Block.objects.count()
-    total = total + (Decimal(32.0) * block_count)
+    rewards = Transaction.objects.filter(from_address="Coinbase_BlkRwd").aggregate(
+        Sum("total_amount")
+    )
+
+    total = total + Decimal(rewards["total_amount__sum"])
 
     # burn fees
     query = Transaction.objects.all().aggregate(Sum("total_fee"))
@@ -701,13 +993,13 @@ def sync_circulation():
     active_master_nodes = MasterNode.objects.filter(is_active=True).count()
     total_master_nodes = MasterNode.objects.all().count()
 
-    stake = active_master_nodes * 12000
+    stake = active_master_nodes * 50000
     total_addresses = Address.objects.all().count()
 
     total_burned = fees + adnr_burned_sum + dst_burned_sum
 
     circulation.balance = total
-    circulation.lifetime_supply = Decimal(372000000) - total_burned
+    circulation.lifetime_supply = Decimal(200000000) - total_burned
     circulation.fees_burned_sum = total_burned
     circulation.fees_burned = fees_burned
     circulation.total_staked = stake
@@ -858,3 +1150,75 @@ def migrate_nft_assets(sc_id: str):
 
     nft.asset_urls = urls
     nft.save()
+
+
+@app.task(autoretry_for=[RBXException])
+def handle_token_icon_upload(sc_identifier: str):
+
+    import tempfile
+
+    try:
+        ft = FungibleToken.objects.get(sc_identifier=sc_identifier)
+    except FungibleToken.DoesNotExist:
+        print(f"FT not found with sc_id of {sc_identifier}")
+        return
+
+    image_data = base64.b64decode(ft.image_base64)
+
+    # Create a temporary file
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as temp_file:
+        temp_file.write(image_data)
+        temp_file.flush()
+        url = upload_to_s3(
+            sc_identifier,
+            temp_file.name,
+            bucket=settings.AWS_BUCKET_NFT_ASSETS,
+        )
+
+        ft.image_base64_url = url
+        ft.save()
+
+
+@app.task(autoretry_for=[RBXException])
+def handle_vbtc_icon_upload(sc_identifier: str):
+
+    import tempfile
+
+    try:
+        vbtc_token = VbtcToken.objects.get(sc_identifier=sc_identifier)
+    except VbtcToken.DoesNotExist:
+        print(f"FT not found with sc_id of {sc_identifier}")
+        return
+
+    if vbtc_token.image_is_default:
+        return
+
+    image_data = base64.b64decode(vbtc_token.image_base64)
+
+    # Create a temporary file
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as temp_file:
+        temp_file.write(image_data)
+        temp_file.flush()
+        url = upload_to_s3(
+            sc_identifier,
+            temp_file.name,
+            bucket=settings.AWS_BUCKET_NFT_ASSETS,
+        )
+
+        vbtc_token.image_base64_url = url
+        vbtc_token.save()
+
+
+def notify_socket_service(payload: dict):
+
+    if settings.SOCKET_BASE_URL and settings.SOCKET_TOKEN:
+
+        payload["api_key"] = settings.SOCKET_TOKEN
+
+        requests.post(
+            f"{settings.SOCKET_BASE_URL}/event/",
+            data=payload,
+            headers={
+                "Content-Type": "application/json",
+            },
+        )

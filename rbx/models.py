@@ -9,7 +9,9 @@ from shop.models import Listing
 from django.db.models import Q
 from django.utils import timezone
 import json
-
+import uuid
+from phonenumber_field.modelfields import PhoneNumberField
+from django.contrib.postgres.fields import ArrayField
 
 # class MasterNodeManager(models.Manager):
 #     def get_queryset(self):
@@ -155,6 +157,15 @@ class Transaction(models.Model):
         VOTE_TOPIC = 8
         VOTE = 9
         RESERVE = 10
+        SC_MINT = 11
+        SC_TX = 12
+        SC_BURN = 13
+        FTKN_MINT = 14
+        FTKN_TX = 15
+        FTKN_BURN = 16
+        TKNZ_MINT = 17
+        TKNZ_TX = 18
+        TKNZ_BURN = 19
 
     hash = models.CharField(_("Hash"), primary_key=True, max_length=255, db_index=True)
     block = models.ForeignKey(
@@ -299,6 +310,9 @@ class Nft(models.Model):
     on_chain = models.BooleanField(default=True)
     asset_urls = models.JSONField(blank=True, null=True)
 
+    is_fungible_token = models.BooleanField(default=False)
+    is_vbtc = models.BooleanField(default=False)
+
     def __str__(self):
         return str(self.name)
 
@@ -362,6 +376,36 @@ class Address(models.Model):
     @property
     def is_ra(self):
         return self.address.startswith("xRBX")
+
+    def get_fungible_tokens(self):
+        address = self.address
+
+        tokens = FungibleToken.objects.filter(
+            Q(
+                fungibletokentx__in=FungibleTokenTx.objects.filter(
+                    Q(sending_address=address) | Q(receiving_address=address)
+                )
+            )
+            | Q(owner_address=address)
+        ).distinct()
+
+        return tokens
+
+    def get_fungible_token_balances(self, serialize_token=False):
+
+        tokens = self.get_fungible_tokens()
+
+        token_balances = []
+        for token in tokens:
+
+            token_balances.append(
+                {
+                    "token": token,
+                    "balance": token.get_address_balance(self.address),
+                }
+            )
+
+        return token_balances
 
     def get_balance(self):
         address = self.address
@@ -650,6 +694,7 @@ class Topic(models.Model):
 class Adnr(models.Model):
     address = models.CharField(_("Address"), max_length=255)
     domain = models.CharField(_("Domain"), max_length=255)
+    is_btc = models.BooleanField(default=False)
 
     create_transaction = models.ForeignKey(
         Transaction,
@@ -670,6 +715,8 @@ class Adnr(models.Model):
         blank=True,
         related_name="adnr_transfers",
     )
+
+    btc_address = models.CharField(max_length=90, blank=True, null=True)
 
     def __str__(self):
         return self.domain
@@ -735,3 +782,259 @@ class Recovery(models.Model):
         Transaction,
         related_name="recovery_outstanding_transactions",
     )
+
+
+class FaucetWithdrawlRequest(models.Model):
+
+    uuid = models.UUIDField(
+        unique=True,
+        default=uuid.uuid4,
+        editable=False,
+        db_index=True,
+    )
+
+    address = models.CharField(max_length=64)
+    amount = models.DecimalField(default=0.0, decimal_places=16, max_digits=32)
+    phone = PhoneNumberField()
+    is_verified = models.BooleanField(default=False)
+    transaction_hash = models.CharField(max_length=255, blank=True, null=True)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f"{self.address} {self.amount}"
+
+
+class FungibleToken(models.Model):
+
+    sc_identifier = models.CharField(max_length=64, unique=True, db_index=True)
+    name = models.CharField(max_length=64)
+    ticker = models.CharField(max_length=64)
+    owner_address = models.CharField(max_length=64)
+    original_owner_address = models.CharField(max_length=64)
+
+    smart_contract = models.ForeignKey(Nft, on_delete=models.CASCADE)
+    create_transaction = models.ForeignKey(Transaction, on_delete=models.CASCADE)
+
+    image_base64 = models.TextField()
+    image_url = models.URLField(blank=True, null=True)
+    decimal_places = models.IntegerField()
+    initial_supply = models.DecimalField(decimal_places=16, max_digits=32, default=0.0)
+
+    image_base64_url = models.URLField(blank=True, null=True)
+
+    can_mint = models.BooleanField()
+    can_burn = models.BooleanField()
+    can_vote = models.BooleanField()
+
+    is_paused = models.BooleanField(default=False)
+    banned_addresses = ArrayField(models.CharField(max_length=64), default=list)
+
+    def get_address_balance(self, address):
+
+        initial_supply_owned = Decimal(0)
+        if self.initial_supply > Decimal(0) and address == self.original_owner_address:
+            initial_supply_owned = self.initial_supply
+
+        minted = FungibleTokenTx.objects.filter(
+            token=self,
+            type=FungibleTokenTx.Type.MINT,
+            receiving_address=address,
+        ).aggregate(Sum("amount"))
+        minted_amount = minted["amount__sum"] or Decimal(0)
+
+        burned = FungibleTokenTx.objects.filter(
+            token=self,
+            type=FungibleTokenTx.Type.BURN,
+            receiving_address=address,
+        ).aggregate(Sum("amount"))
+        burned_amount = burned["amount__sum"] or Decimal(0)
+
+        transferred_to = FungibleTokenTx.objects.filter(
+            token=self,
+            type=FungibleTokenTx.Type.TRANSFER,
+            receiving_address=address,
+        ).aggregate(Sum("amount"))
+        transferred_to_amount = transferred_to["amount__sum"] or Decimal(0)
+
+        transferred_from = FungibleTokenTx.objects.filter(
+            token=self,
+            type=FungibleTokenTx.Type.TRANSFER,
+            sending_address=address,
+        ).aggregate(Sum("amount"))
+        transferred_from_amount = transferred_from["amount__sum"] or Decimal(0)
+
+        return (
+            initial_supply_owned
+            + minted_amount
+            + transferred_to_amount
+            - burned_amount
+            - transferred_from_amount
+        )
+
+    def __str__(self):
+        return f"{self.name} [{self.ticker}]"
+
+    @property
+    def created_at(self):
+        return self.create_transaction.date_crafted
+
+    @property
+    def circulating_supply(self):
+        if not self.can_mint and not self.can_burn:
+            return self.initial_supply
+
+        total_minted = FungibleTokenTx.objects.filter(
+            token=self, type=FungibleTokenTx.Type.MINT
+        ).aggregate(Sum("amount"))
+
+        total_burned = FungibleTokenTx.objects.filter(
+            token=self, type=FungibleTokenTx.Type.BURN
+        ).aggregate(Sum("amount"))
+
+        total_minted_amount = total_minted["amount__sum"] or Decimal(0)
+        total_burned_amount = total_burned["amount__sum"] or Decimal(0)
+
+        return self.initial_supply + total_minted_amount - total_burned_amount
+
+
+class FungibleTokenTx(models.Model):
+
+    class Type(models.TextChoices):
+        MINT = "mint", "Mint"
+        BURN = "burn", "Burn"
+        TRANSFER = "transfer", "Transfer"
+
+    type = models.CharField(choices=Type.choices, max_length=16)
+    sc_identifier = models.CharField(max_length=64)
+    token = models.ForeignKey(FungibleToken, on_delete=models.CASCADE)
+
+    receiving_address = models.CharField(max_length=64, blank=True, null=True)
+    sending_address = models.CharField(max_length=64, blank=True, null=True)
+    amount = models.DecimalField(decimal_places=16, max_digits=32)
+
+    def __str__(self):
+        return f"{self.type} ({self.token})"
+
+
+class TokenVoteTopic(models.Model):
+
+    sc_identifier = models.CharField(max_length=64)
+    token = models.ForeignKey(FungibleToken, on_delete=models.CASCADE)
+    from_address = models.CharField(max_length=64)
+    topic_id = models.CharField(max_length=32)
+    name = models.CharField(max_length=128)
+    description = models.TextField()
+    vote_requirement = models.DecimalField(decimal_places=16, max_digits=32)
+
+    created_at = models.DateTimeField()
+    voting_ends_at = models.DateTimeField()
+
+    def __str__(self):
+        return self.name
+
+    @property
+    def vote_data(self):
+        votes = TokenVoteTopicVote.objects.filter(topic=self)
+        all_votes = [
+            {
+                "address": v.address,
+                "value": v.value,
+                "created_at": v.created_at,
+            }
+            for v in votes
+        ]
+
+        total_votes = len(votes)
+        total_yes = TokenVoteTopicVote.objects.filter(topic=self, value=True).count()
+        total_no = total_votes - total_yes
+
+        percent_yes = total_yes / total_votes if total_votes > 0 else 0
+        percent_no = total_no / total_votes if total_votes > 0 else 0
+
+        data = {
+            "votes": all_votes,
+            "vote_yes": total_yes,
+            "vote_no": total_no,
+            "total_votes": total_votes,
+            "percent_yes": percent_yes,
+            "percent_no": percent_no,
+        }
+
+        return data
+
+
+class TokenVoteTopicVote(models.Model):
+
+    topic = models.ForeignKey(TokenVoteTopic, on_delete=models.CASCADE)
+    address = models.CharField(max_length=64)
+    value = models.BooleanField()
+
+    created_at = models.DateTimeField()
+
+
+class VbtcToken(models.Model):
+    sc_identifier = models.CharField(max_length=64)
+    nft = models.ForeignKey(Nft, on_delete=models.CASCADE)
+    name = models.CharField(max_length=64, blank=True)
+    description = models.TextField(blank=True)
+    owner_address = models.CharField(max_length=64)
+    image_base64 = models.TextField()
+    image_base64_url = models.URLField(blank=True, null=True)
+    deposit_address = models.CharField(max_length=64)
+    public_key_proofs = models.TextField(blank=True)
+    global_balance = models.DecimalField(decimal_places=16, max_digits=32, default=0.0)
+
+    total_recieved = models.DecimalField(decimal_places=16, max_digits=32, default=0)
+    total_sent = models.DecimalField(decimal_places=16, max_digits=32, default=0)
+    tx_count = models.IntegerField(default=0)
+
+    created_at = models.DateTimeField()
+
+    def __str__(self):
+        return f"{self.sc_identifier} ({self.deposit_address})"
+
+    @property
+    def image_is_default(self):
+        return self.image_base64 == "default"
+
+    @property
+    def image_base64_url_with_fallback(self):
+        if self.image_is_default or not self.image_base64_url:
+            return "https://vfx-resources.s3.amazonaws.com/defaultvBTC.gif"
+
+        return self.image_base64_url
+
+    @property
+    def addresses(self):
+        owner_address = self.owner_address
+        transfers = VbtcTokenAmountTransfer.objects.filter(token=self).order_by(
+            "created_at"
+        )
+        entries = {owner_address: self.global_balance}
+        for t in transfers:
+
+            if t.transaction.to_address in entries:
+                entries[t.transaction.to_address] += t.amount
+            else:
+                entries[t.transaction.to_address] = t.amount
+
+            if t.transaction.from_address in entries:
+                entries[t.transaction.from_address] -= t.amount
+            else:
+                entries[t.transaction.from_address] = -t.amount
+
+        return entries
+
+
+class VbtcTokenAmountTransfer(models.Model):
+
+    token = models.ForeignKey(VbtcToken, on_delete=models.CASCADE)
+    transaction = models.ForeignKey(Transaction, on_delete=models.CASCADE)
+    address = models.CharField(max_length=64)
+    amount = models.DecimalField(decimal_places=16, max_digits=32)
+    created_at = models.DateTimeField()
+
+    def __str__(self):
+        return f"{self.token.deposit_address} => {self.address} [{self.amount}]"
