@@ -247,6 +247,7 @@ def sync_block(height: int) -> None:
                     "type": "new_block",
                     "data": BlockSerializer(b).data,
                     "message": f"block {b.height}",
+                    "api_key": settings.SOCKET_TOKEN,
                 },
                 cls=DecimalEncoder,
             )
@@ -1211,9 +1212,7 @@ def handle_vbtc_icon_upload(sc_identifier: str):
 
 def notify_socket_service(payload: dict):
 
-    if settings.SOCKET_BASE_URL and settings.SOCKET_TOKEN:
-
-        payload["api_key"] = settings.SOCKET_TOKEN
+    if settings.SOCKET_BASE_URL:
 
         requests.post(
             f"{settings.SOCKET_BASE_URL}/event/",
