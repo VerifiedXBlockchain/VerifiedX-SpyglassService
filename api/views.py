@@ -91,10 +91,10 @@ def applications(request):
     snapshot_url = (
         None
         if is_testnet
-        else "https://github.com/VerifiedXBlockchain/VerifiedX-Snapshot/releases/download/snapshot1/VFX_MAINNET_snapshot_12_17_2024_19_20_UTC.zip"
+        else "https://github.com/VerifiedXBlockchain/VerifiedX-Snapshot/releases/download/snapshot2/VFX_MAINNET_snapshot_1_10-2025_11_30_UTC.zip"
     )
 
-    snapshot_height = 212050 if is_testnet else 2990776
+    snapshot_height = 212050 if is_testnet else 3074180
 
     data = {
         "gui": {
