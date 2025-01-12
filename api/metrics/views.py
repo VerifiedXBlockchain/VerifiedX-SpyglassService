@@ -43,7 +43,15 @@ class NetworkMetricsView(GenericAPIView):
         ).aggregate(Sum("total_amount"))
         dst_burned_sum = Decimal(query["total_amount__sum"])
 
-        data["total_burned"] = fees + adnr_burned_sum + dst_burned_sum
+        # vault activations
+        vault_burned_sum = Transaction.objects.filter(
+            type=Transaction.Type.RESERVE,
+            to_address="Reserve_Base",
+        ).count() * Decimal(4.0)
+
+        data["total_burned"] = (
+            fees + adnr_burned_sum + dst_burned_sum + vault_burned_sum
+        )
 
         # circulating supply
         query = Transaction.objects.filter(height=0).aggregate(Sum("total_amount"))
@@ -54,7 +62,14 @@ class NetworkMetricsView(GenericAPIView):
         )
         rewards_total = Decimal(rewards["total_amount__sum"])
 
-        total = total - fees - adnr_burned_sum - dst_burned_sum + rewards_total
+        total = (
+            total
+            - fees
+            - adnr_burned_sum
+            - dst_burned_sum
+            - vault_burned_sum
+            + rewards_total
+        )
 
         data["circulating_supply"] = total
 

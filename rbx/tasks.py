@@ -987,7 +987,13 @@ def sync_circulation():
     ).aggregate(Sum("total_amount"))
     dst_burned_sum = Decimal(query["total_amount__sum"])
 
-    total = total - fees - adnr_burned_sum - dst_burned_sum
+    # vault activations
+    vault_burned_sum = Transaction.objects.filter(
+        type=Transaction.Type.RESERVE,
+        to_address="Reserve_Base",
+    ).count() * Decimal(4.0)
+
+    total = total - fees - adnr_burned_sum - dst_burned_sum - vault_burned_sum
 
     active_master_nodes = MasterNode.objects.filter(is_active=True).count()
     total_master_nodes = MasterNode.objects.all().count()
@@ -995,7 +1001,7 @@ def sync_circulation():
     stake = active_master_nodes * 50000
     total_addresses = Address.objects.all().count()
 
-    total_burned = fees + adnr_burned_sum + dst_burned_sum
+    total_burned = fees + adnr_burned_sum + dst_burned_sum + vault_burned_sum
 
     circulation.balance = total
     circulation.lifetime_supply = Decimal(200000000) - total_burned
