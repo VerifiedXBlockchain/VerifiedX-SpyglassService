@@ -975,13 +975,11 @@ def sync_circulation():
     query = Transaction.objects.all().aggregate(Sum("total_fee"))
     fees = query["total_fee__sum"]
 
-    # total txs
-    query = Transaction.objects.count()
-    fees_burned = query
-
     # adnr
-    query = Transaction.objects.filter(type=Transaction.Type.ADDRESS).count()
-    adnr_burned_sum = Decimal(query * 1.0)
+    query = Transaction.objects.filter(type=Transaction.Type.ADDRESS).aggregate(
+        Sum("total_amount")
+    )
+    adnr_burned_sum = Decimal(query["total_amount__sum"])
 
     # decshop
     query = Transaction.objects.filter(
@@ -1002,7 +1000,7 @@ def sync_circulation():
     circulation.balance = total
     circulation.lifetime_supply = Decimal(200000000) - total_burned
     circulation.fees_burned_sum = total_burned
-    circulation.fees_burned = fees_burned
+    circulation.fees_burned = total_burned
     circulation.total_staked = stake
     circulation.total_master_nodes = total_master_nodes
     circulation.active_master_nodes = active_master_nodes

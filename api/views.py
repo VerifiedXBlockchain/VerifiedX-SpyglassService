@@ -26,7 +26,7 @@ def circulation(request):
         "active_master_nodes": circulation.active_master_nodes,
         "total_master_nodes": circulation.total_master_nodes,
         "total_addresses": circulation.total_addresses,
-        "cli_version": "4.0.0.xxx-beta",
+        "cli_version": "5.0.1.xxx-beta",
     }
     return Response(data, status=status.HTTP_200_OK)
 
