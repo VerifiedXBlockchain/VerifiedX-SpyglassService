@@ -53,6 +53,8 @@ class VbtcCompileDataView(GenericAPIView):
 
     def get(self, request, *args, **kwargs):
 
+        return Response({}, status=500)
+
         address = kwargs["address"]
 
         attempts = 0
