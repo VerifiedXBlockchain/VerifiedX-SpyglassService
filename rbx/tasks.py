@@ -993,7 +993,7 @@ def sync_circulation():
         to_address="Reserve_Base",
     ).count() * Decimal(4.0)
 
-    total = total - fees - adnr_burned_sum - dst_burned_sum - vault_burned_sum
+    # total = total - fees - adnr_burned_sum - dst_burned_sum - vault_burned_sum
 
     active_master_nodes = MasterNode.objects.filter(is_active=True).count()
     total_master_nodes = MasterNode.objects.all().count()
@@ -1003,12 +1003,15 @@ def sync_circulation():
 
     total_burned = fees + adnr_burned_sum + dst_burned_sum + vault_burned_sum
 
+    circulating_supply = Decimal(200000000) - total_burned
+    lifetime_supply = Decimal(200000000) - total_burned
+
     total_transactions = (
         Transaction.objects.all().exclude(from_address="Coinbase_BlkRwd").count()
     )
 
-    circulation.balance = total
-    circulation.lifetime_supply = Decimal(200000000) - total_burned
+    circulation.balance = circulating_supply
+    circulation.lifetime_supply = lifetime_supply
     circulation.fees_burned_sum = total_burned
     circulation.fees_burned = total_burned
     circulation.total_staked = stake

@@ -10,5 +10,6 @@ services:
   - name: runner
     type: worker
     run: "celery --app=project beat --loglevel=INFO"
-# predeploy:
-#   run: "python manage.py migrate"
+
+predeploy:
+  run: "python manage.py migrate"
