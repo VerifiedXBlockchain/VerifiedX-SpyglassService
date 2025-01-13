@@ -600,6 +600,7 @@ class Circulation(SingletonModel):
     active_master_nodes = models.PositiveIntegerField(default=0)
     total_master_nodes = models.PositiveIntegerField(default=0)
     total_addresses = models.IntegerField(default=0)
+    total_transactions = models.IntegerField(default=0)
 
     updated_at = models.DateTimeField(auto_now=True)
 

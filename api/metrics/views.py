@@ -23,9 +23,14 @@ class NetworkMetricsView(GenericAPIView):
 
         data = {
             "latest_block": Block.objects.all().count(),
-            "total_transactions": Transaction.objects.all().count(),
             "active_validators": MasterNode.objects.filter(is_active=True).count(),
         }
+
+        total_transactions = (
+            Transaction.objects.all().exclude(from_address="Coinbase_BlkRwd").count()
+        )
+
+        data["total_transactions"] = total_transactions
 
         # burned fees
         query = Transaction.objects.all().aggregate(Sum("total_fee"))

@@ -1003,6 +1003,10 @@ def sync_circulation():
 
     total_burned = fees + adnr_burned_sum + dst_burned_sum + vault_burned_sum
 
+    total_transactions = (
+        Transaction.objects.all().exclude(from_address="Coinbase_BlkRwd").count()
+    )
+
     circulation.balance = total
     circulation.lifetime_supply = Decimal(200000000) - total_burned
     circulation.fees_burned_sum = total_burned
@@ -1011,6 +1015,7 @@ def sync_circulation():
     circulation.total_master_nodes = total_master_nodes
     circulation.active_master_nodes = active_master_nodes
     circulation.total_addresses = total_addresses
+    circulation.total_transactions = total_transactions
 
     circulation.save()
 
