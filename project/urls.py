@@ -28,6 +28,7 @@ schema_view = get_schema_view(
 
 
 urlpatterns.append(path("payment/", include("payment.urls")))
+urlpatterns.append(path("vfx/", include("rbx.urls")))
 
 urlpatterns.append(
     re_path(
