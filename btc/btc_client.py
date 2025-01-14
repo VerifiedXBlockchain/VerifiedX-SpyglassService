@@ -10,8 +10,15 @@ class BtcClient:
 
     def get_balance(self, address: str):
 
-        response = requests.get(f"{self.base_url}/address/{address}")
-        data = response.json()
+        try:
+            response = requests.get(
+                f"{self.base_url}/address/{address}", timeout=(5, 10)
+            )  # 5 sec to connect, 10 seconds to read
+            data = response.json()
+        except Exception as e:
+            print("Error in BtcClient.get_balance()")
+            print(e)
+            return None
 
         chain_stats = data["chain_stats"]
 
