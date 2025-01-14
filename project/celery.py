@@ -50,7 +50,7 @@ def sync_the_blocks():
     command = ["python", "manage.py", "sync_blocks"]
 
     # Run the command in your home directory
-    result = subprocess.run(command, cwd="~", capture_output=True, text=True)
+    result = subprocess.run(command, cwd="/workspace", capture_output=True, text=True)
 
     # Print the output
     print(result.stdout)

@@ -6,10 +6,10 @@ services:
     run: "gunicorn --workers 3 project.wsgi --log-file -"
   - name: worker
     type: worker
-    run: "celery --app=project worker --without-heartbeat --without-gossip --without-mingle --loglevel=INFO"
+    run: "celery --app=project worker --without-heartbeat --without-gossip --without-mingle --loglevel=DEBUG"
   - name: runner
     type: worker
-    run: "celery --app=project beat --loglevel=INFO"
+    run: "celery --app=project beat --loglevel=DEBUG"
 
 predeploy:
   run: "python manage.py migrate"
