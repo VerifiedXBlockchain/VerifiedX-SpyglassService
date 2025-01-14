@@ -43,7 +43,7 @@ def setup_periodic_tasks(sender, **kwargs):
 def sync_blocks():
     from django.core import management
 
-    management.call_command("sync_blocks", "--async")
+    management.call_command("sync_blocks")
 
 
 @app.task
