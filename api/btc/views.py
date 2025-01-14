@@ -92,10 +92,18 @@ class VbtcListView(GenericAPIView):
         for transfer in transfers:
             sc_identifiers.append(transfer.token.sc_identifier)
 
-        for token in VbtcToken.objects.filter(owner_address=vfx_address):
+        for token in (
+            VbtcToken.objects.filter(owner_address=vfx_address)
+            .exclude(sc_identifier="2442522a3fd34270b77a64b07eb34b7f:1736792655")
+            .exclude(sc_identifier="320c5271fc04465cb24c4f1cd48affd4:1736625395")
+        ):
             sc_identifiers.append(token.sc_identifier)
 
-        tokens = VbtcToken.objects.filter(sc_identifier__in=sc_identifiers)
+        tokens = (
+            VbtcToken.objects.filter(sc_identifier__in=sc_identifiers)
+            .exclude(sc_identifier="2442522a3fd34270b77a64b07eb34b7f:1736792655")
+            .exclude(sc_identifier="320c5271fc04465cb24c4f1cd48affd4:1736625395")
+        )
 
         results = VbtcTokenSerializer(tokens, many=True).data
 
