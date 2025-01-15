@@ -26,8 +26,9 @@ def setup_periodic_tasks(sender, **kwargs):
         1 * 60, update_vbtc_balances.s(), name="Update VBTC Balances"
     )
 
+    sender.add_periodic_task(3 * 60, health_check.s(), name="Health Check")
+
     if not settings.MINIMAL_CRON_JOBS:
-        sender.add_periodic_task(3 * 60, health_check.s(), name="Health Check")
         sender.add_periodic_task(
             10 * 60, shop_online_crawler.s(False), name="Online Shop Crawler (ALL)"
         )
