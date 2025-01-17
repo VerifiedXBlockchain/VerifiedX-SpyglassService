@@ -9,7 +9,7 @@ from datetime import datetime
 
 def update_price(coin_type: CoinPrice.CoinType) -> None:
 
-    symbol = "BTC_USDT" if coin_type == CoinPrice.CoinType.BTC else "RBX_USDT"
+    symbol = "BTC_USDT" if coin_type == CoinPrice.CoinType.BTC else "VFX_USDT"
 
     spotAPI = APISpot(timeout=(2, 10))
     response = spotAPI.get_v3_ticker(symbol=symbol)

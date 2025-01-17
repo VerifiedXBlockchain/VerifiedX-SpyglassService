@@ -1,8 +1,8 @@
-# RBX Explorer Service
+# VerifiedX Spyglass Service
 
 ## Overview
 
-This is the source code for the RBX Explorer service. It is built in Python and Django with a postgreSQL database.
+This is the source code for the VFX Explorer service. It is built in Python and Django with a postgreSQL database.
 
 To run your own you will need a wallet running (can be local or in the cloud). It will need to be launched like so:
 

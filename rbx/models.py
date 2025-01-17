@@ -245,7 +245,26 @@ class Transaction(models.Model):
             return "Address"
         if self.type == Transaction.Type.RESERVE:
             return "Reserve"
-        return self.type
+        if self.type == Transaction.Type.SC_MINT:
+            return "Smart Contract Mint"
+        if self.type == Transaction.Type.SC_TX:
+            return "Smart Contract Tx"
+        if self.type == Transaction.Type.SC_BURN:
+            return "Smart Contract Burn"
+        if self.type == Transaction.Type.FTKN_MINT:
+            return "Fungible Token Mint"
+        if self.type == Transaction.Type.FTKN_TX:
+            return "Fungible Token Tx"
+        if self.type == Transaction.Type.FTKN_BURN:
+            return "Fungible Token Burn"
+        if self.type == Transaction.Type.TKNZ_MINT:
+            return "Tokenization Mint"
+        if self.type == Transaction.Type.TKNZ_TX:
+            return "Tokenization Tx"
+        if self.type == Transaction.Type.TKNZ_BURN:
+            return "Tokenization Burn"
+
+        return f"{self.type}"
 
     class Meta:
         verbose_name = _("Transaction")
@@ -600,6 +619,7 @@ class Circulation(SingletonModel):
     active_master_nodes = models.PositiveIntegerField(default=0)
     total_master_nodes = models.PositiveIntegerField(default=0)
     total_addresses = models.IntegerField(default=0)
+    total_transactions = models.IntegerField(default=0)
 
     updated_at = models.DateTimeField(auto_now=True)
 

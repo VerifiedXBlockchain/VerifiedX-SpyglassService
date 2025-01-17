@@ -23,9 +23,14 @@ class NetworkMetricsView(GenericAPIView):
 
         data = {
             "latest_block": Block.objects.all().count(),
-            "total_transactions": Transaction.objects.all().count(),
             "active_validators": MasterNode.objects.filter(is_active=True).count(),
         }
+
+        total_transactions = (
+            Transaction.objects.all().exclude(from_address="Coinbase_BlkRwd").count()
+        )
+
+        data["total_transactions"] = total_transactions
 
         # burned fees
         query = Transaction.objects.all().aggregate(Sum("total_fee"))
@@ -43,20 +48,18 @@ class NetworkMetricsView(GenericAPIView):
         ).aggregate(Sum("total_amount"))
         dst_burned_sum = Decimal(query["total_amount__sum"])
 
-        data["total_burned"] = fees + adnr_burned_sum + dst_burned_sum
+        # vault activations
+        vault_burned_sum = Transaction.objects.filter(
+            type=Transaction.Type.RESERVE,
+            to_address="Reserve_Base",
+        ).count() * Decimal(4.0)
 
-        # circulating supply
-        query = Transaction.objects.filter(height=0).aggregate(Sum("total_amount"))
-        total = Decimal(query["total_amount__sum"])
+        total_burned = fees + adnr_burned_sum + dst_burned_sum + vault_burned_sum
 
-        rewards = Transaction.objects.filter(from_address="Coinbase_BlkRwd").aggregate(
-            Sum("total_amount")
-        )
-        rewards_total = Decimal(rewards["total_amount__sum"])
+        data["total_burned"] = total_burned
 
-        total = total - fees - adnr_burned_sum - dst_burned_sum + rewards_total
-
-        data["circulating_supply"] = total
+        data["circulating_supply"] = Decimal(200000000) - total_burned
+        data["lifetime_supply"] = Decimal(200000000) - total_burned
 
         # block times
         time_threshold = now() - timedelta(minutes=5)

@@ -92,10 +92,18 @@ class VbtcListView(GenericAPIView):
         for transfer in transfers:
             sc_identifiers.append(transfer.token.sc_identifier)
 
-        for token in VbtcToken.objects.filter(owner_address=vfx_address):
+        for token in (
+            VbtcToken.objects.filter(owner_address=vfx_address)
+            .exclude(sc_identifier="2442522a3fd34270b77a64b07eb34b7f:1736792655")
+            .exclude(sc_identifier="320c5271fc04465cb24c4f1cd48affd4:1736625395")
+        ):
             sc_identifiers.append(token.sc_identifier)
 
-        tokens = VbtcToken.objects.filter(sc_identifier__in=sc_identifiers)
+        tokens = (
+            VbtcToken.objects.filter(sc_identifier__in=sc_identifiers)
+            .exclude(sc_identifier="2442522a3fd34270b77a64b07eb34b7f:1736792655")
+            .exclude(sc_identifier="320c5271fc04465cb24c4f1cd48affd4:1736625395")
+        )
 
         results = VbtcTokenSerializer(tokens, many=True).data
 
@@ -105,13 +113,22 @@ class VbtcListView(GenericAPIView):
 class VbtcListAllView(GenericAPIView):
 
     def get(self, request, *args, **kwargs):
-        tokens = VbtcToken.objects.all()
+        tokens = (
+            VbtcToken.objects.all()
+            .exclude(sc_identifier="2442522a3fd34270b77a64b07eb34b7f:1736792655")
+            .exclude(sc_identifier="320c5271fc04465cb24c4f1cd48affd4:1736625395")
+        )
+
         transfers = VbtcTokenAmountTransfer.objects.all()
         sc_identifiers = []
         for transfer in transfers:
             sc_identifiers.append(transfer.token.sc_identifier)
 
-        for token in VbtcToken.objects.all():
+        for token in (
+            VbtcToken.objects.all()
+            .exclude(sc_identifier="2442522a3fd34270b77a64b07eb34b7f:1736792655")
+            .exclude(sc_identifier="320c5271fc04465cb24c4f1cd48affd4:1736625395")
+        ):
             sc_identifiers.append(token.sc_identifier)
 
         tokens = VbtcToken.objects.filter(sc_identifier__in=sc_identifiers)
@@ -123,7 +140,11 @@ class VbtcListAllView(GenericAPIView):
 
 class VbtcDetailView(RetrieveAPIView):
     serializer_class = VbtcTokenSerializer
-    queryset = VbtcToken.objects.all()
+    queryset = (
+        VbtcToken.objects.all()
+        .exclude(sc_identifier="2442522a3fd34270b77a64b07eb34b7f:1736792655")
+        .exclude(sc_identifier="320c5271fc04465cb24c4f1cd48affd4:1736625395")
+    )
 
     lookup_field = "sc_identifier"
 

@@ -1,5 +1,5 @@
 while true
 do
     python manage.py sync_blocks
-    sleep 30
+    sleep 10
 done
