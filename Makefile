@@ -30,6 +30,12 @@ shell_main:
 shell_testnet:
 	porter app run rbx-explorer-testnet -e -- bash
 
+logs_main_runner:
+	porter app logs rbx-explorer-mainnet --service runner
+
+logs_main_worker:
+	porter app logs rbx-explorer-mainnet --service worker
+
 run_cli:
 	/Applications/VFXWallet.app/Contents/Resources/RBXCore/ReserveBlockCore enableapi
 
