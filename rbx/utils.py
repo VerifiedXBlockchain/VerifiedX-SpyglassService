@@ -35,9 +35,14 @@ def get_remote_max_height() -> int:
 def network_metrics() -> Optional[NetworkMetrics]:
     try:
         data = get_network_metrics()
+        print(data)
         if data:
             return NetworkMetrics(
-                block_difference_average=Decimal(data["BlockDiffAvg"]),
+                block_difference_average=(
+                    Decimal(data["BlockDiffAvg"])
+                    if data["BlockDiffAvg"]
+                    else Decimal(12.15)
+                ),
                 block_last_received=data["BlockLastReceived"],
                 block_last_delay=int(data["BlockLastDelay"]),
                 time_since_last_block=int(data["TimeSinceLastBlockSeconds"]),
