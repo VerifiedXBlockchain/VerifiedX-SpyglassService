@@ -396,9 +396,9 @@ class FaucetWithdrawlRequestAdmin(RbxModelAdmin):
 class FungibleTokenAdmin(RbxModelAdmin):
     search_fields = ["name", "ticker"]
 
-    list_display = ["name", "ticker", "can_mint", "can_burn", "can_vote"]
+    list_display = ["name", "ticker", "can_mint", "can_burn", "can_vote", "nsfw"]
 
-    list_filter = ["can_mint", "can_burn", "can_vote"]
+    list_filter = ["can_mint", "can_burn", "can_vote", "nsfw"]
 
     autocomplete_fields = ["smart_contract", "create_transaction"]
 

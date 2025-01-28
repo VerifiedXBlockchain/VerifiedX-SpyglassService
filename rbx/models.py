@@ -851,6 +851,8 @@ class FungibleToken(models.Model):
     is_paused = models.BooleanField(default=False)
     banned_addresses = ArrayField(models.CharField(max_length=64), default=list)
 
+    nsfw = models.BooleanField(default=False)
+
     def get_address_balance(self, address):
 
         initial_supply_owned = Decimal(0)

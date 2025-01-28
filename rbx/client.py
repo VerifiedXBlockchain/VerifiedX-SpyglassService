@@ -462,17 +462,23 @@ def handle_raw_transaction(tx: dict, execute: bool = False) -> bool:
 
 
 # region Nfts
-def get_nft(id: str, *args) -> Tuple[dict, int]:
+def get_nft(id: str, attempt=0) -> Tuple[dict, int]:
+    attempt += 1
+
+    if attempt > 5:
+        print("Could not get nft data after 5 tries")
+        return None
+
     url = join_url(SHOP_BASE_URL, f"/scapi/scv1/GetSmartContractData/{id}/")
 
-    response = requests.get(url)
-
-    print(url)
-    print(response.text)
     try:
+        response = requests.get(url)
         return response.json()
-    except:
-        return None
+    except Exception as e:
+        print("NFT Get Data Exception")
+        print(e)
+        time.sleep(5)
+        return get_nft(id, attempt)
 
 
 def verify_nft_ownership(sig: str) -> bool:
