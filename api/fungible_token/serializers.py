@@ -25,6 +25,7 @@ class FungibleTokenSerializer(serializers.ModelSerializer):
             "image_url",
             "is_paused",
             "banned_addresses",
+            "nsfw",
         ]
 
 

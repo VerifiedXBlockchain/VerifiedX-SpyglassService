@@ -325,9 +325,7 @@ def process_transaction(tx: Transaction):
         function = parsed["Function"]
 
         data = get_nft(identifier)
-        print("-------")
-        print(data)
-        print("-------")
+
         if not data:
             # handle_unavailable_nft(tx, parsed)
             logging.error("No SC data found.")
