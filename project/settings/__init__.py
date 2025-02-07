@@ -16,6 +16,7 @@ from .gis import *
 from .i18n import *
 from .logging import *
 from .middleware import *
+from .moonpay import *
 from .rbx import *
 from .security import *
 from .session import *
