@@ -20,7 +20,6 @@ Then, update your env variable "RBX_WALLET_ADDRESS" to be `http://{server_ip OR 
 - [ ] Python 3.10.x
 - [ ] Postgres 13.x
 - [ ] Redis 6.x
-- [ ] RabbitMQ 3.x
 
 #### Setup
 
