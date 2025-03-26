@@ -443,5 +443,5 @@ class VbtcTokenAdmin(RbxModelAdmin):
 @admin.register(VbtcTokenAmountTransfer)
 class VbtcTokenAmountTransferAdmin(RbxModelAdmin):
     search_fields = ["address"]
-    list_display = ["token", "address", "amount", "created_at"]
+    list_display = ["token", "address", "amount", "is_multi", "created_at"]
     autocomplete_fields = ["token", "transaction"]

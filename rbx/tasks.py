@@ -770,9 +770,9 @@ def process_transaction(tx: Transaction):
     elif tx.type == Transaction.Type.TKNZ_TX:
         parsed = json.loads(tx.data)[0]
         func = parsed["Function"]
-        sc_identifier = parsed["ContractUID"]
 
         if func == "TransferCoin()":
+            sc_identifier = parsed["ContractUID"]
             amount = Decimal(parsed["Amount"])
             try:
                 token = VbtcToken.objects.get(sc_identifier=sc_identifier)
@@ -790,6 +790,7 @@ def process_transaction(tx: Transaction):
             transfer.save()
 
         elif func == "Transfer()":
+            sc_identifier = parsed["ContractUID"]
             try:
                 token = VbtcToken.objects.get(sc_identifier=sc_identifier)
             except VbtcToken.DoesNotExist:
@@ -798,6 +799,31 @@ def process_transaction(tx: Transaction):
 
             token.owner_address = tx.to_address
             token.save()
+
+        elif func == "TransferCoinMulti()":
+            total_amount = Decimal(parsed["Amount"])
+            inputs = parsed["Inputs"]
+
+            for input in inputs:
+                amount = input["Amount"]
+                sc_identifier = input["SCUID"]
+                from_address = input["FromAddress"]
+
+                try:
+                    token = VbtcToken.objects.get(sc_identifier=sc_identifier)
+                except VbtcToken.DoesNotExist:
+                    print(f"VbtcToken with sc id of{sc_identifier} not found.")
+                    continue
+
+                transfer = VbtcTokenAmountTransfer(
+                    token=token,
+                    transaction=tx,
+                    address=tx.to_address,
+                    amount=amount,
+                    created_at=tx.date_crafted,
+                    is_multi=True,
+                )
+                transfer.save()
 
 
 # def handle_unavailable_nft(tx: Transaction, data: dict):
