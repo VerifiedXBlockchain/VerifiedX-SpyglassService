@@ -770,7 +770,15 @@ def process_transaction(tx: Transaction):
 
     elif tx.type == Transaction.Type.TKNZ_TX:
         print("TKNZ_TX TX Found")
-        parsed = json.loads(tx.data)[0]
+
+        parsed = json.loads(tx.data)
+        print(f"parsed {parsed}")
+
+        if isinstance(parsed, list):
+            parsed = parsed[0]
+
+        print(f"parsed clean {parsed}")
+
         func = parsed["Function"]
 
         print(f"func == {func}")

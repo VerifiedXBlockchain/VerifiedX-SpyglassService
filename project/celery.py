@@ -44,19 +44,9 @@ def setup_periodic_tasks(sender, **kwargs):
 
 @app.task
 def sync_the_blocks():
-    # from django.core import management
+    from django.core import management
 
-    # management.call_command("sync_blocks")
-
-    print("TRIGGERING sync_blocks() command in celery.py")
-    command = ["python", "manage.py", "sync_blocks"]
-
-    # Run the command in your home directory
-    result = subprocess.run(command, cwd="/workspace", capture_output=True, text=True)
-
-    # Print the output
-    print(result.stdout)
-    print("-------")
+    management.call_command("sync_blocks")
 
 
 @app.task
