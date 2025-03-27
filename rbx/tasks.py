@@ -769,19 +769,13 @@ def process_transaction(tx: Transaction):
             )
 
     elif tx.type == Transaction.Type.TKNZ_TX:
-        print("TKNZ_TX TX Found")
 
         parsed = json.loads(tx.data)
-        print(f"parsed {parsed}")
 
         if isinstance(parsed, list):
             parsed = parsed[0]
 
-        print(f"parsed clean {parsed}")
-
         func = parsed["Function"]
-
-        print(f"func == {func}")
 
         if func == "TransferCoin()":
             sc_identifier = parsed["ContractUID"]
@@ -813,15 +807,12 @@ def process_transaction(tx: Transaction):
             token.save()
 
         elif func == "TransferCoinMulti()":
-            print(f"inputs {inputs}")
             inputs = parsed["Inputs"]
 
             for input in inputs:
-                print(f"input {input}")
 
                 try:
                     amount = Decimal(input["Amount"])
-                    print(f"amount {amount}")
 
                     sc_identifier = input["SCUID"]
                     from_address = input["FromAddress"]
@@ -841,9 +832,7 @@ def process_transaction(tx: Transaction):
                         created_at=tx.date_crafted,
                         is_multi=True,
                     )
-                    print(f"transfer {transfer}")
                     transfer.save()
-                    print(f"saved! {transfer.id}")
                 except Exception as e:
                     print("ERROR")
                     print(e)
