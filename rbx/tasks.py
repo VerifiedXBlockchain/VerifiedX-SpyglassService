@@ -801,29 +801,32 @@ def process_transaction(tx: Transaction):
             token.save()
 
         elif func == "TransferCoinMulti()":
-            total_amount = Decimal(parsed["Amount"])
             inputs = parsed["Inputs"]
 
             for input in inputs:
-                amount = input["Amount"]
-                sc_identifier = input["SCUID"]
-                from_address = input["FromAddress"]
-
                 try:
-                    token = VbtcToken.objects.get(sc_identifier=sc_identifier)
-                except VbtcToken.DoesNotExist:
-                    print(f"VbtcToken with sc id of{sc_identifier} not found.")
-                    continue
+                    amount = Decimal(input["Amount"])
+                    sc_identifier = input["SCUID"]
+                    from_address = input["FromAddress"]
 
-                transfer = VbtcTokenAmountTransfer(
-                    token=token,
-                    transaction=tx,
-                    address=tx.to_address,
-                    amount=amount,
-                    created_at=tx.date_crafted,
-                    is_multi=True,
-                )
-                transfer.save()
+                    try:
+                        token = VbtcToken.objects.get(sc_identifier=sc_identifier)
+                    except VbtcToken.DoesNotExist:
+                        print(f"VbtcToken with sc id of{sc_identifier} not found.")
+                        continue
+
+                    transfer = VbtcTokenAmountTransfer(
+                        token=token,
+                        transaction=tx,
+                        address=tx.to_address,
+                        amount=amount,
+                        created_at=tx.date_crafted,
+                        is_multi=True,
+                    )
+                    transfer.save()
+                except Exception as e:
+                    print("ERROR")
+                    print(e)
 
 
 # def handle_unavailable_nft(tx: Transaction, data: dict):
