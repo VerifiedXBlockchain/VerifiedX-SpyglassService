@@ -314,6 +314,7 @@ def resync_balances() -> None:
 
 
 def process_transaction(tx: Transaction):
+    print(f"Processing TX {tx.hash}")
     if tx.type in [Transaction.Type.NFT_MINT, Transaction.Type.TKNZ_MINT]:
         logging.info(f"NFT Mint: {tx.hash}")
 
@@ -768,8 +769,11 @@ def process_transaction(tx: Transaction):
             )
 
     elif tx.type == Transaction.Type.TKNZ_TX:
+        print("TKNZ_TX TX Found")
         parsed = json.loads(tx.data)[0]
         func = parsed["Function"]
+
+        print(f"func == {func}")
 
         if func == "TransferCoin()":
             sc_identifier = parsed["ContractUID"]
@@ -801,11 +805,16 @@ def process_transaction(tx: Transaction):
             token.save()
 
         elif func == "TransferCoinMulti()":
+            print(f"inputs {inputs}")
             inputs = parsed["Inputs"]
 
             for input in inputs:
+                print(f"input {input}")
+
                 try:
                     amount = Decimal(input["Amount"])
+                    print(f"amount {amount}")
+
                     sc_identifier = input["SCUID"]
                     from_address = input["FromAddress"]
 
@@ -814,6 +823,7 @@ def process_transaction(tx: Transaction):
                     except VbtcToken.DoesNotExist:
                         print(f"VbtcToken with sc id of{sc_identifier} not found.")
                         continue
+                    print(f"token {token}")
 
                     transfer = VbtcTokenAmountTransfer(
                         token=token,
@@ -823,7 +833,9 @@ def process_transaction(tx: Transaction):
                         created_at=tx.date_crafted,
                         is_multi=True,
                     )
+                    print(f"transfer {transfer}")
                     transfer.save()
+                    print(f"saved! {transfer.id}")
                 except Exception as e:
                     print("ERROR")
                     print(e)
