@@ -6,7 +6,7 @@ from rest_framework.response import Response
 
 from api import exceptions
 from api.fungible_token.serializers import FungibleTokenSerializer
-from rbx.models import Address
+from rbx.models import Address, Transaction
 from api.address.serializers import AddressSerializer
 from api.address.querysets import ALL_ADDRESSES_QUERYSET
 from decimal import Decimal
@@ -20,6 +20,60 @@ class AddressView(GenericAPIView):
 class AddressListView(ListModelMixin, AddressView):
     def get(self, request, *args, **kwargs):
         return self.list(request, *args, **kwargs)
+
+
+class AddressTopHoldersListView(AddressView):
+
+    def get(self, request, *args, **kwargs):
+        from django.db.models import Sum, F, Value
+        from django.db.models.functions import Coalesce
+        from django.db.models import Subquery, OuterRef, ExpressionWrapper, DecimalField
+
+        sent_subquery = (
+            Transaction.objects.filter(from_address=OuterRef("to_address"))
+            .values("from_address")
+            .annotate(
+                total_sent_with_fees=Coalesce(
+                    Sum(
+                        ExpressionWrapper(
+                            F("total_amount") + F("total_fee"),
+                            output_field=DecimalField(decimal_places=16, max_digits=32),
+                        )
+                    ),
+                    Value(Decimal(0)),
+                )
+            )
+            .values("total_sent_with_fees")
+        )
+
+        received_qs = (
+            Transaction.objects.values("to_address")
+            .annotate(
+                total_received=Coalesce(Sum("total_amount"), Value(Decimal(0))),
+                total_sent=Coalesce(Subquery(sent_subquery), Value(Decimal(0))),
+            )
+            .annotate(
+                balance=ExpressionWrapper(
+                    F("total_received") - F("total_sent"),
+                    output_field=DecimalField(
+                        decimal_places=16, max_digits=32
+                    ),  # Adjust to match your actual field's precision
+                )
+            )
+            .order_by("-balance")[:100]
+        )
+
+        top_balances = [
+            {
+                "address": row["to_address"],
+                "balance": row["balance"],
+                "received": row["total_received"],
+                "sent": row["total_sent"],
+            }
+            for row in received_qs
+        ]
+
+        return Response(top_balances, status=200)
 
 
 class AddressDetailView(RetrieveModelMixin, AddressView):
