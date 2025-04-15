@@ -349,7 +349,7 @@ class Nft(models.Model):
     @property
     def readable_code(self):
         data = self.data
-        data.replace("\x00", "\uFFFD")
+        data.replace("\x00", "\ufffd")
         b64_decoded = base64.b64decode(data)
         code = str(gzip.decompress(b64_decoded), "utf-8")
         return code
@@ -1056,6 +1056,7 @@ class VbtcTokenAmountTransfer(models.Model):
     transaction = models.ForeignKey(Transaction, on_delete=models.CASCADE)
     address = models.CharField(max_length=64)
     amount = models.DecimalField(decimal_places=16, max_digits=32)
+    is_multi = models.BooleanField(default=False)
     created_at = models.DateTimeField()
 
     def __str__(self):

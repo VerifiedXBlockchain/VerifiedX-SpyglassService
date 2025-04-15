@@ -35,3 +35,16 @@ class BtcClient:
             "balance": total_recieved - total_sent,
             "tx_count": chain_stats["tx_count"],
         }
+
+    def get_transactions(self, address: str):
+        try:
+            response = requests.get(
+                f"{self.base_url}/address/{address}/tx", timeout=(5, 10)
+            )  # 5 sec to connect, 10 seconds to read
+            data = response.json()
+        except Exception as e:
+            print("Error in BtcClient.get_balance()")
+            print(e)
+            return None
+
+        return data

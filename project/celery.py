@@ -26,7 +26,8 @@ def setup_periodic_tasks(sender, **kwargs):
         1 * 60, update_vbtc_balances.s(), name="Update VBTC Balances"
     )
 
-    sender.add_periodic_task(3 * 60, health_check.s(), name="Health Check")
+    if settings.HEALTH_CHECK_ENABLED:
+        sender.add_periodic_task(3 * 60, health_check.s(), name="Health Check")
 
     if not settings.MINIMAL_CRON_JOBS:
         sender.add_periodic_task(
@@ -43,19 +44,9 @@ def setup_periodic_tasks(sender, **kwargs):
 
 @app.task
 def sync_the_blocks():
-    # from django.core import management
+    from django.core import management
 
-    # management.call_command("sync_blocks")
-
-    print("TRIGGERING sync_blocks() command in celery.py")
-    command = ["python", "manage.py", "sync_blocks"]
-
-    # Run the command in your home directory
-    result = subprocess.run(command, cwd="/workspace", capture_output=True, text=True)
-
-    # Print the output
-    print(result.stdout)
-    print("-------")
+    management.call_command("sync_blocks")
 
 
 @app.task

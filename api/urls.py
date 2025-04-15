@@ -30,6 +30,7 @@ urlpatterns = [
     path("applications/", applications),
     path("network-metrics/", network_metrics),
     path("metrics/", include("api.metrics.urls")),
+    path("galxe/", include("api.galxe.urls")),
 ]
 
 if settings.FAUCET_ENABLED:
