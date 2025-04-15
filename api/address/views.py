@@ -1,4 +1,4 @@
-from rest_framework import status
+from rest_framework import status, filters
 from rest_framework.generics import GenericAPIView
 from rest_framework.mixins import RetrieveModelMixin, ListModelMixin
 from rest_framework.permissions import AllowAny
@@ -10,11 +10,19 @@ from rbx.models import Address, Transaction
 from api.address.serializers import AddressSerializer
 from api.address.querysets import ALL_ADDRESSES_QUERYSET
 from decimal import Decimal
+from django_filters.rest_framework import DjangoFilterBackend
 
 
 class AddressView(GenericAPIView):
     serializer_class = AddressSerializer
     queryset = ALL_ADDRESSES_QUERYSET
+    filter_backends = [
+        DjangoFilterBackend,
+        filters.OrderingFilter,
+        filters.SearchFilter,
+    ]
+
+    order_fields = ["balance"]
 
 
 class AddressListView(ListModelMixin, AddressView):
@@ -55,9 +63,7 @@ class AddressTopHoldersListView(AddressView):
             .annotate(
                 balance=ExpressionWrapper(
                     F("total_received") - F("total_sent"),
-                    output_field=DecimalField(
-                        decimal_places=16, max_digits=32
-                    ),  # Adjust to match your actual field's precision
+                    output_field=DecimalField(decimal_places=16, max_digits=32),
                 )
             )
             .order_by("-balance")[:100]
