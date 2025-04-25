@@ -13,7 +13,7 @@ class BtcClient:
         try:
             response = requests.get(
                 f"{self.base_url}/address/{address}", timeout=(5, 10)
-            )  # 5 sec to connect, 10 seconds to read
+            )
             data = response.json()
         except Exception as e:
             print("Error in BtcClient.get_balance()")
@@ -37,13 +37,12 @@ class BtcClient:
         }
 
     def get_transactions(self, address: str):
+        url = f"{self.base_url}/address/{address}/txs"
         try:
-            response = requests.get(
-                f"{self.base_url}/address/{address}/tx", timeout=(5, 10)
-            )  # 5 sec to connect, 10 seconds to read
+            response = requests.get(url, timeout=(5, 10))
             data = response.json()
         except Exception as e:
-            print("Error in BtcClient.get_balance()")
+            print("Error in BtcClient.get_transactions()")
             print(e)
             return None
 
