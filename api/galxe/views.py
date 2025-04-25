@@ -14,6 +14,10 @@ class GalxeVerifyView(GenericAPIView):
         btc_client = BtcClient()
         txs = btc_client.get_transactions(address)
 
+        print(txs)
+        if not txs:
+            return []
+
         for tx in txs:
             is_sender = False
             if "vin" in tx:
