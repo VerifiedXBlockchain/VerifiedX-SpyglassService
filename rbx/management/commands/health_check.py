@@ -10,7 +10,7 @@ from rbx.sms import send_sms
 python manage.py health_check
 """
 
-THRESHOLD_SECONDS = 90
+THRESHOLD_SECONDS = 250
 ALERT_NUMBERS = [
     "+14169974264",
     "+19729982871",
