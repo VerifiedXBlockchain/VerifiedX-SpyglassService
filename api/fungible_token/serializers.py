@@ -14,6 +14,7 @@ class FungibleTokenSerializer(serializers.ModelSerializer):
             "sc_identifier",
             "name",
             "ticker",
+            "description",
             "owner_address",
             "can_mint",
             "can_burn",

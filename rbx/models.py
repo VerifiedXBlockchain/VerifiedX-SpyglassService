@@ -903,6 +903,15 @@ class FungibleToken(models.Model):
         return self.create_transaction.date_crafted
 
     @property
+    def description(self):
+        try:
+            sc = Nft.objects.get(identifier=self.sc_identifier)
+        except Nft.DoesNotExist:
+            return None
+
+        return sc.description
+
+    @property
     def circulating_supply(self):
         if not self.can_mint and not self.can_burn:
             return self.initial_supply
