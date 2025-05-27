@@ -1,6 +1,5 @@
 import random
 import string
-
 from distutils.util import strtobool
 
 
