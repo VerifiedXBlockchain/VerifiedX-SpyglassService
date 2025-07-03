@@ -7,6 +7,7 @@ from .btc import *
 from .cache import *
 from .cmc import *
 from .cors import *
+from .crypto_dot_com import *
 from .database import *
 from .develop import *
 from .email import *

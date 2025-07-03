@@ -129,7 +129,18 @@ def tx_send(transaction: dict) -> Tuple[dict, int]:
     data = transaction
     data["Amount"] = _fix_amount(data["Amount"])
 
+    print("-----------------")
+    print("-----NEW TX------")
+    print(url)
+    print("==================")
+    print(json.dumps(data))
+    print("==================")
+
     response = requests.post(url, json=data)
+    print("---RESPONSE---")
+    print(response.text)
+    print("---------------")
+
     if response.status_code != 200:
         raise RBXException
 

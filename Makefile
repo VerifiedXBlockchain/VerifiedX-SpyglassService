@@ -1,28 +1,84 @@
-.PHONY: install run release web worker
+COMPOSE_PROJECT_NAME = vfx-explorer
 
-install:
-	pip install -r requirements.txt
+# ---- Docker Helpers ----
+build:
+	docker compose build
 
-run:
-	python manage.py runserver 0.0.0.0:8000
+up:
+	docker compose -p $(COMPOSE_PROJECT_NAME) up --detach
 
-release:
-	python manage.py migrate
+down:
+	docker compose -p $(COMPOSE_PROJECT_NAME) down
 
-web:
-	gunicorn project.wsgi --log-file -
+restart:
+	docker compose -p $(COMPOSE_PROJECT_NAME) down && docker compose up --detach
 
-worker:
-	celery --app=project worker --without-heartbeat --without-gossip --without-mingle --loglevel=INFO
+bash:
+	docker compose -p $(COMPOSE_PROJECT_NAME) exec web bash
 
-watch_worker:
-	python manage.py watch_worker
+wipe:
+	@read -p "⚠️  This will stop and remove all containers and volumes. Continue? (y/N) " CONFIRM; \
+	if [ "$$CONFIRM" = "y" ] || [ "$$CONFIRM" = "Y" ]; then \
+		docker compose -p $(COMPOSE_PROJECT_NAME) down -v; \
+	else \
+		echo "❌ Cancelled."; \
+	fi
 	
-deploy_main:
-	heroku git:remote -a rbx-explorer-service && git push heroku main
 
-deploy_testnet:
-	heroku git:remote -a rbx-explorer-service-testnet && git push heroku testnet:main
+# ---- Django Management ----
+
+manage:
+	docker compose -p $(COMPOSE_PROJECT_NAME) exec web python manage.py $(filter-out $@,$(MAKECMDGOALS))
+
+%:
+	@:
+
+migrate:
+	docker compose -p $(COMPOSE_PROJECT_NAME) exec web python manage.py migrate
+
+makemigrations:
+	docker compose -p $(COMPOSE_PROJECT_NAME) exec web python manage.py makemigrations
+
+shell:
+	docker compose -p $(COMPOSE_PROJECT_NAME) exec web python manage.py shell
+
+createsuperuser:
+	docker compose -p $(COMPOSE_PROJECT_NAME) exec web python manage.py createsuperuser
+
+collectstatic:
+	docker compose -p $(COMPOSE_PROJECT_NAME) exec web python manage.py collectstatic --noinput
+
+# ---- Dev Server (inside container) ----
+dev:
+	docker compose -p $(COMPOSE_PROJECT_NAME) exec web python manage.py runserver 0.0.0.0:8000
+
+
+# ---- Celery ----
+celery:
+	docker compose -p $(COMPOSE_PROJECT_NAME) exec web celery -A config worker --loglevel=info
+
+# ---- Logs ----
+logs:
+	docker compose -p $(COMPOSE_PROJECT_NAME) logs -f web
+
+logs-celery:
+	docker compose -p $(COMPOSE_PROJECT_NAME) logs -f web | grep celery
+
+# ---- Testing ----
+test:
+	docker compose -p $(COMPOSE_PROJECT_NAME) exec web python manage.py test
+
+
+# ---- Admin ----
+admin_theme_dump:
+	docker compose -p $(COMPOSE_PROJECT_NAME) exec web python manage.py dumpdata admin_interface.Theme --indent 4 -o admin/fixtures/admin_interface_theme.json 
+
+admin_theme_load:
+	docker compose -p $(COMPOSE_PROJECT_NAME) exec web python manage.py loaddata ./admin/fixtures/admin_interface_theme.json
+
+
+	
+
 
 shell_main:
 	porter app run rbx-explorer-mainnet -- bash
