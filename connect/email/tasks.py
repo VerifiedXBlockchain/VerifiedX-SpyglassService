@@ -28,9 +28,9 @@ def send_build_sale_start_tx_email(bid_pk: int):
     contacts = Contact.objects.filter(address=owner_address)
 
     subject = (
-        f"RBX Buy Now Request: {listing.nft.name}"
+        f"VFX Buy Now Request: {listing.nft.name}"
         if bid.is_buy_now
-        else f"RBX Auction Completed: {listing.nft.name}"
+        else f"VFX Auction Completed: {listing.nft.name}"
     )
     sc_id = listing.nft.identifier
     address = bid.address
@@ -79,7 +79,7 @@ def send_sale_started_email(tx_hash: str):
 
     amount = parsed["SoldFor"]
 
-    subject = "RBX Sale Start TX"
+    subject = "VFX Sale Start TX"
     context = {
         "subject": subject,
         "tx": tx,

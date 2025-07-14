@@ -9,7 +9,10 @@ from rest_framework.generics import GenericAPIView
 from rest_framework.response import Response
 
 from api import exceptions
+from api.media.serializers import AssociateMediaSerializer
 from project.utils.string import get_random_string
+from rbx.models import Nft
+from nft.serializers import NftSerializer
 
 MAX_FILE_SIZE = 157286400
 
@@ -56,3 +59,32 @@ class UploadAssetView(GenericAPIView):
             url = f"https://{BUCKET}.s3.amazonaws.com/{key}"
 
             return Response({"url": url})
+
+
+class AssociateMediaView(GenericAPIView):
+
+    serializer_class = AssociateMediaSerializer
+
+    def post(self, request, *args, **kwargs):
+
+        sc_id = kwargs.get("sc_id", None)
+
+        if not sc_id:
+            raise exceptions.BadRequest("smart contract id required")
+
+        try:
+            nft = Nft.objects.get(identifier=sc_id)
+        except Nft.DoesNotExist:
+            raise exceptions.BadRequest(
+                f"Smart contract with identifier of {sc_id} not found"
+            )
+
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        media_map = serializer.validated_data.get("media_map")
+
+        nft.asset_urls = media_map
+        nft.save()
+
+        return Response(NftSerializer(nft).data, status=200)
