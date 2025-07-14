@@ -12,7 +12,7 @@ from api import exceptions
 from api.media.serializers import AssociateMediaSerializer
 from project.utils.string import get_random_string
 from rbx.models import Nft
-from nft.serializers import NftSerializer
+from api.nft.serializers import NftSerializer
 
 MAX_FILE_SIZE = 157286400
 
