@@ -1,4 +1,4 @@
-from time import sleep
+from time import sleep, time
 from django.core.management.base import BaseCommand
 from btc.btc_client import BtcClient
 from rbx.models import VbtcToken
@@ -34,4 +34,5 @@ class Command(BaseCommand):
                     token.tx_count = balance_info["tx_count"]
                     token.save()
 
+                sleep(0.5)
                 progress.update()
