@@ -89,6 +89,9 @@ shell_testnet:
 logs_main_runner:
 	porter app logs rbx-explorer-mainnet --service runner
 
+logs_main_web:
+	porter app logs rbx-explorer-mainnet --service web
+
 logs_main_worker:
 	porter app logs rbx-explorer-mainnet --service worker
 

@@ -12,7 +12,7 @@ class BtcClient:
 
         try:
             response = requests.get(
-                f"{self.base_url}/address/{address}", timeout=(5, 10)
+                f"{self.base_url}/address/{address}", timeout=(1, 2)
             )
             data = response.json()
         except Exception as e:

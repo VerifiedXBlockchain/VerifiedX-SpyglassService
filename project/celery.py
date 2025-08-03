@@ -23,7 +23,7 @@ def setup_periodic_tasks(sender, **kwargs):
     sender.add_periodic_task(5 * 60, update_cmc_prices.s(), name="Update CMC Prices")
 
     sender.add_periodic_task(
-        1 * 60, update_vbtc_balances.s(), name="Update VBTC Balances"
+        3 * 60, update_vbtc_balances.s(), name="Update VBTC Balances"
     )
 
     if settings.HEALTH_CHECK_ENABLED:
