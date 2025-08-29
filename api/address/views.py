@@ -109,6 +109,7 @@ class AddressDetailView(RetrieveModelMixin, AddressView):
             balance_locked_value = Decimal(balance_locked)
 
         activated = False
+        deactivated = False
         if address.is_ra:
             from rbx.models import Transaction
             import json
@@ -122,6 +123,9 @@ class AddressDetailView(RetrieveModelMixin, AddressView):
                     data = json.loads(tx.data)
                     if data["Function"] == "Register()":
                         activated = True
+                    if data["Function"] == "Recover()":
+                        deactivated = True
+                    if activated and deactivated:
                         break
 
         data = {
@@ -131,6 +135,7 @@ class AddressDetailView(RetrieveModelMixin, AddressView):
             "balance_locked": balance_locked_value,
             "adnr": address.adnr.domain if address.adnr else None,
             "activated": activated,
+            "deactivated": deactivated,
         }
 
         # serializer = AddressSerializer(payload)
