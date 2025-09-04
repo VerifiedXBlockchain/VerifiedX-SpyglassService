@@ -30,7 +30,8 @@ class AddressListView(ListModelMixin, AddressView):
         return self.list(request, *args, **kwargs)
 
 
-class AddressTopHoldersListView(AddressView):
+class AddressTopHoldersListView(GenericAPIView):
+    # This view returns a custom list, so it doesn't need filter backends
 
     def get(self, request, *args, **kwargs):
         from django.db.models import Sum, F, Value
