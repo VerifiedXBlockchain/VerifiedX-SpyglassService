@@ -98,6 +98,8 @@ logs_main_worker:
 run_cli:
 	/Applications/VFXWallet.app/Contents/Resources/RBXCore/ReserveBlockCore enableapi
 
+run_cli_testnet:
+	/Applications/VFXWallet.app/Contents/Resources/RBXCore/ReserveBlockCore testnet enableapi
 
 wal_testnet:
 	ssh root@159.203.76.174

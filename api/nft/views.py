@@ -39,7 +39,7 @@ class NftMultipleAddressesListView(ListModelMixin, NftView):
     def get_queryset(self):
         addresses: str = self.kwargs.get("addresses", None)
         if not addresses:
-            return []
+            return ALL_NFTS_QUERYSET.none()  # Return empty QuerySet instead of list
 
         address_list = addresses.split(",")
 

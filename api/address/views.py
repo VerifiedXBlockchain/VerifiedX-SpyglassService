@@ -30,7 +30,8 @@ class AddressListView(ListModelMixin, AddressView):
         return self.list(request, *args, **kwargs)
 
 
-class AddressTopHoldersListView(AddressView):
+class AddressTopHoldersListView(GenericAPIView):
+    # This view returns a custom list, so it doesn't need filter backends
 
     def get(self, request, *args, **kwargs):
         from django.db.models import Sum, F, Value
@@ -109,6 +110,7 @@ class AddressDetailView(RetrieveModelMixin, AddressView):
             balance_locked_value = Decimal(balance_locked)
 
         activated = False
+        deactivated = False
         if address.is_ra:
             from rbx.models import Transaction
             import json
@@ -122,6 +124,9 @@ class AddressDetailView(RetrieveModelMixin, AddressView):
                     data = json.loads(tx.data)
                     if data["Function"] == "Register()":
                         activated = True
+                    if data["Function"] == "Recover()":
+                        deactivated = True
+                    if activated and deactivated:
                         break
 
         data = {
@@ -131,6 +136,7 @@ class AddressDetailView(RetrieveModelMixin, AddressView):
             "balance_locked": balance_locked_value,
             "adnr": address.adnr.domain if address.adnr else None,
             "activated": activated,
+            "deactivated": deactivated,
         }
 
         # serializer = AddressSerializer(payload)

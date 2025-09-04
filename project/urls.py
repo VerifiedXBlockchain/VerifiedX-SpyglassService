@@ -16,11 +16,11 @@ if settings.API_ENABLED:
 
 schema_view = get_schema_view(
     openapi.Info(
-        title="RBX Explorer API",
+        title="VFX Web API",
         default_version="v1",
-        description="API endpoint documentation for the RBX explorer data service.",
-        terms_of_service="https://reserveblock.io",
-        contact=openapi.Contact(email="hello@reserveblock.io"),
+        description="API endpoint documentation for the VFX explorer data service.",
+        terms_of_service="https://verifiedx.io",
+        contact=openapi.Contact(email="dev@verifiedx.io"),
     ),
     public=True,
     permission_classes=[AllowAny],

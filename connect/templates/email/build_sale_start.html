@@ -3,9 +3,9 @@
 {% block body %}
 
 {% if is_buy_now %}
-    <h4>A Buy Now request has been sent from {{address}} for {{name}} ({{amount}} RBX).</h4>
+    <h4>A Buy Now request has been sent from {{address}} for {{name}} ({{amount}} VFX).</h4>
 {% else %}
-    <h4>Your auction for {{name}} has completed and was won by {{address}} for {{amount}} RBX.</h4>
+    <h4>Your auction for {{name}} has completed and was won by {{address}} for {{amount}} VFX.</h4>
 
 {% endif %}
     <p><a href="{{url}}">Click here</a> to launch the web wallet and finalize the transaction.</p>
@@ -24,7 +24,7 @@
         </tr>
         <tr>
             <td>Amount:</td>
-            <td>{{ amount }} RBX</td>
+            <td>{{ amount }} VFX</td>
         </tr>
     </table>
 
