@@ -480,7 +480,7 @@ def get_nft(id: str, attempt=0) -> Tuple[dict, int]:
         print("Could not get nft data after 5 tries")
         return None
 
-    url = join_url(SHOP_BASE_URL, f"/scapi/scv1/GetSmartContractData/{id}/")
+    url = join_url(BASE_URL, f"/scapi/scv1/GetSmartContractData/{id}/")
 
     try:
         response = requests.get(url)
