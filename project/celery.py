@@ -13,7 +13,6 @@ app = Celery(__name__)
 app.config_from_object("django.conf:settings", namespace="CELERY")
 app.autodiscover_tasks()
 
-# Configure default queue for all tasks (sync_the_blocks has explicit queue binding)
 app.conf.task_default_queue = "default"
 
 
@@ -25,9 +24,9 @@ def setup_periodic_tasks(sender, **kwargs):
 
     sender.add_periodic_task(5 * 60, update_cmc_prices.s(), name="Update CMC Prices")
 
-    # sender.add_periodic_task(
-    #     3 * 60, update_vbtc_balances.s(), name="Update VBTC Balances"
-    # )
+    sender.add_periodic_task(
+        20 * 60, update_vbtc_balances.s(), name="Update VBTC Balances"
+    )
 
     if settings.HEALTH_CHECK_ENABLED:
         sender.add_periodic_task(3 * 60, health_check.s(), name="Health Check")
@@ -97,7 +96,7 @@ def update_cmc_prices():
     management.call_command("fetch_cmc_prices")
 
 
-@app.task
+@app.task(queue="vbtc_queue")
 def update_vbtc_balances():
     from django.core import management
 

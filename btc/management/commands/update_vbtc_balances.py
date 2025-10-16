@@ -34,5 +34,5 @@ class Command(BaseCommand):
                     token.tx_count = balance_info["tx_count"]
                     token.save()
 
-                sleep(0.5)
+                sleep(0.1)
                 progress.update()
