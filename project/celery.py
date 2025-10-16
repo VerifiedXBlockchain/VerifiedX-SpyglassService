@@ -13,6 +13,9 @@ app = Celery(__name__)
 app.config_from_object("django.conf:settings", namespace="CELERY")
 app.autodiscover_tasks()
 
+# Configure default queue for all tasks (sync_the_blocks has explicit queue binding)
+app.conf.task_default_queue = 'default'
+
 
 @app.on_after_configure.connect
 def setup_periodic_tasks(sender, **kwargs):
@@ -42,7 +45,7 @@ def setup_periodic_tasks(sender, **kwargs):
         )
 
 
-@app.task
+@app.task(queue='blocks_queue')
 def sync_the_blocks():
     from django.core import management
 
