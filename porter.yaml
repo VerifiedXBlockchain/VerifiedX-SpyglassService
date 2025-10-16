@@ -6,10 +6,10 @@ services:
     run: "gunicorn --workers 3 project.wsgi --log-file -"
   - name: default-worker
     type: worker
-    run: "celery --app=project worker -Q default -n default_worker@%h --without-heartbeat --without-gossip --without-mingle --loglevel=DEBUG"
+    run: "celery --app=project worker --queues=default --hostname=default_worker@%h --without-heartbeat --without-gossip --without-mingle --loglevel=DEBUG"
   - name: blocks-worker
     type: worker
-    run: "celery --app=project worker -Q blocks_queue -n blocks_worker@%h --concurrency=1 --without-heartbeat --without-gossip --without-mingle --loglevel=DEBUG"
+    run: "celery --app=project worker --queues=blocks_queue --hostname=blocks_worker@%h --concurrency=1 --without-heartbeat --without-gossip --without-mingle --loglevel=DEBUG"
   - name: runner
     type: worker
     run: "celery --app=project beat --loglevel=DEBUG"
