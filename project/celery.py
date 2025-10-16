@@ -13,6 +13,13 @@ app = Celery(__name__)
 app.config_from_object("django.conf:settings", namespace="CELERY")
 app.autodiscover_tasks()
 
+# Configure task routing
+app.conf.task_routes = {
+    'project.celery.sync_the_blocks': {'queue': 'blocks_queue'},
+    'project.celery.*': {'queue': 'default'},
+}
+app.conf.task_default_queue = 'default'
+
 
 @app.on_after_configure.connect
 def setup_periodic_tasks(sender, **kwargs):

@@ -4,9 +4,12 @@ services:
   - name: web
     type: web
     run: "gunicorn --workers 3 project.wsgi --log-file -"
-  - name: worker
+  - name: default_worker
     type: worker
-    run: "celery --app=project worker --without-heartbeat --without-gossip --without-mingle --loglevel=DEBUG"
+    run: "celery --app=project worker -Q default -n default_worker@%h --without-heartbeat --without-gossip --without-mingle --loglevel=DEBUG"
+  - name: blocks_worker
+    type: worker
+    run: "celery --app=project worker -Q blocks_queue -n blocks_worker@%h --concurrency=1 --without-heartbeat --without-gossip --without-mingle --loglevel=DEBUG"
   - name: runner
     type: worker
     run: "celery --app=project beat --loglevel=DEBUG"
