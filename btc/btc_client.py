@@ -8,11 +8,18 @@ class BtcClient:
     base_url = f"https://mempool.space{'/testnet4' if settings.ENVIRONMENT == 'testnet' else ''}/api"
     satoshi_to_btc_multiplier = settings.SATOSHI_TO_BTC_MULTIPLIER
 
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+        'Accept': 'application/json',
+    }
+
     def get_balance(self, address: str):
 
         try:
             response = requests.get(
-                f"{self.base_url}/address/{address}", timeout=(1, 2)
+                f"{self.base_url}/address/{address}",
+                headers=self.headers,
+                timeout=(5, 10)
             )
             data = response.json()
         except Exception as e:
@@ -39,7 +46,7 @@ class BtcClient:
     def get_transactions(self, address: str):
         url = f"{self.base_url}/address/{address}/txs"
         try:
-            response = requests.get(url, timeout=(5, 10))
+            response = requests.get(url, headers=self.headers, timeout=(5, 10))
             data = response.json()
         except Exception as e:
             print("Error in BtcClient.get_transactions()")
