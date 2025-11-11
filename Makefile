@@ -86,6 +86,9 @@ shell_main:
 shell_testnet:
 	porter app run rbx-explorer-testnet -e -- bash
 
+shell_devnet:
+	porter app run vfx-explorer-devnet -e -- bash
+
 logs_main_runner:
 	porter app logs rbx-explorer-mainnet --service runner
 
