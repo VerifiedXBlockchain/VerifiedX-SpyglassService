@@ -19,11 +19,13 @@ app.conf.task_default_queue = "default"
 @app.on_after_configure.connect
 def setup_periodic_tasks(sender, **kwargs):
 
-    sender.add_periodic_task(10 * 60, sync_master_nodes.s(), name="Sync Master Nodes")
     sender.add_periodic_task(10, sync_the_blocks.s(), name="Sync Blocks")
 
-    sender.add_periodic_task(5 * 60, update_cmc_prices.s(), name="Update CMC Prices")
+    if settings.IS_DEVNET:
+        return
 
+    sender.add_periodic_task(5 * 60, update_cmc_prices.s(), name="Update CMC Prices")
+    sender.add_periodic_task(10 * 60, sync_master_nodes.s(), name="Sync Master Nodes")
     sender.add_periodic_task(
         20 * 60, update_vbtc_balances.s(), name="Update VBTC Balances"
     )
