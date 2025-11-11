@@ -5,9 +5,6 @@ import requests
 
 class BtcClient:
 
-    is_blockchain_info = True
-    base_url = "https://blockchain.info"
-
     satoshi_to_btc_multiplier = settings.SATOSHI_TO_BTC_MULTIPLIER
 
     headers = {
@@ -18,28 +15,20 @@ class BtcClient:
     def __init__(self):
 
         if settings.ENVIRONMENT == "testnet":
-            self.base_url = "https://blockbook.tbtc-1.zelcore.io/api/v2"
-            self.is_blockchain_info = False
+            self.base_url = "https://api.blockcypher.com/v1/btc/test3"
+        else:
+            self.base_url = "https://api.blockcypher.com/v1/btc/main"
 
     def get_balance(self, address: str):
 
         try:
-            if self.is_blockchain_info:
-                # Blockchain.info API format
-                url = f"{self.base_url}/rawaddr/{address}"
-                response = requests.get(
-                    url,
-                    headers=self.headers,
-                    timeout=(5, 10),
-                )
-            else:
-                # Blockbook API v2 format
-                url = f"{self.base_url}/address/{address}"
-                response = requests.get(
-                    url,
-                    headers=self.headers,
-                    timeout=(5, 10),
-                )
+            # BlockCypher API format
+            url = f"{self.base_url}/addrs/{address}/balance"
+            response = requests.get(
+                url,
+                headers=self.headers,
+                timeout=(5, 10),
+            )
 
             response.raise_for_status()
             data = response.json()
@@ -48,24 +37,14 @@ class BtcClient:
             print(e)
             return None
 
-        if self.is_blockchain_info:
-            # Blockchain.info returns values in satoshis
-            total_recieved = Decimal(
-                int(data.get("total_received", 0)) * self.satoshi_to_btc_multiplier
-            )
-            total_sent = Decimal(
-                int(data.get("total_sent", 0)) * self.satoshi_to_btc_multiplier
-            )
-            tx_count = data.get("n_tx", 0)
-        else:
-            # Blockbook API v2 returns values in satoshis as strings
-            total_recieved = Decimal(
-                int(data.get("totalReceived", 0)) * self.satoshi_to_btc_multiplier
-            )
-            total_sent = Decimal(
-                int(data.get("totalSent", 0)) * self.satoshi_to_btc_multiplier
-            )
-            tx_count = data.get("txs", 0)
+        # BlockCypher returns values in satoshis
+        total_recieved = Decimal(
+            int(data.get("total_received", 0)) * self.satoshi_to_btc_multiplier
+        )
+        total_sent = Decimal(
+            int(data.get("total_sent", 0)) * self.satoshi_to_btc_multiplier
+        )
+        tx_count = data.get("n_tx", 0)
 
         return {
             "total_recieved": total_recieved,
@@ -75,8 +54,8 @@ class BtcClient:
         }
 
     def get_transactions(self, address: str):
-        # Blockbook API v2 uses different endpoint structure
-        url = f"{self.base_url}/address/{address}"
+        # BlockCypher API endpoint
+        url = f"{self.base_url}/addrs/{address}"
         try:
             response = requests.get(url, headers=self.headers, timeout=(5, 10))
             data = response.json()
@@ -85,7 +64,7 @@ class BtcClient:
             print(e)
             return None
 
-        # Blockbook returns txids in the address endpoint
+        # BlockCypher returns txrefs (transaction references)
         # For full tx details, you'd need to query each txid separately
-        # Returning the txids array for now
-        return data.get("txids", [])
+        # Returning the txrefs array for now
+        return data.get("txrefs", [])
