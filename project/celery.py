@@ -27,7 +27,7 @@ def setup_periodic_tasks(sender, **kwargs):
     sender.add_periodic_task(5 * 60, update_cmc_prices.s(), name="Update CMC Prices")
     sender.add_periodic_task(10 * 60, sync_master_nodes.s(), name="Sync Master Nodes")
     sender.add_periodic_task(
-        20 * 60, update_vbtc_balances.s(), name="Update VBTC Balances"
+        2.5 * 60 * 60, update_vbtc_balances.s(), name="Update VBTC Balances"
     )
 
     if settings.HEALTH_CHECK_ENABLED:
