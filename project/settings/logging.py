@@ -5,8 +5,8 @@ import sentry_sdk
 from project.settings.environment import ENV, VERSION
 
 logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
+    level=logging.DEBUG if ENV.bool("DEBUG", default=False) else logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     handlers=[logging.StreamHandler()],
 )
 

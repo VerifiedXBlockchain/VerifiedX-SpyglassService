@@ -101,14 +101,10 @@ class SendMasterNodesView(ListModelMixin, CreateModelMixin, GenericAPIView):
         try:
             data = self.request.data
 
-            print(data)
             if not data:
                 return Response({"success": False, "message": "No data"}, status=400)
 
             for d in data:
-                print("----")
-                print(d)
-                print("----")
 
                 try:
                     mn = SentMasterNode.objects.get(address=d["Address"])
