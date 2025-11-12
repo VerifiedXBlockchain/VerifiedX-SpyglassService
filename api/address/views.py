@@ -86,25 +86,16 @@ class AddressTopHoldersListView(GenericAPIView):
 class AddressDetailView(RetrieveModelMixin, AddressView):
     lookup_field = "address"
 
-    def get_object(self):
-        """Override to suppress 404 logging - expected behavior"""
+    def get(self, request, *args, **kwargs):
         from django.http import Http404
-        import logging
-
-        logger = logging.getLogger('django.request')
-        original_level = logger.level
 
         try:
-            # Temporarily disable logging for 404s
-            logger.setLevel(logging.CRITICAL + 1)
-            return super().get_object()
+            address: Address = self.get_object()
         except Http404:
-            raise
-        finally:
-            logger.setLevel(original_level)
-
-    def get(self, request, *args, **kwargs):
-        address: Address = self.get_object()
+            return Response(
+                {"detail": "Address not found"},
+                status=status.HTTP_404_NOT_FOUND
+            )
         (
             balance_available,
             balance_locked,
