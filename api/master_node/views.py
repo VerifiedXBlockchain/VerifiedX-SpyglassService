@@ -98,8 +98,6 @@ class SendMasterNodesView(ListModelMixin, CreateModelMixin, GenericAPIView):
 
     def post(self, request, *args, **kwargs):
 
-        print("SendMasterNodesView")
-
         try:
             data = self.request.data
 

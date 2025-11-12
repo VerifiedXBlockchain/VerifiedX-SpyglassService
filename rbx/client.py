@@ -1056,20 +1056,16 @@ def send_testnet_funds(from_address: str, to_address: str, amount: Decimal):
 
 
 def withdraw_btc(payload: dict):
+    logger = logging.getLogger(__name__)
 
-    print("WITHDRAW_BTC")
-    print("PAYLOAD")
-    print("****")
-    print(json.dumps(payload))
-    print("****")
+    logger.info("WITHDRAW_BTC")
+    logger.info(f"PAYLOAD: {json.dumps(payload)}")
 
     url = join_url(BASE_URL, f"btcapi/btcv2/WithdrawalCoinRawTX")
-    print("URL")
-    print(url)
+    logger.info(f"URL: {url}")
 
     response = requests.post(url, json=payload)
 
     data = response.json()
-    print("RESPONSE:")
-    print(json.dumps(data))
+    logger.info(f"RESPONSE: {json.dumps(data)}")
     return data
