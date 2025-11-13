@@ -103,6 +103,7 @@ class VbtcListView(GenericAPIView):
             VbtcToken.objects.filter(sc_identifier__in=sc_identifiers)
             .exclude(sc_identifier="2442522a3fd34270b77a64b07eb34b7f:1736792655")
             .exclude(sc_identifier="320c5271fc04465cb24c4f1cd48affd4:1736625395")
+            .order_by('-created_at')
         )
 
         results = VbtcTokenSerializer(tokens, many=True).data
@@ -131,7 +132,7 @@ class VbtcListAllView(GenericAPIView):
         ):
             sc_identifiers.append(token.sc_identifier)
 
-        tokens = VbtcToken.objects.filter(sc_identifier__in=sc_identifiers)
+        tokens = VbtcToken.objects.filter(sc_identifier__in=sc_identifiers).order_by('-created_at')
 
         results = VbtcTokenSerializer(tokens, many=True).data
 
