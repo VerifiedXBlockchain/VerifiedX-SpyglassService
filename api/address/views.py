@@ -83,15 +83,13 @@ class AddressTopHoldersListView(GenericAPIView):
         return Response(top_balances, status=200)
 
 
-class AddressDetailView(RetrieveModelMixin, AddressView):
-    lookup_field = "address"
-
+class AddressDetailView(AddressView):
     def get(self, request, *args, **kwargs):
-        from django.http import Http404
+        address_str = kwargs.get("address")
 
         try:
-            address: Address = self.get_object()
-        except Http404:
+            address = Address.objects.get(address=address_str)
+        except Address.DoesNotExist:
             return Response(
                 {"detail": "Address not found"},
                 status=status.HTTP_404_NOT_FOUND
@@ -152,11 +150,17 @@ class AddressDetailView(RetrieveModelMixin, AddressView):
         return Response(data, status=200)
 
 
-class AddressTokensDetailView(RetrieveModelMixin, AddressView):
-    lookup_field = "address"
-
+class AddressTokensDetailView(AddressView):
     def get(self, request, *args, **kwargs):
-        address: Address = self.get_object()
+        address_str = kwargs.get("address")
+
+        try:
+            address = Address.objects.get(address=address_str)
+        except Address.DoesNotExist:
+            return Response(
+                {"detail": "Address not found"},
+                status=status.HTTP_404_NOT_FOUND
+            )
 
         results = address.get_fungible_token_balances(serialize_token=True)
 
