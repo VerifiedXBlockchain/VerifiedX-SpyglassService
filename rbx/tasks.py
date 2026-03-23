@@ -36,6 +36,9 @@ from rbx.models import (
     Callback,
     VbtcToken,
     VbtcTokenAmountTransfer,
+    VbtcV2Token,
+    VbtcV2TokenTransfer,
+    VbtcV2WithdrawalRequest,
 )
 from rbx.utils import get_ip_location, network_metrics
 from dateutil import parser
@@ -186,6 +189,9 @@ def sync_block(height: int) -> None:
         block.save()
 
     for transaction in data["Transactions"]:
+        if transaction.get("TransactionStatus") == 999:
+            continue
+
         unlock_time = None
         if "UnlockTime" in transaction and transaction["UnlockTime"]:
             unlock_time = timezone.make_aware(
@@ -315,7 +321,7 @@ def resync_balances() -> None:
 
 def process_transaction(tx: Transaction):
     print(f"Processing TX {tx.hash}")
-    if tx.type in [Transaction.Type.NFT_MINT, Transaction.Type.TKNZ_MINT]:
+    if tx.type in [Transaction.Type.NFT_MINT, Transaction.Type.TKNZ_MINT, Transaction.Type.VBTC_V2_MINT]:
         logging.info(f"NFT Mint: {tx.hash}")
 
         parsed = json.loads(tx.data)[0]
@@ -441,6 +447,34 @@ def process_transaction(tx: Transaction):
                         nft.save()
 
                         handle_vbtc_icon_upload.apply_async(args=[identifier])
+
+                    if feature["FeatureName"] == 14:
+                        v2_info = feature["FeatureFeatures"]
+
+                        try:
+                            v2_token = VbtcV2Token.objects.get(sc_identifier=identifier)
+                        except VbtcV2Token.DoesNotExist:
+                            v2_token = VbtcV2Token(sc_identifier=identifier)
+
+                        v2_token.nft = nft
+                        v2_token.name = nft.name
+                        v2_token.description = nft.description
+                        v2_token.owner_address = nft.owner_address
+                        v2_token.image_base64 = v2_info.get("ImageBase", "default")
+                        v2_token.deposit_address = v2_info["DepositAddress"]
+                        v2_token.frost_group_public_key = v2_info.get("FrostGroupPublicKey", "")
+                        v2_token.dkg_proof = v2_info.get("DKGProof", "")
+                        v2_token.validator_snapshot = v2_info.get("ValidatorSnapshot")
+                        v2_token.required_threshold = v2_info.get("RequiredThreshold", 0)
+                        v2_token.proof_block_height = v2_info.get("ProofBlockHeight", 0)
+                        v2_token.global_balance = Decimal(0)
+                        v2_token.created_at = tx.date_crafted
+                        v2_token.save()
+
+                        nft.is_vbtc = True
+                        nft.save()
+
+                        handle_vbtc_v2_icon_upload.apply_async(args=[identifier])
 
         return
 
@@ -836,6 +870,102 @@ def process_transaction(tx: Transaction):
                 except Exception as e:
                     print("ERROR")
                     print(e)
+
+    elif tx.type == Transaction.Type.VBTC_V2_TRANSFER:
+        parsed = json.loads(tx.data)
+        if isinstance(parsed, list):
+            parsed = parsed[0]
+
+        func = parsed["Function"]
+
+        if func == "TransferVBTCV2()":
+            sc_identifier = parsed["ContractUID"]
+            from_address = parsed["FromAddress"]
+            to_address = parsed["ToAddress"]
+            amount = Decimal(parsed["Amount"])
+
+            try:
+                token = VbtcV2Token.objects.get(sc_identifier=sc_identifier)
+            except VbtcV2Token.DoesNotExist:
+                logging.error(f"VbtcV2Token with sc id of {sc_identifier} not found.")
+                return
+
+            VbtcV2TokenTransfer.objects.create(
+                token=token,
+                transaction=tx,
+                from_address=from_address,
+                to_address=to_address,
+                amount=amount,
+                created_at=tx.date_crafted,
+            )
+
+    elif tx.type == Transaction.Type.VBTC_V2_WITHDRAWAL_REQUEST:
+        parsed = json.loads(tx.data)
+        if isinstance(parsed, list):
+            parsed = parsed[0]
+
+        func = parsed["Function"]
+
+        if func == "VBTCWithdrawalRequest()":
+            sc_identifier = parsed["ContractUID"]
+
+            try:
+                token = VbtcV2Token.objects.get(sc_identifier=sc_identifier)
+            except VbtcV2Token.DoesNotExist:
+                logging.error(f"VbtcV2Token with sc id of {sc_identifier} not found.")
+                return
+
+            VbtcV2WithdrawalRequest.objects.create(
+                token=token,
+                request_transaction=tx,
+                requestor_address=parsed["RequestorAddress"],
+                btc_address=parsed["BTCAddress"],
+                amount=Decimal(parsed["Amount"]),
+                fee_rate=Decimal(parsed["FeeRate"]),
+                status=VbtcV2WithdrawalRequest.Status.REQUESTED,
+                created_at=tx.date_crafted,
+            )
+
+            token.is_pending_withdrawal = True
+            token.save()
+
+    elif tx.type == Transaction.Type.VBTC_V2_WITHDRAWAL_COMPLETE:
+        parsed = json.loads(tx.data)
+        if isinstance(parsed, list):
+            parsed = parsed[0]
+
+        func = parsed["Function"]
+
+        if func == "VBTCWithdrawalComplete()":
+            sc_identifier = parsed["ContractUID"]
+            withdrawal_request_hash = parsed["WithdrawalRequestHash"]
+
+            try:
+                token = VbtcV2Token.objects.get(sc_identifier=sc_identifier)
+            except VbtcV2Token.DoesNotExist:
+                logging.error(f"VbtcV2Token with sc id of {sc_identifier} not found.")
+                return
+
+            try:
+                withdrawal = VbtcV2WithdrawalRequest.objects.get(
+                    request_transaction__hash=withdrawal_request_hash
+                )
+            except VbtcV2WithdrawalRequest.DoesNotExist:
+                logging.error(
+                    f"Withdrawal request with hash {withdrawal_request_hash} not found."
+                )
+                return
+
+            withdrawal.completion_transaction = tx
+            withdrawal.btc_transaction_hash = parsed["BTCTransactionHash"]
+            withdrawal.status = VbtcV2WithdrawalRequest.Status.COMPLETED
+            withdrawal.completed_at = tx.date_crafted
+            withdrawal.save()
+
+            token.global_balance -= Decimal(parsed["Amount"])
+            token.total_sent += Decimal(parsed["Amount"])
+            token.is_pending_withdrawal = False
+            token.save()
 
 
 # def handle_unavailable_nft(tx: Transaction, data: dict):
@@ -1256,6 +1386,35 @@ def handle_vbtc_icon_upload(sc_identifier: str):
 
         vbtc_token.image_base64_url = url
         vbtc_token.save()
+
+
+@app.task(autoretry_for=[RBXException])
+def handle_vbtc_v2_icon_upload(sc_identifier: str):
+
+    import tempfile
+
+    try:
+        v2_token = VbtcV2Token.objects.get(sc_identifier=sc_identifier)
+    except VbtcV2Token.DoesNotExist:
+        print(f"VbtcV2Token not found with sc_id of {sc_identifier}")
+        return
+
+    if v2_token.image_is_default:
+        return
+
+    image_data = base64.b64decode(v2_token.image_base64)
+
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as temp_file:
+        temp_file.write(image_data)
+        temp_file.flush()
+        url = upload_to_s3(
+            sc_identifier,
+            temp_file.name,
+            bucket=settings.AWS_BUCKET_NFT_ASSETS,
+        )
+
+        v2_token.image_base64_url = url
+        v2_token.save()
 
 
 def notify_socket_service(payload: dict):
