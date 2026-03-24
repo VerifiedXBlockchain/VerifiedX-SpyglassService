@@ -170,6 +170,12 @@ class Transaction(models.Model):
         VBTC_V2_TRANSFER = 26
         VBTC_V2_WITHDRAWAL_REQUEST = 27
         VBTC_V2_WITHDRAWAL_COMPLETE = 28
+        VFX_SHIELD = 31
+        VFX_UNSHIELD = 32
+        VFX_PRIVATE_TRANSFER = 33
+        VBTC_V2_SHIELD = 34
+        VBTC_V2_UNSHIELD = 35
+        VBTC_V2_PRIVATE_TRANSFER = 36
 
     hash = models.CharField(_("Hash"), primary_key=True, max_length=255, db_index=True)
     block = models.ForeignKey(
@@ -275,6 +281,18 @@ class Transaction(models.Model):
             return "vBTC V2 Withdrawal Request"
         if self.type == Transaction.Type.VBTC_V2_WITHDRAWAL_COMPLETE:
             return "vBTC V2 Withdrawal Complete"
+        if self.type == Transaction.Type.VFX_SHIELD:
+            return "VFX Shield"
+        if self.type == Transaction.Type.VFX_UNSHIELD:
+            return "VFX Unshield"
+        if self.type == Transaction.Type.VFX_PRIVATE_TRANSFER:
+            return "VFX Private Transfer"
+        if self.type == Transaction.Type.VBTC_V2_SHIELD:
+            return "vBTC Shield"
+        if self.type == Transaction.Type.VBTC_V2_UNSHIELD:
+            return "vBTC Unshield"
+        if self.type == Transaction.Type.VBTC_V2_PRIVATE_TRANSFER:
+            return "vBTC Private Transfer"
 
         return f"{self.type}"
 
@@ -632,6 +650,9 @@ class Circulation(SingletonModel):
     total_master_nodes = models.PositiveIntegerField(default=0)
     total_addresses = models.IntegerField(default=0)
     total_transactions = models.IntegerField(default=0)
+    total_shielded_vfx = models.DecimalField(decimal_places=16, max_digits=32, default=0)
+    total_shielded_vbtc = models.DecimalField(decimal_places=16, max_digits=32, default=0)
+    total_privacy_transactions = models.IntegerField(default=0)
 
     updated_at = models.DateTimeField(auto_now=True)
 

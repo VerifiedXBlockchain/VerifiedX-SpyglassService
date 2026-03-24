@@ -55,8 +55,15 @@ class AddressTopHoldersListView(GenericAPIView):
             .values("total_sent_with_fees")
         )
 
+        EXCLUDED_ADDRESSES = [
+            "Shielded_Pool",
+            "Coinbase_BlkRwd",
+            "Coinbase_TrxFees",
+        ]
+
         received_qs = (
-            Transaction.objects.values("to_address")
+            Transaction.objects.exclude(to_address__in=EXCLUDED_ADDRESSES)
+            .values("to_address")
             .annotate(
                 total_received=Coalesce(Sum("total_amount"), Value(Decimal(0))),
                 total_sent=Coalesce(Subquery(sent_subquery), Value(Decimal(0))),

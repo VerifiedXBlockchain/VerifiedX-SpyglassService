@@ -967,6 +967,55 @@ def process_transaction(tx: Transaction):
             token.is_pending_withdrawal = False
             token.save()
 
+    elif tx.type in [
+        Transaction.Type.VFX_SHIELD,
+        Transaction.Type.VFX_UNSHIELD,
+        Transaction.Type.VFX_PRIVATE_TRANSFER,
+        Transaction.Type.VBTC_V2_SHIELD,
+        Transaction.Type.VBTC_V2_UNSHIELD,
+        Transaction.Type.VBTC_V2_PRIVATE_TRANSFER,
+    ]:
+        process_privacy_transaction(tx)
+
+
+def process_privacy_transaction(tx: Transaction):
+    """Process a PRISM privacy transaction and update shielded pool totals."""
+    circulation = Circulation.load()
+
+    if tx.type == Transaction.Type.VFX_SHIELD:
+        circulation.total_shielded_vfx += tx.total_amount
+
+    elif tx.type == Transaction.Type.VFX_UNSHIELD:
+        circulation.total_shielded_vfx -= tx.total_amount
+
+    elif tx.type == Transaction.Type.VBTC_V2_SHIELD:
+        vbtc_amt = _parse_vbtc_amount_from_payload(tx.data)
+        if vbtc_amt:
+            circulation.total_shielded_vbtc += vbtc_amt
+
+    elif tx.type == Transaction.Type.VBTC_V2_UNSHIELD:
+        vbtc_amt = _parse_vbtc_amount_from_payload(tx.data)
+        if vbtc_amt:
+            circulation.total_shielded_vbtc -= vbtc_amt
+
+    circulation.total_privacy_transactions += 1
+    circulation.save()
+
+
+def _parse_vbtc_amount_from_payload(data) -> Decimal:
+    """Extract vbtc_amt from a PrivateTxPayload stored in tx.data."""
+    try:
+        if isinstance(data, str):
+            payload = json.loads(data)
+        else:
+            payload = data
+        if isinstance(payload, list):
+            payload = payload[0]
+        vbtc_amt = payload.get("vbtc_amt", 0)
+        return Decimal(str(vbtc_amt))
+    except (json.JSONDecodeError, TypeError, KeyError, ValueError):
+        return Decimal(0)
+
 
 # def handle_unavailable_nft(tx: Transaction, data: dict):
 

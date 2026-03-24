@@ -27,6 +27,9 @@ def circulation(request):
         "total_master_nodes": circulation.total_master_nodes,
         "total_addresses": circulation.total_addresses,
         "total_transactions": circulation.total_transactions,
+        "total_shielded_vfx": circulation.total_shielded_vfx,
+        "total_shielded_vbtc": circulation.total_shielded_vbtc,
+        "total_privacy_transactions": circulation.total_privacy_transactions,
         "cli_version": "5.0.1.xxx-beta",
     }
     return Response(data, status=status.HTTP_200_OK)
