@@ -345,18 +345,26 @@ def beacon_upload_request(
         f"txapi/txV1/CreateBeaconUploadRequest/{id}/{to_address}/{quote(signature, safe='')}",
     )
 
-    response = requests.get(url)
+    try:
+        response = requests.get(url)
+    except requests.RequestException as e:
+        logger.error(f"Beacon upload request failed: {e}")
+        return None
 
-    logger.debug(f"Beacon upload request URL: {url}")
-    logger.debug(f"Beacon upload response: {response.text}")
+    logger.error(f"Beacon upload URL: {url}")
+    logger.error(f"Beacon upload status: {response.status_code}")
+    logger.error(f"Beacon upload response: {response.text}")
 
     try:
         data = response.json()
-        if data["Success"]:
-            return data["Locator"]
+        if data.get("Success"):
+            return data.get("Locator")
+        else:
+            logger.error(f"Beacon upload not successful: {data}")
     except json.JSONDecodeError as e:
-        logger.error(f"JSON decode error in beacon upload: {e}")
-        return None
+        logger.error(f"Beacon upload JSON decode error: {e} | raw: {response.text}")
+
+    return None
 
 
 # region Transactions

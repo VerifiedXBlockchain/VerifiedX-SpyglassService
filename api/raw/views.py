@@ -157,7 +157,10 @@ class BeaconUploadRequestView(GenericAPIView):
                 {"success": True, "locator": locator}, status=status.HTTP_200_OK
             )
 
-        return Response({}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        return Response(
+            {"success": False, "error": "Beacon upload request failed"},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
 
 
 class BeaconAssetsView(GenericAPIView):

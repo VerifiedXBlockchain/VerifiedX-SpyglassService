@@ -10,6 +10,9 @@ logging.basicConfig(
     handlers=[logging.StreamHandler()],
 )
 
+# Suppress noisy 404 logs from django.request (e.g. unknown addresses)
+logging.getLogger("django.request").setLevel(logging.CRITICAL)
+
 # Sentry
 # https://docs.sentry.io/platforms/python/django/
 
