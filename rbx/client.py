@@ -3,7 +3,6 @@ import string
 import time
 from decimal import Decimal
 from typing import List, Optional, Tuple
-from urllib.parse import quote
 
 import requests
 from django.conf import settings
@@ -322,7 +321,7 @@ def get_beacon_assets(
     logger = logging.getLogger(__name__)
     url = join_url(
         SHOP_BASE_URL,
-        f"bcapi/bcV1/GetBeaconAssets/{id}/{locators}/{address}/{quote(signature, safe='')}",
+        f"bcapi/bcV1/GetBeaconAssets/{id}/{locators}/{address}/{signature}",
     )
     logger.debug(f"Beacon assets URL: {url}")
 
@@ -342,7 +341,7 @@ def beacon_upload_request(
     logger = logging.getLogger(__name__)
     url = join_url(
         SHOP_BASE_URL,
-        f"txapi/txV1/CreateBeaconUploadRequest/{id}/{to_address}/{quote(signature, safe='')}",
+        f"txapi/txV1/CreateBeaconUploadRequest/{id}/{to_address}/{signature}",
     )
 
     try:
@@ -431,7 +430,7 @@ def get_tx_hash(tx: dict) -> Optional[str]:
 
 def validate_signature(message: str, address: str, signature: str) -> bool:
     url = join_url(
-        BASE_URL, f"/txapi/txV1/ValidateSignature/{message}/{address}/{quote(signature, safe='')}/"
+        BASE_URL, f"/txapi/txV1/ValidateSignature/{message}/{address}/{signature}/"
     )
     response = requests.get(url)
 
@@ -538,7 +537,7 @@ def get_network_metrics() -> Optional[dict]:
 
 def validate_signature(message, address, signature):
     url = join_url(
-        BASE_URL, f"txapi/TXV1/ValidateSignature/{message}/{address}/{quote(signature, safe='')}"
+        BASE_URL, f"txapi/TXV1/ValidateSignature/{message}/{address}/{signature}"
     )
     response = requests.get(url)
 
