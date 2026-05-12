@@ -129,17 +129,7 @@ def tx_send(transaction: dict) -> Tuple[dict, int]:
     data = transaction
     data["Amount"] = _fix_amount(data["Amount"])
 
-    print("-----------------")
-    print("-----NEW TX------")
-    print(url)
-    print("==================")
-    print(json.dumps(data))
-    print("==================")
-
     response = requests.post(url, json=data)
-    print("---RESPONSE---")
-    print(response.text)
-    print("---------------")
 
     if response.status_code != 200:
         raise RBXException
@@ -164,6 +154,7 @@ def get_smart_contract(identifier: str) -> Optional[dict]:
 
 
 def nft_data(payload: dict, *args) -> Optional[dict]:
+    logger = logging.getLogger(__name__)
     url = join_url(SHOP_BASE_URL, f"txapi/txv1/GetSCMintDeployData/")
 
     asset_urls = {}
@@ -210,19 +201,15 @@ def nft_data(payload: dict, *args) -> Optional[dict]:
 
             feature_i += 1
 
-    print("------------")
-    print(json.dumps(payload))
-    print("------------")
-
     response = requests.post(url, json=payload)
 
-    print(response.text)
+    logger.debug(f"NFT data response: {response.text}")
 
     if response.status_code != 200:
         raise RBXException
     try:
         r = response.json()
-        print(r)
+        logger.debug(f"NFT data json: {r}")
         data = r[0]
 
         Nft.objects.create(
@@ -242,7 +229,7 @@ def nft_data(payload: dict, *args) -> Optional[dict]:
         return r
 
     except Exception as e:
-        print(e)
+        logger.error(f"NFT data error: {e}")
         return None
 
 
@@ -331,17 +318,16 @@ def get_locators(id: str, *args) -> Tuple[dict, int]:
 def get_beacon_assets(
     id: str, locators: str, address: str, signature: str, *args
 ) -> bool:
+    logger = logging.getLogger(__name__)
     url = join_url(
         SHOP_BASE_URL,
         f"bcapi/bcV1/GetBeaconAssets/{id}/{locators}/{address}/{signature}",
     )
-    print(url)
+    logger.debug(f"Beacon assets URL: {url}")
 
     response = requests.get(url)
 
-    print("RESPONSE:")
-    print(response.text)
-    print("----------------")
+    logger.debug(f"Beacon assets response: {response.text}")
 
     if response.status_code != 200:
         raise RBXException
@@ -352,29 +338,32 @@ def get_beacon_assets(
 def beacon_upload_request(
     id: str, to_address: str, signature: str, *args
 ) -> Optional[str]:
+    logger = logging.getLogger(__name__)
     url = join_url(
         SHOP_BASE_URL,
         f"txapi/txV1/CreateBeaconUploadRequest/{id}/{to_address}/{signature}",
     )
 
-    response = requests.get(url)
+    try:
+        response = requests.get(url)
+    except requests.RequestException as e:
+        logger.error(f"Beacon upload request failed: {e}")
+        return None
 
-    print("****")
-    print(url)
-    print("****")
-
-    print("----------")
-    print(response.text)
-    print("----------")
+    logger.error(f"Beacon upload URL: {url}")
+    logger.error(f"Beacon upload status: {response.status_code}")
+    logger.error(f"Beacon upload response: {response.text}")
 
     try:
         data = response.json()
-        if data["Success"]:
-            return data["Locator"]
+        if data.get("Success"):
+            return data.get("Locator")
+        else:
+            logger.error(f"Beacon upload not successful: {data}")
     except json.JSONDecodeError as e:
-        print("JSON DECODE ERROR")
-        print(e)
-        return None
+        logger.error(f"Beacon upload JSON decode error: {e} | raw: {response.text}")
+
+    return None
 
 
 # region Transactions
@@ -395,10 +384,11 @@ def get_timestamp() -> Optional[int]:
 
 
 def get_address_nonce(address: str) -> Optional[Decimal]:
+    logger = logging.getLogger(__name__)
     url = join_url(BASE_URL, f"/txapi/txV1/GetAddressNonce/{address}")
     response = requests.get(url)
 
-    print(response.json())
+    logger.debug(f"Address nonce response: {response.json()}")
 
     if response.status_code != 200:
         raise RBXException
@@ -474,10 +464,11 @@ def handle_raw_transaction(tx: dict, execute: bool = False) -> bool:
 
 # region Nfts
 def get_nft(id: str, attempt=0) -> Tuple[dict, int]:
+    logger = logging.getLogger(__name__)
     attempt += 1
 
     if attempt > 5:
-        print("Could not get nft data after 5 tries")
+        logger.error("Could not get nft data after 5 tries")
         return None
 
     url = join_url(BASE_URL, f"/scapi/scv1/GetSmartContractData/{id}/")
@@ -486,20 +477,19 @@ def get_nft(id: str, attempt=0) -> Tuple[dict, int]:
         response = requests.get(url)
         return response.json()
     except Exception as e:
-        print("NFT Get Data Exception")
-        print(e)
+        logger.error(f"NFT get data exception: {e}")
         time.sleep(5)
         return get_nft(id, attempt)
 
 
 def verify_nft_ownership(sig: str) -> bool:
-
+    logger = logging.getLogger(__name__)
     url = join_url(SHOP_BASE_URL, f"/scapi/scv1/VerifyOwnership/{sig}")
 
     response = requests.get(url)
 
-    print(url)
-    print(response.text)
+    logger.debug(f"Verify NFT ownership URL: {url}")
+    logger.debug(f"Verify NFT ownership response: {response.text}")
 
     try:
         data = response.json()
@@ -897,9 +887,7 @@ def send_raw_bid(bid: Bid) -> bool:
     headers = {"Content-Type": "application/json"}
     json_payload = json.dumps(payload, cls=DecimalEncoder)
 
-    print("------json_payload-------")
-    print(json_payload)
-    print("------json_payload-------")
+    logging.debug(f"Raw bid json payload: {json_payload}")
 
     shop_url = bid.listing.collection.shop.url
 
@@ -1056,10 +1044,16 @@ def send_testnet_funds(from_address: str, to_address: str, amount: Decimal):
 
 
 def withdraw_btc(payload: dict):
+    logger = logging.getLogger(__name__)
+
+    logger.info("WITHDRAW_BTC")
+    logger.info(f"PAYLOAD: {json.dumps(payload)}")
 
     url = join_url(BASE_URL, f"btcapi/btcv2/WithdrawalCoinRawTX")
+    logger.info(f"URL: {url}")
+
     response = requests.post(url, json=payload)
 
     data = response.json()
-    print(data)
+    logger.info(f"RESPONSE: {json.dumps(data)}")
     return data

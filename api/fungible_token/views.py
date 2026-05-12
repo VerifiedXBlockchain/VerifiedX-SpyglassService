@@ -24,6 +24,9 @@ class FungibleTokenView(GenericAPIView):
 
 class FungibleTokenListView(FungibleTokenView, ListModelMixin):
 
+    def get_queryset(self):
+        return FungibleToken.objects.all().order_by('-create_transaction__date_crafted')
+
     def get(self, request, *args, **kwargs):
 
         return self.list(request, *args, **kwargs)
