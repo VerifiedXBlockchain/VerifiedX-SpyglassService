@@ -21,7 +21,7 @@ from django.contrib.postgres.fields import ArrayField
 class MasterNode(models.Model):
     address = models.CharField(_("Address"), primary_key=True, max_length=255)
     name = models.CharField(_("Name"), max_length=255, blank=True, null=True)
-    is_active = models.BooleanField(_("Active"), default=True)
+    is_active = models.BooleanField(_("Active"), default=True, db_index=True)
     connection_id = models.TextField(_("Connection ID"), blank=True)
     ip_address = models.CharField(
         _("IP Address"), max_length=255, blank=True, null=True
@@ -29,7 +29,7 @@ class MasterNode(models.Model):
     wallet_version = models.CharField(
         _("Wallet Version"), max_length=255, blank=True, null=True
     )
-    date_connected = models.DateTimeField(_("Date Connected"))
+    date_connected = models.DateTimeField(_("Date Connected"), db_index=True)
 
     city = models.CharField(_("City"), max_length=255, blank=True, null=True)
     region = models.CharField(_("Region"), max_length=255, blank=True, null=True)
@@ -127,7 +127,7 @@ class Block(models.Model):
     size = models.IntegerField(_("Size"), default=0)
 
     craft_time = models.IntegerField(_("Craft Time"), default=0)
-    date_crafted = models.DateTimeField(_("Date Crafted"))
+    date_crafted = models.DateTimeField(_("Date Crafted"), db_index=True)
 
     objects = BlockManager()
 
@@ -179,7 +179,7 @@ class Transaction(models.Model):
         on_delete=models.CASCADE,
     )
     height = models.IntegerField(_("Height"))
-    type = models.IntegerField(_("Type"), choices=Type.choices)
+    type = models.IntegerField(_("Type"), choices=Type.choices, db_index=True)
 
     to_address = models.CharField(_("To Address"), max_length=255, db_index=True)
     from_address = models.CharField(_("From Address"), max_length=255, db_index=True)
@@ -196,7 +196,7 @@ class Transaction(models.Model):
         _("Validator Signature"), max_length=255, blank=True, null=True
     )
 
-    date_crafted = models.DateTimeField(_("Date Crafted"))
+    date_crafted = models.DateTimeField(_("Date Crafted"), db_index=True)
     nft = models.ForeignKey("Nft", blank=True, null=True, on_delete=models.SET_NULL)
 
     unlock_time = models.DateTimeField(_("Unlock Time"), blank=True, null=True)
@@ -289,8 +289,8 @@ class Nft(models.Model):
     name = models.CharField(max_length=255)
     description = models.TextField(blank=True)
 
-    minter_address = models.CharField(max_length=64)
-    owner_address = models.CharField(max_length=64)
+    minter_address = models.CharField(max_length=64, db_index=True)
+    owner_address = models.CharField(max_length=64, db_index=True)
 
     minter_name = models.CharField(max_length=255)
     primary_asset_name = models.CharField(max_length=255)
@@ -787,8 +787,8 @@ class NetworkMetrics(SingletonModel):
 
 
 class Callback(models.Model):
-    to_address = models.CharField(max_length=64)
-    from_address = models.CharField(max_length=64)
+    to_address = models.CharField(max_length=64, db_index=True)
+    from_address = models.CharField(max_length=64, db_index=True)
     amount = models.DecimalField(decimal_places=16, max_digits=32)
     transaction = models.ForeignKey(
         Transaction, related_name="callbacks", on_delete=models.CASCADE
@@ -804,8 +804,8 @@ class Callback(models.Model):
 
 
 class Recovery(models.Model):
-    original_address = models.CharField(max_length=64)
-    new_address = models.CharField(max_length=64)
+    original_address = models.CharField(max_length=64, db_index=True)
+    new_address = models.CharField(max_length=64, db_index=True)
     amount = models.DecimalField(decimal_places=16, max_digits=32, default=0)
     transaction = models.ForeignKey(
         Transaction, related_name="recoveries", on_delete=models.CASCADE
@@ -953,8 +953,8 @@ class FungibleTokenTx(models.Model):
     sc_identifier = models.CharField(max_length=64)
     token = models.ForeignKey(FungibleToken, on_delete=models.CASCADE)
 
-    receiving_address = models.CharField(max_length=64, blank=True, null=True)
-    sending_address = models.CharField(max_length=64, blank=True, null=True)
+    receiving_address = models.CharField(max_length=64, blank=True, null=True, db_index=True)
+    sending_address = models.CharField(max_length=64, blank=True, null=True, db_index=True)
     amount = models.DecimalField(decimal_places=16, max_digits=32)
 
     def __str__(self):
@@ -1018,11 +1018,11 @@ class TokenVoteTopicVote(models.Model):
 
 
 class VbtcToken(models.Model):
-    sc_identifier = models.CharField(max_length=64)
+    sc_identifier = models.CharField(max_length=64, db_index=True)
     nft = models.ForeignKey(Nft, on_delete=models.CASCADE)
     name = models.CharField(max_length=64, blank=True)
     description = models.TextField(blank=True)
-    owner_address = models.CharField(max_length=64)
+    owner_address = models.CharField(max_length=64, db_index=True)
     image_base64 = models.TextField()
     image_base64_url = models.URLField(blank=True, null=True)
     deposit_address = models.CharField(max_length=64)
@@ -1075,7 +1075,7 @@ class VbtcTokenAmountTransfer(models.Model):
 
     token = models.ForeignKey(VbtcToken, on_delete=models.CASCADE)
     transaction = models.ForeignKey(Transaction, on_delete=models.CASCADE)
-    address = models.CharField(max_length=64)
+    address = models.CharField(max_length=64, db_index=True)
     amount = models.DecimalField(decimal_places=16, max_digits=32)
     is_multi = models.BooleanField(default=False)
     created_at = models.DateTimeField()
@@ -1085,11 +1085,11 @@ class VbtcTokenAmountTransfer(models.Model):
 
 
 class VbtcV2Token(models.Model):
-    sc_identifier = models.CharField(max_length=64)
+    sc_identifier = models.CharField(max_length=64, db_index=True)
     nft = models.ForeignKey(Nft, on_delete=models.CASCADE)
     name = models.CharField(max_length=64, blank=True)
     description = models.TextField(blank=True)
-    owner_address = models.CharField(max_length=64)
+    owner_address = models.CharField(max_length=64, db_index=True)
     image_base64 = models.TextField()
     image_base64_url = models.URLField(blank=True, null=True)
     deposit_address = models.CharField(max_length=128)
@@ -1142,8 +1142,8 @@ class VbtcV2Token(models.Model):
 class VbtcV2TokenTransfer(models.Model):
     token = models.ForeignKey(VbtcV2Token, on_delete=models.CASCADE)
     transaction = models.ForeignKey(Transaction, on_delete=models.CASCADE)
-    from_address = models.CharField(max_length=64)
-    to_address = models.CharField(max_length=64)
+    from_address = models.CharField(max_length=64, db_index=True)
+    to_address = models.CharField(max_length=64, db_index=True)
     amount = models.DecimalField(decimal_places=16, max_digits=32)
     created_at = models.DateTimeField()
 
@@ -1169,7 +1169,7 @@ class VbtcV2WithdrawalRequest(models.Model):
         null=True,
         related_name="+",
     )
-    requestor_address = models.CharField(max_length=64)
+    requestor_address = models.CharField(max_length=64, db_index=True)
     btc_address = models.CharField(max_length=128)
     amount = models.DecimalField(decimal_places=16, max_digits=32)
     fee_rate = models.DecimalField(decimal_places=8, max_digits=16)
