@@ -24,6 +24,9 @@ from rbx.models import (
     FungibleTokenTx,
     VbtcToken,
     VbtcTokenAmountTransfer,
+    VbtcV2Token,
+    VbtcV2TokenTransfer,
+    VbtcV2WithdrawalRequest,
 )
 from django.contrib.admin.utils import model_ngettext
 
@@ -445,3 +448,26 @@ class VbtcTokenAmountTransferAdmin(RbxModelAdmin):
     search_fields = ["address"]
     list_display = ["token", "address", "amount", "is_multi", "created_at"]
     autocomplete_fields = ["token", "transaction"]
+
+
+@admin.register(VbtcV2Token)
+class VbtcV2TokenAdmin(RbxModelAdmin):
+    search_fields = ["sc_identifier", "owner_address", "deposit_address"]
+    list_display = ["sc_identifier", "deposit_address", "global_balance", "is_pending_withdrawal", "created_at"]
+    list_filter = ["is_pending_withdrawal"]
+    autocomplete_fields = ["nft"]
+
+
+@admin.register(VbtcV2TokenTransfer)
+class VbtcV2TokenTransferAdmin(RbxModelAdmin):
+    search_fields = ["from_address", "to_address"]
+    list_display = ["token", "from_address", "to_address", "amount", "created_at"]
+    autocomplete_fields = ["token", "transaction"]
+
+
+@admin.register(VbtcV2WithdrawalRequest)
+class VbtcV2WithdrawalRequestAdmin(RbxModelAdmin):
+    search_fields = ["requestor_address", "btc_address", "btc_transaction_hash"]
+    list_display = ["token", "requestor_address", "amount", "status", "created_at", "completed_at"]
+    list_filter = ["status"]
+    autocomplete_fields = ["token", "request_transaction", "completion_transaction"]

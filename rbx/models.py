@@ -166,6 +166,10 @@ class Transaction(models.Model):
         TKNZ_MINT = 17
         TKNZ_TX = 18
         TKNZ_BURN = 19
+        VBTC_V2_MINT = 25
+        VBTC_V2_TRANSFER = 26
+        VBTC_V2_WITHDRAWAL_REQUEST = 27
+        VBTC_V2_WITHDRAWAL_COMPLETE = 28
 
     hash = models.CharField(_("Hash"), primary_key=True, max_length=255, db_index=True)
     block = models.ForeignKey(
@@ -263,6 +267,14 @@ class Transaction(models.Model):
             return "Tokenization Tx"
         if self.type == Transaction.Type.TKNZ_BURN:
             return "Tokenization Burn"
+        if self.type == Transaction.Type.VBTC_V2_MINT:
+            return "vBTC V2 Mint"
+        if self.type == Transaction.Type.VBTC_V2_TRANSFER:
+            return "vBTC V2 Transfer"
+        if self.type == Transaction.Type.VBTC_V2_WITHDRAWAL_REQUEST:
+            return "vBTC V2 Withdrawal Request"
+        if self.type == Transaction.Type.VBTC_V2_WITHDRAWAL_COMPLETE:
+            return "vBTC V2 Withdrawal Complete"
 
         return f"{self.type}"
 
@@ -1070,3 +1082,103 @@ class VbtcTokenAmountTransfer(models.Model):
 
     def __str__(self):
         return f"{self.token.deposit_address} => {self.address} [{self.amount}]"
+
+
+class VbtcV2Token(models.Model):
+    sc_identifier = models.CharField(max_length=64)
+    nft = models.ForeignKey(Nft, on_delete=models.CASCADE)
+    name = models.CharField(max_length=64, blank=True)
+    description = models.TextField(blank=True)
+    owner_address = models.CharField(max_length=64)
+    image_base64 = models.TextField()
+    image_base64_url = models.URLField(blank=True, null=True)
+    deposit_address = models.CharField(max_length=128)
+    frost_group_public_key = models.TextField(blank=True)
+    dkg_proof = models.TextField(blank=True)
+    validator_snapshot = models.JSONField(blank=True, null=True)
+    required_threshold = models.IntegerField(default=0)
+    proof_block_height = models.IntegerField(default=0)
+    global_balance = models.DecimalField(decimal_places=16, max_digits=32, default=0.0)
+    total_received = models.DecimalField(decimal_places=16, max_digits=32, default=0)
+    total_sent = models.DecimalField(decimal_places=16, max_digits=32, default=0)
+    tx_count = models.IntegerField(default=0)
+    is_pending_withdrawal = models.BooleanField(default=False)
+    created_at = models.DateTimeField()
+
+    def __str__(self):
+        return f"{self.sc_identifier} ({self.deposit_address})"
+
+    @property
+    def image_is_default(self):
+        return self.image_base64 == "default"
+
+    @property
+    def image_base64_url_with_fallback(self):
+        if self.image_is_default or not self.image_base64_url:
+            return "https://vfx-resources.s3.amazonaws.com/defaultvBTC.gif"
+        return self.image_base64_url
+
+    @property
+    def addresses(self):
+        owner_address = self.owner_address
+        transfers = VbtcV2TokenTransfer.objects.filter(token=self).order_by(
+            "created_at"
+        )
+        entries = {owner_address: self.global_balance}
+        for t in transfers:
+            if t.to_address in entries:
+                entries[t.to_address] += t.amount
+            else:
+                entries[t.to_address] = t.amount
+
+            if t.from_address in entries:
+                entries[t.from_address] -= t.amount
+            else:
+                entries[t.from_address] = -t.amount
+
+        return entries
+
+
+class VbtcV2TokenTransfer(models.Model):
+    token = models.ForeignKey(VbtcV2Token, on_delete=models.CASCADE)
+    transaction = models.ForeignKey(Transaction, on_delete=models.CASCADE)
+    from_address = models.CharField(max_length=64)
+    to_address = models.CharField(max_length=64)
+    amount = models.DecimalField(decimal_places=16, max_digits=32)
+    created_at = models.DateTimeField()
+
+    def __str__(self):
+        return f"{self.from_address} => {self.to_address} [{self.amount}]"
+
+
+class VbtcV2WithdrawalRequest(models.Model):
+    class Status(models.TextChoices):
+        REQUESTED = "requested"
+        COMPLETED = "completed"
+
+    token = models.ForeignKey(
+        VbtcV2Token, on_delete=models.CASCADE, related_name="withdrawal_requests"
+    )
+    request_transaction = models.ForeignKey(
+        Transaction, on_delete=models.CASCADE, related_name="+"
+    )
+    completion_transaction = models.ForeignKey(
+        Transaction,
+        on_delete=models.CASCADE,
+        blank=True,
+        null=True,
+        related_name="+",
+    )
+    requestor_address = models.CharField(max_length=64)
+    btc_address = models.CharField(max_length=128)
+    amount = models.DecimalField(decimal_places=16, max_digits=32)
+    fee_rate = models.DecimalField(decimal_places=8, max_digits=16)
+    btc_transaction_hash = models.CharField(max_length=128, blank=True)
+    status = models.CharField(
+        max_length=16, choices=Status.choices, default=Status.REQUESTED
+    )
+    created_at = models.DateTimeField()
+    completed_at = models.DateTimeField(blank=True, null=True)
+
+    def __str__(self):
+        return f"{self.token.sc_identifier} withdrawal [{self.status}]"

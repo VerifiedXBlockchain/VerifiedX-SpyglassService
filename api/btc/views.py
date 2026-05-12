@@ -6,9 +6,21 @@ from django.utils import timezone
 from rest_framework.response import Response
 from rest_framework.generics import GenericAPIView, RetrieveAPIView
 from api.btc.constants import FALLBACK_VBTC_IMAGE_DATA
-from api.btc.serializers import VbtcTokenSerializer
+from api.btc.serializers import (
+    VbtcTokenSerializer,
+    VbtcV2TokenSerializer,
+    VbtcV2TokenTransferSerializer,
+    VbtcV2WithdrawalRequestSerializer,
+)
 from rbx.client import get_default_vbtc_base64_image_data, get_vbtc_compile_data
-from rbx.models import Price, VbtcToken, VbtcTokenAmountTransfer
+from rbx.models import (
+    Price,
+    VbtcToken,
+    VbtcTokenAmountTransfer,
+    VbtcV2Token,
+    VbtcV2TokenTransfer,
+    VbtcV2WithdrawalRequest,
+)
 from btc.client import BtcExplorerClient
 from api.decorators import cache_request
 from django.utils.decorators import method_decorator
@@ -151,3 +163,66 @@ class VbtcDetailView(RetrieveAPIView):
 
     def get(self, request, *args, **kwargs):
         return self.retrieve(request, *args, **kwargs)
+
+
+class VbtcV2ListAllView(GenericAPIView):
+
+    def get(self, request, *args, **kwargs):
+        tokens = VbtcV2Token.objects.all().order_by("-created_at")
+        results = VbtcV2TokenSerializer(tokens, many=True).data
+        return Response({"results": results}, status=200)
+
+
+class VbtcV2ListView(GenericAPIView):
+
+    def get(self, request, *args, **kwargs):
+        vfx_address = self.kwargs["vfx_address"]
+
+        sc_identifiers = set()
+
+        transfers = VbtcV2TokenTransfer.objects.filter(
+            to_address=vfx_address
+        ) | VbtcV2TokenTransfer.objects.filter(from_address=vfx_address)
+        for transfer in transfers:
+            sc_identifiers.add(transfer.token.sc_identifier)
+
+        for token in VbtcV2Token.objects.filter(owner_address=vfx_address):
+            sc_identifiers.add(token.sc_identifier)
+
+        tokens = VbtcV2Token.objects.filter(
+            sc_identifier__in=sc_identifiers
+        ).order_by("-created_at")
+
+        results = VbtcV2TokenSerializer(tokens, many=True).data
+        return Response({"results": results}, status=200)
+
+
+class VbtcV2DetailView(RetrieveAPIView):
+    serializer_class = VbtcV2TokenSerializer
+    queryset = VbtcV2Token.objects.all()
+    lookup_field = "sc_identifier"
+
+    def get(self, request, *args, **kwargs):
+        return self.retrieve(request, *args, **kwargs)
+
+
+class VbtcV2TransfersView(GenericAPIView):
+
+    def get(self, request, *args, **kwargs):
+        sc_identifier = self.kwargs["sc_identifier"]
+        transfers = VbtcV2TokenTransfer.objects.filter(
+            token__sc_identifier=sc_identifier
+        ).order_by("-created_at")
+        results = VbtcV2TokenTransferSerializer(transfers, many=True).data
+        return Response({"results": results}, status=200)
+
+
+class VbtcV2WithdrawalsView(GenericAPIView):
+
+    def get(self, request, *args, **kwargs):
+        sc_identifier = self.kwargs["sc_identifier"]
+        withdrawals = VbtcV2WithdrawalRequest.objects.filter(
+            token__sc_identifier=sc_identifier
+        ).order_by("-created_at")
+        results = VbtcV2WithdrawalRequestSerializer(withdrawals, many=True).data
+        return Response({"results": results}, status=200)
