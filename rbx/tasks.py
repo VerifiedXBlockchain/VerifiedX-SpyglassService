@@ -1164,7 +1164,7 @@ def sync_circulation():
     active_master_nodes = MasterNode.objects.filter(is_active=True).count()
     total_master_nodes = MasterNode.objects.all().count()
 
-    stake = active_master_nodes * 50000
+    stake = active_master_nodes * 5000
     total_addresses = Address.objects.all().count()
 
     total_burned = fees + adnr_burned_sum + dst_burned_sum + vault_burned_sum
