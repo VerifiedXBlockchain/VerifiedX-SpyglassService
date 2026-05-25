@@ -166,10 +166,21 @@ class Transaction(models.Model):
         TKNZ_MINT = 17
         TKNZ_TX = 18
         TKNZ_BURN = 19
+        TKNZ_WITHDRAWAL_REQUEST = 20
+        TKNZ_WITHDRAWAL_COMPLETE = 21
+        VALIDATOR_REGISTRATION = 22
+        VALIDATOR_HEARTBEAT = 23
         VBTC_V2_MINT = 25
         VBTC_V2_TRANSFER = 26
         VBTC_V2_WITHDRAWAL_REQUEST = 27
         VBTC_V2_WITHDRAWAL_COMPLETE = 28
+        VFX_SHIELD = 31
+        VFX_UNSHIELD = 32
+        VFX_PRIVATE_TRANSFER = 33
+        VBTC_SHIELD = 34
+        VBTC_UNSHIELD = 35
+        VBTC_PRIVATE_TRANSFER = 36
+        VBTC_BRIDGE_LOCK = 37
 
     hash = models.CharField(_("Hash"), primary_key=True, max_length=255, db_index=True)
     block = models.ForeignKey(
@@ -267,6 +278,14 @@ class Transaction(models.Model):
             return "Tokenization Tx"
         if self.type == Transaction.Type.TKNZ_BURN:
             return "Tokenization Burn"
+        if self.type == Transaction.Type.TKNZ_WITHDRAWAL_REQUEST:
+            return "Tokenization Withdrawal Request"
+        if self.type == Transaction.Type.TKNZ_WITHDRAWAL_COMPLETE:
+            return "Tokenization Withdrawal Complete"
+        if self.type == Transaction.Type.VALIDATOR_REGISTRATION:
+            return "Validator Registration"
+        if self.type == Transaction.Type.VALIDATOR_HEARTBEAT:
+            return "Validator Heartbeat"
         if self.type == Transaction.Type.VBTC_V2_MINT:
             return "vBTC V2 Mint"
         if self.type == Transaction.Type.VBTC_V2_TRANSFER:
@@ -275,6 +294,20 @@ class Transaction(models.Model):
             return "vBTC V2 Withdrawal Request"
         if self.type == Transaction.Type.VBTC_V2_WITHDRAWAL_COMPLETE:
             return "vBTC V2 Withdrawal Complete"
+        if self.type == Transaction.Type.VFX_SHIELD:
+            return "VFX Shield"
+        if self.type == Transaction.Type.VFX_UNSHIELD:
+            return "VFX Unshield"
+        if self.type == Transaction.Type.VFX_PRIVATE_TRANSFER:
+            return "VFX Private Transfer"
+        if self.type == Transaction.Type.VBTC_SHIELD:
+            return "vBTC Shield"
+        if self.type == Transaction.Type.VBTC_UNSHIELD:
+            return "vBTC Unshield"
+        if self.type == Transaction.Type.VBTC_PRIVATE_TRANSFER:
+            return "vBTC Private Transfer"
+        if self.type == Transaction.Type.VBTC_BRIDGE_LOCK:
+            return "vBTC Bridge Lock"
 
         return f"{self.type}"
 
