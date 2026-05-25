@@ -284,10 +284,11 @@ class VbtcV2CeremonyStatusView(GenericAPIView):
                 "status": result.get("Status"),
                 "progress": result.get("ProgressPercentage", 0),
                 "message": result.get("Message", ""),
+                "raw": result,
             })
 
         return Response(
-            {"success": False, "message": result.get("Message", "Could not get ceremony status")},
+            {"success": False, "message": result.get("Message", "Could not get ceremony status"), "raw": result},
             status=500,
         )
 
