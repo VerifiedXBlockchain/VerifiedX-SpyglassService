@@ -174,6 +174,8 @@ class Transaction(models.Model):
         VBTC_V2_TRANSFER = 26
         VBTC_V2_WITHDRAWAL_REQUEST = 27
         VBTC_V2_WITHDRAWAL_COMPLETE = 28
+        VBTC_V2_WITHDRAWAL_CANCEL = 29
+        VBTC_V2_WITHDRAWAL_VOTE = 30
         VFX_SHIELD = 31
         VFX_UNSHIELD = 32
         VFX_PRIVATE_TRANSFER = 33
@@ -181,6 +183,7 @@ class Transaction(models.Model):
         VBTC_UNSHIELD = 35
         VBTC_PRIVATE_TRANSFER = 36
         VBTC_BRIDGE_LOCK = 37
+        VBTC_BRIDGE_UNLOCK = 38
 
     hash = models.CharField(_("Hash"), primary_key=True, max_length=255, db_index=True)
     block = models.ForeignKey(
@@ -294,6 +297,10 @@ class Transaction(models.Model):
             return "vBTC V2 Withdrawal Request"
         if self.type == Transaction.Type.VBTC_V2_WITHDRAWAL_COMPLETE:
             return "vBTC V2 Withdrawal Complete"
+        if self.type == Transaction.Type.VBTC_V2_WITHDRAWAL_CANCEL:
+            return "vBTC Withdrawal Cancel"
+        if self.type == Transaction.Type.VBTC_V2_WITHDRAWAL_VOTE:
+            return "vBTC Withdrawal Vote"
         if self.type == Transaction.Type.VFX_SHIELD:
             return "VFX Shield"
         if self.type == Transaction.Type.VFX_UNSHIELD:
@@ -308,6 +315,8 @@ class Transaction(models.Model):
             return "vBTC Private Transfer"
         if self.type == Transaction.Type.VBTC_BRIDGE_LOCK:
             return "vBTC Bridge Lock"
+        if self.type == Transaction.Type.VBTC_BRIDGE_UNLOCK:
+            return "vBTC Bridge Unlock"
 
         return f"{self.type}"
 

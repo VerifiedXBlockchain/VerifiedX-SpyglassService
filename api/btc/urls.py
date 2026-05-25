@@ -11,6 +11,11 @@ from .views import (
     VbtcV2DetailView,
     VbtcV2TransfersView,
     VbtcV2WithdrawalsView,
+    VbtcV2CeremonyInitiateView,
+    VbtcV2CeremonyStatusView,
+    VbtcV2CreateContractView,
+    VbtcV2WithdrawCompleteView,
+    VbtcV2WithdrawCancelView,
 )
 
 urlpatterns = [
@@ -25,4 +30,9 @@ urlpatterns = [
     path("vbtc-v2/detail/<str:sc_identifier>/", VbtcV2DetailView.as_view()),
     path("vbtc-v2/transfers/<str:sc_identifier>/", VbtcV2TransfersView.as_view()),
     path("vbtc-v2/withdrawals/<str:sc_identifier>/", VbtcV2WithdrawalsView.as_view()),
+    path("vbtc-v2/ceremony/initiate/", VbtcV2CeremonyInitiateView.as_view()),
+    path("vbtc-v2/ceremony/<str:ceremony_id>/", VbtcV2CeremonyStatusView.as_view()),
+    path("vbtc-v2/create/", VbtcV2CreateContractView.as_view()),
+    path("vbtc-v2/withdraw/complete/", VbtcV2WithdrawCompleteView.as_view()),
+    path("vbtc-v2/withdraw/cancel/", VbtcV2WithdrawCancelView.as_view()),
 ]

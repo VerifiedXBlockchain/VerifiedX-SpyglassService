@@ -12,7 +12,15 @@ from api.btc.serializers import (
     VbtcV2TokenTransferSerializer,
     VbtcV2WithdrawalRequestSerializer,
 )
-from rbx.client import get_default_vbtc_base64_image_data, get_vbtc_compile_data
+from rbx.client import (
+    get_default_vbtc_base64_image_data,
+    get_vbtc_compile_data,
+    initiate_vbtc_v2_ceremony,
+    get_vbtc_v2_ceremony_status,
+    create_vbtc_v2_contract,
+    complete_vbtc_v2_withdrawal,
+    cancel_vbtc_v2_withdrawal,
+)
 from rbx.models import (
     Price,
     VbtcToken,
@@ -236,3 +244,147 @@ class VbtcV2WithdrawalsView(GenericAPIView):
         ).order_by("-created_at")
         results = VbtcV2WithdrawalRequestSerializer(withdrawals, many=True).data
         return Response({"results": results}, status=200)
+
+
+class VbtcV2CeremonyInitiateView(GenericAPIView):
+
+    def post(self, request, *args, **kwargs):
+        owner_address = request.data.get("owner_address")
+        if not owner_address:
+            return Response(
+                {"success": False, "message": "owner_address required"}, status=400
+            )
+
+        result = initiate_vbtc_v2_ceremony(owner_address)
+        success = result.get("Success", False)
+
+        if success:
+            return Response({
+                "success": True,
+                "ceremony_id": result.get("CeremonyId"),
+                "message": result.get("Message", ""),
+            })
+
+        return Response(
+            {"success": False, "message": result.get("Message", "Ceremony initiation failed")},
+            status=500,
+        )
+
+
+class VbtcV2CeremonyStatusView(GenericAPIView):
+
+    def get(self, request, *args, **kwargs):
+        ceremony_id = self.kwargs["ceremony_id"]
+        result = get_vbtc_v2_ceremony_status(ceremony_id)
+        success = result.get("Success", False)
+
+        if success:
+            return Response({
+                "success": True,
+                "status": result.get("Status"),
+                "progress": result.get("ProgressPercentage", 0),
+                "message": result.get("Message", ""),
+            })
+
+        return Response(
+            {"success": False, "message": result.get("Message", "Could not get ceremony status")},
+            status=500,
+        )
+
+
+class VbtcV2CreateContractView(GenericAPIView):
+
+    def post(self, request, *args, **kwargs):
+        required = ["owner_address", "name", "description", "ticker", "ceremony_id"]
+        for field in required:
+            if not request.data.get(field):
+                return Response(
+                    {"success": False, "message": f"{field} required"}, status=400
+                )
+
+        payload = {
+            "OwnerAddress": request.data["owner_address"],
+            "Name": request.data["name"],
+            "Description": request.data["description"],
+            "Ticker": request.data["ticker"],
+            "CeremonyId": request.data["ceremony_id"],
+        }
+
+        result = create_vbtc_v2_contract(payload)
+        success = result.get("Success", False)
+
+        if success:
+            return Response({
+                "success": True,
+                "transaction_hash": result.get("TransactionHash") or result.get("Hash"),
+                "sc_identifier": result.get("SmartContractUID"),
+            })
+
+        return Response(
+            {"success": False, "message": result.get("Message", "Contract creation failed")},
+            status=500,
+        )
+
+
+class VbtcV2WithdrawCompleteView(GenericAPIView):
+
+    def post(self, request, *args, **kwargs):
+        sc_identifier = request.data.get("sc_identifier")
+        withdrawal_request_hash = request.data.get("withdrawal_request_hash")
+
+        if not sc_identifier or not withdrawal_request_hash:
+            return Response(
+                {"success": False, "message": "sc_identifier and withdrawal_request_hash required"},
+                status=400,
+            )
+
+        payload = {
+            "SmartContractUID": sc_identifier,
+            "WithdrawalRequestHash": withdrawal_request_hash,
+        }
+
+        result = complete_vbtc_v2_withdrawal(payload)
+        success = result.get("Success", False)
+
+        if success:
+            return Response({
+                "success": True,
+                "vfx_transaction_hash": result.get("VFXTransactionHash"),
+                "btc_transaction_hash": result.get("BTCTransactionHash"),
+                "status": result.get("Status"),
+            })
+
+        return Response(
+            {"success": False, "message": result.get("Message", "Withdrawal completion failed")},
+            status=500,
+        )
+
+
+class VbtcV2WithdrawCancelView(GenericAPIView):
+
+    def post(self, request, *args, **kwargs):
+        required = ["sc_identifier", "owner_address", "withdrawal_request_hash"]
+        for field in required:
+            if not request.data.get(field):
+                return Response(
+                    {"success": False, "message": f"{field} required"}, status=400
+                )
+
+        payload = {
+            "SmartContractUID": request.data["sc_identifier"],
+            "OwnerAddress": request.data["owner_address"],
+            "WithdrawalRequestHash": request.data["withdrawal_request_hash"],
+            "BTCTxHash": request.data.get("btc_tx_hash", ""),
+            "FailureProof": request.data.get("failure_proof", ""),
+        }
+
+        result = cancel_vbtc_v2_withdrawal(payload)
+        success = result.get("Success", False)
+
+        if success:
+            return Response({"success": True})
+
+        return Response(
+            {"success": False, "message": result.get("Message", "Withdrawal cancellation failed")},
+            status=500,
+        )

@@ -1057,3 +1057,68 @@ def withdraw_btc(payload: dict):
     data = response.json()
     logger.info(f"RESPONSE: {json.dumps(data)}")
     return data
+
+
+# region vBTC V2
+
+
+def initiate_vbtc_v2_ceremony(owner_address: str):
+    logger = logging.getLogger(__name__)
+    url = join_url(BASE_URL, f"vbtcapi/vbtc/InitiateMPCCeremony/{owner_address}")
+    logger.info(f"INITIATE_MPC_CEREMONY: {url}")
+    try:
+        response = requests.post(url, timeout=30)
+        return response.json()
+    except Exception as e:
+        logger.error(f"Error initiating MPC ceremony: {e}")
+        return {"Success": False, "Message": str(e)}
+
+
+def get_vbtc_v2_ceremony_status(ceremony_id: str):
+    logger = logging.getLogger(__name__)
+    url = join_url(BASE_URL, f"vbtcapi/vbtc/GetCeremonyStatus/{ceremony_id}")
+    try:
+        response = requests.get(url, timeout=10)
+        return response.json()
+    except Exception as e:
+        logger.error(f"Error getting ceremony status: {e}")
+        return {"Success": False, "Message": str(e)}
+
+
+def create_vbtc_v2_contract(payload: dict):
+    logger = logging.getLogger(__name__)
+    url = join_url(BASE_URL, "vbtcapi/vbtc/CreateVBTCContract")
+    logger.info(f"CREATE_VBTC_V2_CONTRACT: {url}")
+    try:
+        response = requests.post(url, params=payload, timeout=60)
+        return response.json()
+    except Exception as e:
+        logger.error(f"Error creating vBTC V2 contract: {e}")
+        return {"Success": False, "Message": str(e)}
+
+
+def complete_vbtc_v2_withdrawal(payload: dict):
+    logger = logging.getLogger(__name__)
+    url = join_url(BASE_URL, "vbtcapi/vbtc/CompleteWithdrawal")
+    logger.info(f"COMPLETE_VBTC_V2_WITHDRAWAL: {url}")
+    try:
+        response = requests.post(url, params=payload, timeout=180)
+        return response.json()
+    except Exception as e:
+        logger.error(f"Error completing vBTC V2 withdrawal: {e}")
+        return {"Success": False, "Message": str(e)}
+
+
+def cancel_vbtc_v2_withdrawal(payload: dict):
+    logger = logging.getLogger(__name__)
+    url = join_url(BASE_URL, "vbtcapi/vbtc/CancelWithdrawal")
+    logger.info(f"CANCEL_VBTC_V2_WITHDRAWAL: {url}")
+    try:
+        response = requests.post(url, params=payload, timeout=30)
+        return response.json()
+    except Exception as e:
+        logger.error(f"Error cancelling vBTC V2 withdrawal: {e}")
+        return {"Success": False, "Message": str(e)}
+
+
+# endregion

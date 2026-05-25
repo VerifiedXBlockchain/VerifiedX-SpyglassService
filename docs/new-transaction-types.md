@@ -37,7 +37,8 @@ Context document for the explorer frontend and wallet (web + GUI) teams. All dat
 | 26 | `VBTC_V2_TRANSFER` | vBTC V2 Transfer | Existing |
 | 27 | `VBTC_V2_WITHDRAWAL_REQUEST` | vBTC V2 Withdrawal Request | Existing |
 | 28 | `VBTC_V2_WITHDRAWAL_COMPLETE` | vBTC V2 Withdrawal Complete | Existing |
-| 29-30 | — | (unused) | — |
+| **29** | `VBTC_V2_WITHDRAWAL_CANCEL` | vBTC Withdrawal Cancel | **New** (reserved, no on-chain data yet) |
+| **30** | `VBTC_V2_WITHDRAWAL_VOTE` | vBTC Withdrawal Vote | **New** (reserved, no on-chain data yet) |
 | **31** | `VFX_SHIELD` | VFX Shield | **New** |
 | **32** | `VFX_UNSHIELD` | VFX Unshield | **New** |
 | **33** | `VFX_PRIVATE_TRANSFER` | VFX Private Transfer | **New** |
@@ -45,6 +46,7 @@ Context document for the explorer frontend and wallet (web + GUI) teams. All dat
 | **35** | `VBTC_UNSHIELD` | vBTC Unshield | **New** |
 | **36** | `VBTC_PRIVATE_TRANSFER` | vBTC Private Transfer | **New** (reserved, no on-chain data yet) |
 | **37** | `VBTC_BRIDGE_LOCK` | vBTC Bridge Lock | **New** |
+| **38** | `VBTC_BRIDGE_UNLOCK` | vBTC Bridge Unlock | **New** (reserved, no on-chain data yet) |
 
 ---
 
@@ -368,6 +370,16 @@ Locks vBTC on the VFX chain for bridging to an EVM chain.
 
 **Key fields for display**: `LockId` (unique lock identifier), `Amount` (BTC-denominated), `AmountSats` (satoshi amount), `EvmDestination` (EVM address receiving the bridged asset).
 
+#### Type 38 — vBTC Bridge Unlock
+
+Unlocks vBTC back from an EVM chain to the VFX chain. The reverse of type 37 (Bridge Lock). Reserved but **no on-chain transactions exist yet**.
+
+Expected data payload (mirroring Bridge Lock):
+- `Function`: `"VBTCBridgeUnlock()"`
+- `ContractUID`: the vBTC contract UID
+- `LockId`: references the original lock
+- `Amount` / `AmountSats`: the unlocked amount
+
 ---
 
 ## Frontend Display Recommendations
@@ -410,6 +422,8 @@ The explorer API already serves `type_label` as a string field on all transactio
 21 -> "Tokenization Withdrawal Complete"
 22 -> "Validator Registration"
 23 -> "Validator Heartbeat"
+29 -> "vBTC Withdrawal Cancel"
+30 -> "vBTC Withdrawal Vote"
 31 -> "VFX Shield"
 32 -> "VFX Unshield"
 33 -> "VFX Private Transfer"
@@ -417,6 +431,7 @@ The explorer API already serves `type_label` as a string field on all transactio
 35 -> "vBTC Unshield"
 36 -> "vBTC Private Transfer"
 37 -> "vBTC Bridge Lock"
+38 -> "vBTC Bridge Unlock"
 ```
 
 These are returned alongside the integer `type` field, so frontends can use either for display/filtering.
