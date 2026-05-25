@@ -1154,20 +1154,30 @@ class VbtcV2Token(models.Model):
     @property
     def addresses(self):
         owner_address = self.owner_address
+
+        completed_withdrawals = VbtcV2WithdrawalRequest.objects.filter(
+            token=self, status=VbtcV2WithdrawalRequest.Status.COMPLETED
+        )
+        total_withdrawn = sum(
+            (w.amount for w in completed_withdrawals), Decimal(0)
+        )
+
+        # Owner starts with all BTC ever deposited (current balance + withdrawn)
+        entries = {owner_address: self.global_balance + total_withdrawn}
+
+        # Transfers redistribute between VFX addresses
         transfers = VbtcV2TokenTransfer.objects.filter(token=self).order_by(
             "created_at"
         )
-        entries = {owner_address: self.global_balance}
         for t in transfers:
-            if t.to_address in entries:
-                entries[t.to_address] += t.amount
-            else:
-                entries[t.to_address] = t.amount
+            entries[t.to_address] = entries.get(t.to_address, Decimal(0)) + t.amount
+            entries[t.from_address] = entries.get(t.from_address, Decimal(0)) - t.amount
 
-            if t.from_address in entries:
-                entries[t.from_address] -= t.amount
-            else:
-                entries[t.from_address] = -t.amount
+        # Withdrawals deduct from the requestor's balance
+        for w in completed_withdrawals:
+            entries[w.requestor_address] = (
+                entries.get(w.requestor_address, Decimal(0)) - w.amount
+            )
 
         return entries
 

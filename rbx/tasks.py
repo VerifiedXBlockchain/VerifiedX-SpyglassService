@@ -962,8 +962,8 @@ def process_transaction(tx: Transaction):
             withdrawal.completed_at = tx.date_crafted
             withdrawal.save()
 
-            token.global_balance -= Decimal(parsed["Amount"])
-            token.total_sent += Decimal(parsed["Amount"])
+            # Balance fields (global_balance, total_sent) are updated by the
+            # periodic BTC chain sync (update_vbtc_balances), not here.
             token.is_pending_withdrawal = False
             token.save()
 

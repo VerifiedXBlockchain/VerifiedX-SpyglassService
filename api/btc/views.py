@@ -21,6 +21,7 @@ from rbx.models import (
     VbtcV2TokenTransfer,
     VbtcV2WithdrawalRequest,
 )
+from btc.btc_client import BtcClient
 from btc.client import BtcExplorerClient
 from api.decorators import cache_request
 from django.utils.decorators import method_decorator
@@ -203,7 +204,16 @@ class VbtcV2DetailView(RetrieveAPIView):
     lookup_field = "sc_identifier"
 
     def get(self, request, *args, **kwargs):
-        return self.retrieve(request, *args, **kwargs)
+        token = self.get_object()
+        client = BtcClient()
+        balance_info = client.get_balance(token.deposit_address)
+        if balance_info:
+            token.global_balance = balance_info["balance"]
+            token.total_received = balance_info["total_received"]
+            token.total_sent = balance_info["total_sent"]
+            token.tx_count = balance_info["tx_count"]
+            token.save()
+        return Response(self.get_serializer(token).data)
 
 
 class VbtcV2TransfersView(GenericAPIView):
