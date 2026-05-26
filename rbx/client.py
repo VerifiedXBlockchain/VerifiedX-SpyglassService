@@ -1062,63 +1062,138 @@ def withdraw_btc(payload: dict):
 # region vBTC V2
 
 
-def initiate_vbtc_v2_ceremony(owner_address: str):
+def _vbtc_v2_request(method, path, payload=None, timeout=30):
+    """Shared helper for vBTC V2 CLI requests."""
     logger = logging.getLogger(__name__)
-    url = join_url(BASE_URL, f"vbtcapi/vbtc/InitiateMPCCeremony/{owner_address}")
-    logger.info(f"INITIATE_MPC_CEREMONY: {url}")
+    url = join_url(BASE_URL, path)
+    logger.info(f"VBTC_V2: {method.upper()} {url}")
     try:
-        response = requests.post(url, timeout=30)
+        if method == "get":
+            response = requests.get(url, timeout=timeout)
+        else:
+            response = requests.post(url, json=payload, timeout=timeout)
         return response.json()
     except Exception as e:
-        logger.error(f"Error initiating MPC ceremony: {e}")
+        logger.error(f"Error in vBTC V2 request {path}: {e}")
         return {"Success": False, "Message": str(e)}
+
+
+# MPC Ceremony (DKG)
+
+def prepare_vbtc_v2_ceremony(owner_address: str):
+    return _vbtc_v2_request(
+        "post",
+        "vbtcapi/vbtc/PrepareMPCCeremonyRaw",
+        {"OwnerAddress": owner_address},
+    )
+
+
+def execute_vbtc_v2_ceremony(payload: dict):
+    return _vbtc_v2_request(
+        "post",
+        "vbtcapi/vbtc/ExecuteMPCCeremonyRaw",
+        payload,
+    )
 
 
 def get_vbtc_v2_ceremony_status(ceremony_id: str):
-    logger = logging.getLogger(__name__)
-    url = join_url(BASE_URL, f"vbtcapi/vbtc/GetCeremonyStatus/{ceremony_id}")
-    try:
-        response = requests.get(url, timeout=10)
-        return response.json()
-    except Exception as e:
-        logger.error(f"Error getting ceremony status: {e}")
-        return {"Success": False, "Message": str(e)}
+    return _vbtc_v2_request(
+        "get",
+        f"vbtcapi/vbtc/GetCeremonyStatus/{ceremony_id}",
+        timeout=10,
+    )
 
 
-def create_vbtc_v2_contract(payload: dict):
-    logger = logging.getLogger(__name__)
-    url = join_url(BASE_URL, "vbtcapi/vbtc/CreateVBTCContract")
-    logger.info(f"CREATE_VBTC_V2_CONTRACT: {url}")
-    try:
-        response = requests.post(url, params=payload, timeout=60)
-        return response.json()
-    except Exception as e:
-        logger.error(f"Error creating vBTC V2 contract: {e}")
-        return {"Success": False, "Message": str(e)}
+# Contract Creation
+
+def get_raw_create_contract_tx(payload: dict):
+    return _vbtc_v2_request(
+        "post",
+        "vbtcapi/vbtc/GetRawCreateContractTxData",
+        payload,
+        timeout=60,
+    )
 
 
-def complete_vbtc_v2_withdrawal(payload: dict):
-    logger = logging.getLogger(__name__)
-    url = join_url(BASE_URL, "vbtcapi/vbtc/CompleteWithdrawal")
-    logger.info(f"COMPLETE_VBTC_V2_WITHDRAWAL: {url}")
-    try:
-        response = requests.post(url, params=payload, timeout=180)
-        return response.json()
-    except Exception as e:
-        logger.error(f"Error completing vBTC V2 withdrawal: {e}")
-        return {"Success": False, "Message": str(e)}
+def send_raw_create_contract_tx(payload: dict):
+    return _vbtc_v2_request(
+        "post",
+        "vbtcapi/vbtc/SendRawCreateContractTx",
+        payload,
+    )
 
 
-def cancel_vbtc_v2_withdrawal(payload: dict):
-    logger = logging.getLogger(__name__)
-    url = join_url(BASE_URL, "vbtcapi/vbtc/CancelWithdrawal")
-    logger.info(f"CANCEL_VBTC_V2_WITHDRAWAL: {url}")
-    try:
-        response = requests.post(url, params=payload, timeout=30)
-        return response.json()
-    except Exception as e:
-        logger.error(f"Error cancelling vBTC V2 withdrawal: {e}")
-        return {"Success": False, "Message": str(e)}
+# Transfer
+
+def get_raw_transfer_vbtc_tx(payload: dict):
+    return _vbtc_v2_request(
+        "post",
+        "vbtcapi/vbtc/GetRawTransferVBTCData",
+        payload,
+    )
+
+
+def send_raw_transfer_vbtc_tx(payload: dict):
+    return _vbtc_v2_request(
+        "post",
+        "vbtcapi/vbtc/SendRawTransferVBTCTx",
+        payload,
+    )
+
+
+# Withdrawal Request
+
+def get_raw_request_withdrawal_tx(payload: dict):
+    return _vbtc_v2_request(
+        "post",
+        "vbtcapi/vbtc/GetRawRequestWithdrawalTxData",
+        payload,
+    )
+
+
+def send_raw_request_withdrawal_tx(payload: dict):
+    return _vbtc_v2_request(
+        "post",
+        "vbtcapi/vbtc/SendRawRequestWithdrawalTx",
+        payload,
+    )
+
+
+# Withdrawal Complete (FROST)
+
+def prepare_complete_withdrawal(payload: dict):
+    return _vbtc_v2_request(
+        "post",
+        "vbtcapi/vbtc/PrepareCompleteWithdrawalRaw",
+        payload,
+    )
+
+
+def execute_complete_withdrawal(payload: dict):
+    return _vbtc_v2_request(
+        "post",
+        "vbtcapi/vbtc/CompleteWithdrawalRaw",
+        payload,
+        timeout=180,
+    )
+
+
+# Withdrawal Cancel
+
+def get_raw_cancel_withdrawal_tx(payload: dict):
+    return _vbtc_v2_request(
+        "post",
+        "vbtcapi/vbtc/GetRawCancelWithdrawalTxData",
+        payload,
+    )
+
+
+def send_raw_cancel_withdrawal_tx(payload: dict):
+    return _vbtc_v2_request(
+        "post",
+        "vbtcapi/vbtc/SendRawCancelWithdrawalTx",
+        payload,
+    )
 
 
 # endregion

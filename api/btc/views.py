@@ -15,11 +15,19 @@ from api.btc.serializers import (
 from rbx.client import (
     get_default_vbtc_base64_image_data,
     get_vbtc_compile_data,
-    initiate_vbtc_v2_ceremony,
+    prepare_vbtc_v2_ceremony,
+    execute_vbtc_v2_ceremony,
     get_vbtc_v2_ceremony_status,
-    create_vbtc_v2_contract,
-    complete_vbtc_v2_withdrawal,
-    cancel_vbtc_v2_withdrawal,
+    get_raw_create_contract_tx,
+    send_raw_create_contract_tx,
+    get_raw_transfer_vbtc_tx,
+    send_raw_transfer_vbtc_tx,
+    get_raw_request_withdrawal_tx,
+    send_raw_request_withdrawal_tx,
+    prepare_complete_withdrawal,
+    execute_complete_withdrawal,
+    get_raw_cancel_withdrawal_tx,
+    send_raw_cancel_withdrawal_tx,
 )
 from rbx.models import (
     Price,
@@ -246,29 +254,73 @@ class VbtcV2WithdrawalsView(GenericAPIView):
         return Response({"results": results}, status=200)
 
 
-class VbtcV2CeremonyInitiateView(GenericAPIView):
+def _vbtc_v2_proxy(cli_func, payload, error_msg="Operation failed"):
+    """Shared proxy helper — calls CLI, normalizes response."""
+    result = cli_func(payload) if payload is not None else cli_func()
+    success = result.get("Success", False)
+    if success:
+        return Response({"success": True, **{k: v for k, v in result.items() if k != "Success"}})
+    return Response(
+        {"success": False, "message": result.get("Message", error_msg)},
+        status=500,
+    )
+
+
+def _require_fields(data, fields):
+    """Validate required fields, return error Response or None."""
+    for field in fields:
+        if not data.get(field):
+            return Response({"success": False, "message": f"{field} required"}, status=400)
+    return None
+
+
+# --- MPC Ceremony ---
+
+
+class VbtcV2CeremonyPrepareView(GenericAPIView):
 
     def post(self, request, *args, **kwargs):
-        owner_address = request.data.get("owner_address")
-        if not owner_address:
-            return Response(
-                {"success": False, "message": "owner_address required"}, status=400
-            )
+        err = _require_fields(request.data, ["owner_address"])
+        if err:
+            return err
 
-        result = initiate_vbtc_v2_ceremony(owner_address)
+        result = prepare_vbtc_v2_ceremony(request.data["owner_address"])
         success = result.get("Success", False)
 
         if success:
             return Response({
                 "success": True,
                 "ceremony_id": result.get("CeremonyId"),
-                "message": result.get("Message", ""),
+                "session_id": result.get("SessionId"),
+                "messages_to_sign": {
+                    "start_message": result.get("StartMessage"),
+                    "start_timestamp": result.get("StartTimestamp"),
+                    "share_distribution_message": result.get("ShareDistributionMessage"),
+                    "share_distribution_timestamp": result.get("ShareDistributionTimestamp"),
+                },
+                "validator_count": result.get("ValidatorCount"),
+                "threshold": result.get("Threshold"),
             })
 
         return Response(
-            {"success": False, "message": result.get("Message", "Ceremony initiation failed")},
+            {"success": False, "message": result.get("Message", "Ceremony preparation failed")},
             status=500,
         )
+
+
+class VbtcV2CeremonyExecuteView(GenericAPIView):
+
+    def post(self, request, *args, **kwargs):
+        err = _require_fields(request.data, ["ceremony_id", "start_signature", "share_distribution_signature"])
+        if err:
+            return err
+
+        payload = {
+            "CeremonyId": request.data["ceremony_id"],
+            "StartSignature": request.data["start_signature"],
+            "ShareDistributionSignature": request.data["share_distribution_signature"],
+        }
+        return _vbtc_v2_proxy(execute_vbtc_v2_ceremony, payload, "Ceremony execution failed")
 
 
 class VbtcV2CeremonyStatusView(GenericAPIView):
@@ -293,15 +345,15 @@ class VbtcV2CeremonyStatusView(GenericAPIView):
         )
 
 
-class VbtcV2CreateContractView(GenericAPIView):
+# --- Contract Creation ---
+
+
+class VbtcV2CreateContractPrepareView(GenericAPIView):
 
     def post(self, request, *args, **kwargs):
-        required = ["owner_address", "name", "description", "ticker", "ceremony_id"]
-        for field in required:
-            if not request.data.get(field):
-                return Response(
-                    {"success": False, "message": f"{field} required"}, status=400
-                )
+        err = _require_fields(request.data, ["owner_address", "name", "description", "ticker", "ceremony_id"])
+        if err:
+            return err
 
         payload = {
             "OwnerAddress": request.data["owner_address"],
@@ -310,82 +362,156 @@ class VbtcV2CreateContractView(GenericAPIView):
             "Ticker": request.data["ticker"],
             "CeremonyId": request.data["ceremony_id"],
         }
-
-        result = create_vbtc_v2_contract(payload)
-        success = result.get("Success", False)
-
-        if success:
-            return Response({
-                "success": True,
-                "transaction_hash": result.get("TransactionHash") or result.get("Hash"),
-                "sc_identifier": result.get("SmartContractUID"),
-            })
-
-        return Response(
-            {"success": False, "message": result.get("Message", "Contract creation failed")},
-            status=500,
-        )
+        return _vbtc_v2_proxy(get_raw_create_contract_tx, payload, "Contract TX preparation failed")
 
 
-class VbtcV2WithdrawCompleteView(GenericAPIView):
+class VbtcV2CreateContractSendView(GenericAPIView):
 
     def post(self, request, *args, **kwargs):
-        sc_identifier = request.data.get("sc_identifier")
-        withdrawal_request_hash = request.data.get("withdrawal_request_hash")
-
-        if not sc_identifier or not withdrawal_request_hash:
-            return Response(
-                {"success": False, "message": "sc_identifier and withdrawal_request_hash required"},
-                status=400,
-            )
+        err = _require_fields(request.data, ["hash", "signature", "public_key"])
+        if err:
+            return err
 
         payload = {
-            "SmartContractUID": sc_identifier,
-            "WithdrawalRequestHash": withdrawal_request_hash,
+            "Hash": request.data["hash"],
+            "Signature": request.data["signature"],
+            "PublicKey": request.data["public_key"],
         }
-
-        result = complete_vbtc_v2_withdrawal(payload)
-        success = result.get("Success", False)
-
-        if success:
-            return Response({
-                "success": True,
-                "vfx_transaction_hash": result.get("VFXTransactionHash"),
-                "btc_transaction_hash": result.get("BTCTransactionHash"),
-                "status": result.get("Status"),
-            })
-
-        return Response(
-            {"success": False, "message": result.get("Message", "Withdrawal completion failed")},
-            status=500,
-        )
+        return _vbtc_v2_proxy(send_raw_create_contract_tx, payload, "Contract TX send failed")
 
 
-class VbtcV2WithdrawCancelView(GenericAPIView):
+# --- Transfer ---
+
+
+class VbtcV2TransferPrepareView(GenericAPIView):
 
     def post(self, request, *args, **kwargs):
-        required = ["sc_identifier", "owner_address", "withdrawal_request_hash"]
-        for field in required:
-            if not request.data.get(field):
-                return Response(
-                    {"success": False, "message": f"{field} required"}, status=400
-                )
+        err = _require_fields(request.data, ["sc_identifier", "from_address", "to_address", "amount"])
+        if err:
+            return err
+
+        payload = {
+            "SmartContractUID": request.data["sc_identifier"],
+            "FromAddress": request.data["from_address"],
+            "ToAddress": request.data["to_address"],
+            "Amount": request.data["amount"],
+        }
+        return _vbtc_v2_proxy(get_raw_transfer_vbtc_tx, payload, "Transfer TX preparation failed")
+
+
+class VbtcV2TransferSendView(GenericAPIView):
+
+    def post(self, request, *args, **kwargs):
+        err = _require_fields(request.data, ["hash", "signature", "public_key"])
+        if err:
+            return err
+
+        payload = {
+            "Hash": request.data["hash"],
+            "Signature": request.data["signature"],
+            "PublicKey": request.data["public_key"],
+        }
+        return _vbtc_v2_proxy(send_raw_transfer_vbtc_tx, payload, "Transfer TX send failed")
+
+
+# --- Withdrawal Request ---
+
+
+class VbtcV2WithdrawRequestPrepareView(GenericAPIView):
+
+    def post(self, request, *args, **kwargs):
+        err = _require_fields(request.data, ["sc_identifier", "requestor_address", "btc_address", "amount", "fee_rate"])
+        if err:
+            return err
+
+        payload = {
+            "SmartContractUID": request.data["sc_identifier"],
+            "RequestorAddress": request.data["requestor_address"],
+            "BTCAddress": request.data["btc_address"],
+            "Amount": request.data["amount"],
+            "FeeRate": request.data["fee_rate"],
+        }
+        return _vbtc_v2_proxy(get_raw_request_withdrawal_tx, payload, "Withdrawal request TX preparation failed")
+
+
+class VbtcV2WithdrawRequestSendView(GenericAPIView):
+
+    def post(self, request, *args, **kwargs):
+        err = _require_fields(request.data, ["hash", "signature", "public_key"])
+        if err:
+            return err
+
+        payload = {
+            "Hash": request.data["hash"],
+            "Signature": request.data["signature"],
+            "PublicKey": request.data["public_key"],
+        }
+        return _vbtc_v2_proxy(send_raw_request_withdrawal_tx, payload, "Withdrawal request TX send failed")
+
+
+# --- Withdrawal Complete (FROST) ---
+
+
+class VbtcV2WithdrawCompletePrepareView(GenericAPIView):
+
+    def post(self, request, *args, **kwargs):
+        err = _require_fields(request.data, ["sc_identifier", "withdrawal_request_hash"])
+        if err:
+            return err
+
+        payload = {
+            "SmartContractUID": request.data["sc_identifier"],
+            "WithdrawalRequestHash": request.data["withdrawal_request_hash"],
+        }
+        return _vbtc_v2_proxy(prepare_complete_withdrawal, payload, "Withdrawal complete preparation failed")
+
+
+class VbtcV2WithdrawCompleteExecuteView(GenericAPIView):
+
+    def post(self, request, *args, **kwargs):
+        err = _require_fields(request.data, ["sc_identifier", "withdrawal_request_hash", "signature", "timestamp", "unique_id"])
+        if err:
+            return err
+
+        payload = {
+            "SmartContractUID": request.data["sc_identifier"],
+            "WithdrawalRequestHash": request.data["withdrawal_request_hash"],
+            "ValidatorAddress": request.data.get("owner_address", ""),
+            "ValidatorSignature": request.data["signature"],
+            "Timestamp": request.data["timestamp"],
+            "UniqueId": request.data["unique_id"],
+        }
+        return _vbtc_v2_proxy(execute_complete_withdrawal, payload, "Withdrawal completion failed")
+
+
+# --- Withdrawal Cancel ---
+
+
+class VbtcV2WithdrawCancelPrepareView(GenericAPIView):
+
+    def post(self, request, *args, **kwargs):
+        err = _require_fields(request.data, ["sc_identifier", "owner_address", "withdrawal_request_hash"])
+        if err:
+            return err
 
         payload = {
             "SmartContractUID": request.data["sc_identifier"],
             "OwnerAddress": request.data["owner_address"],
             "WithdrawalRequestHash": request.data["withdrawal_request_hash"],
-            "BTCTxHash": request.data.get("btc_tx_hash", ""),
-            "FailureProof": request.data.get("failure_proof", ""),
         }
+        return _vbtc_v2_proxy(get_raw_cancel_withdrawal_tx, payload, "Cancel TX preparation failed")
 
-        result = cancel_vbtc_v2_withdrawal(payload)
-        success = result.get("Success", False)
 
-        if success:
-            return Response({"success": True})
+class VbtcV2WithdrawCancelSendView(GenericAPIView):
 
-        return Response(
-            {"success": False, "message": result.get("Message", "Withdrawal cancellation failed")},
-            status=500,
-        )
+    def post(self, request, *args, **kwargs):
+        err = _require_fields(request.data, ["hash", "signature", "public_key"])
+        if err:
+            return err
+
+        payload = {
+            "Hash": request.data["hash"],
+            "Signature": request.data["signature"],
+            "PublicKey": request.data["public_key"],
+        }
+        return _vbtc_v2_proxy(send_raw_cancel_withdrawal_tx, payload, "Cancel TX send failed")
