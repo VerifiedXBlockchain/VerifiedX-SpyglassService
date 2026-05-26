@@ -1,6 +1,7 @@
 from django.urls import path
 from .views import (
     BtcAddressView,
+    BtcBroadcastView,
     VbtcCompileDataView,
     VbtcDefaultImageView,
     VbtcListView,
@@ -28,6 +29,7 @@ from .views import (
 
 urlpatterns = [
     path("address/<str:address>/", BtcAddressView.as_view()),
+    path("broadcast/", BtcBroadcastView.as_view()),
     path("vbtc/", VbtcListAllView.as_view()),
     path("vbtc/<str:vfx_address>/", VbtcListView.as_view()),
     path("vbtc/detail/<str:sc_identifier>/", VbtcDetailView.as_view()),

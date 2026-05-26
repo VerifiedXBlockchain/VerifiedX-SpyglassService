@@ -92,3 +92,26 @@ class BtcClient:
             return data.get("txs", [])
         else:
             return data.get("transactions", [])
+
+    def broadcast_transaction(self, raw_tx_hex: str):
+        """Broadcast a signed transaction to the Bitcoin network."""
+        try:
+            if self.is_blockchain_info:
+                url = "https://blockstream.info/api/tx"
+            else:
+                url = "https://blockstream.info/testnet/api/tx"
+
+            response = requests.post(
+                url,
+                data=raw_tx_hex,
+                headers={"Content-Type": "text/plain"},
+                timeout=(5, 30),
+            )
+
+            if response.status_code == 200:
+                return {"success": True, "txid": response.text.strip()}
+
+            return {"success": False, "message": response.text.strip()}
+        except Exception as e:
+            logger.error(f"Error broadcasting BTC transaction: {e}")
+            return {"success": False, "message": str(e)}

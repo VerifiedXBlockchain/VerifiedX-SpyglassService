@@ -533,3 +533,30 @@ class VbtcV2WithdrawCancelSendView(GenericAPIView):
             "PublicKey": request.data["public_key"],
         }
         return _vbtc_v2_proxy(send_raw_cancel_withdrawal_tx, payload, "Cancel TX send failed")
+
+
+# --- BTC Broadcast ---
+
+
+class BtcBroadcastView(GenericAPIView):
+
+    def post(self, request, *args, **kwargs):
+        raw_tx_hex = request.data.get("raw_tx_hex")
+        if not raw_tx_hex:
+            return Response(
+                {"success": False, "message": "raw_tx_hex required"}, status=400
+            )
+
+        client = BtcClient()
+        result = client.broadcast_transaction(raw_tx_hex)
+
+        if result.get("success"):
+            return Response({
+                "success": True,
+                "txid": result.get("txid"),
+            })
+
+        return Response(
+            {"success": False, "message": result.get("message", "BTC broadcast failed")},
+            status=500,
+        )
