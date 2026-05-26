@@ -1172,7 +1172,7 @@ def prepare_complete_withdrawal(payload: dict):
 def execute_complete_withdrawal(payload: dict):
     return _vbtc_v2_request(
         "post",
-        "vbtcapi/vbtc/CompleteWithdrawalRaw",
+        "vbtcapi/vbtc/ExecuteCompleteWithdrawalRaw",
         payload,
         timeout=180,
     )

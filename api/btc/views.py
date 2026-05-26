@@ -311,14 +311,22 @@ class VbtcV2CeremonyPrepareView(GenericAPIView):
 class VbtcV2CeremonyExecuteView(GenericAPIView):
 
     def post(self, request, *args, **kwargs):
-        err = _require_fields(request.data, ["ceremony_id", "start_signature", "share_distribution_signature"])
+        err = _require_fields(request.data, [
+            "ceremony_id", "session_id", "owner_address",
+            "start_signature", "start_timestamp",
+            "share_distribution_signature", "share_distribution_timestamp",
+        ])
         if err:
             return err
 
         payload = {
             "CeremonyId": request.data["ceremony_id"],
+            "SessionId": request.data["session_id"],
+            "OwnerAddress": request.data["owner_address"],
             "StartSignature": request.data["start_signature"],
+            "StartTimestamp": request.data["start_timestamp"],
             "ShareDistributionSignature": request.data["share_distribution_signature"],
+            "ShareDistributionTimestamp": request.data["share_distribution_timestamp"],
         }
         return _vbtc_v2_proxy(execute_vbtc_v2_ceremony, payload, "Ceremony execution failed")
 
@@ -455,13 +463,14 @@ class VbtcV2WithdrawRequestSendView(GenericAPIView):
 class VbtcV2WithdrawCompletePrepareView(GenericAPIView):
 
     def post(self, request, *args, **kwargs):
-        err = _require_fields(request.data, ["sc_identifier", "withdrawal_request_hash"])
+        err = _require_fields(request.data, ["sc_identifier", "withdrawal_request_hash", "owner_address"])
         if err:
             return err
 
         payload = {
             "SmartContractUID": request.data["sc_identifier"],
             "WithdrawalRequestHash": request.data["withdrawal_request_hash"],
+            "OwnerAddress": request.data["owner_address"],
         }
         return _vbtc_v2_proxy(prepare_complete_withdrawal, payload, "Withdrawal complete preparation failed")
 
@@ -469,17 +478,26 @@ class VbtcV2WithdrawCompletePrepareView(GenericAPIView):
 class VbtcV2WithdrawCompleteExecuteView(GenericAPIView):
 
     def post(self, request, *args, **kwargs):
-        err = _require_fields(request.data, ["sc_identifier", "withdrawal_request_hash", "signature", "timestamp", "unique_id"])
+        err = _require_fields(request.data, [
+            "sc_identifier", "withdrawal_request_hash", "owner_address",
+            "session_id", "start_signature", "start_timestamp",
+            "share_distribution_signature", "share_distribution_timestamp",
+        ])
         if err:
             return err
 
         payload = {
+            "OwnerAddress": request.data["owner_address"],
             "SmartContractUID": request.data["sc_identifier"],
             "WithdrawalRequestHash": request.data["withdrawal_request_hash"],
-            "ValidatorAddress": request.data.get("owner_address", ""),
-            "ValidatorSignature": request.data["signature"],
-            "Timestamp": request.data["timestamp"],
-            "UniqueId": request.data["unique_id"],
+            "SessionId": request.data["session_id"],
+            "StartTimestamp": request.data["start_timestamp"],
+            "StartSignature": request.data["start_signature"],
+            "ShareDistributionTimestamp": request.data["share_distribution_timestamp"],
+            "ShareDistributionSignature": request.data["share_distribution_signature"],
+            "Amount": request.data.get("amount", 0),
+            "BTCDestination": request.data.get("btc_destination", ""),
+            "FeeRate": request.data.get("fee_rate", 0),
         }
         return _vbtc_v2_proxy(execute_complete_withdrawal, payload, "Withdrawal completion failed")
 
@@ -496,7 +514,7 @@ class VbtcV2WithdrawCancelPrepareView(GenericAPIView):
 
         payload = {
             "SmartContractUID": request.data["sc_identifier"],
-            "OwnerAddress": request.data["owner_address"],
+            "RequestorAddress": request.data["owner_address"],
             "WithdrawalRequestHash": request.data["withdrawal_request_hash"],
         }
         return _vbtc_v2_proxy(get_raw_cancel_withdrawal_tx, payload, "Cancel TX preparation failed")
