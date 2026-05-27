@@ -261,7 +261,7 @@ def _vbtc_v2_proxy(cli_func, payload, error_msg="Operation failed"):
     if success:
         return Response({"success": True, **{k: v for k, v in result.items() if k != "Success"}})
     return Response(
-        {"success": False, "message": result.get("Message", error_msg)},
+        {"success": False, "message": result.get("Message", error_msg), "raw": result},
         status=500,
     )
 
