@@ -359,7 +359,10 @@ class VbtcV2CeremonyStatusView(GenericAPIView):
 class VbtcV2CreateContractPrepareView(GenericAPIView):
 
     def post(self, request, *args, **kwargs):
-        err = _require_fields(request.data, ["owner_address", "name", "description", "ticker", "ceremony_id"])
+        err = _require_fields(request.data, [
+            "owner_address", "name", "description", "ticker", "ceremony_id",
+            "timestamp", "unique_id", "owner_signature",
+        ])
         if err:
             return err
 
@@ -369,6 +372,9 @@ class VbtcV2CreateContractPrepareView(GenericAPIView):
             "Description": request.data["description"],
             "Ticker": request.data["ticker"],
             "CeremonyId": request.data["ceremony_id"],
+            "Timestamp": request.data["timestamp"],
+            "UniqueId": request.data["unique_id"],
+            "OwnerSignature": request.data["owner_signature"],
         }
         return _vbtc_v2_proxy(get_raw_create_contract_tx, payload, "Contract TX preparation failed")
 
