@@ -23,6 +23,7 @@ from .views import (
     VbtcV2WithdrawRequestSendView,
     VbtcV2WithdrawCompletePrepareView,
     VbtcV2WithdrawCompleteExecuteView,
+    VbtcV2WithdrawCompleteStatusView,
     VbtcV2WithdrawCancelPrepareView,
     VbtcV2WithdrawCancelSendView,
 )
@@ -52,6 +53,7 @@ urlpatterns = [
     # Withdrawal Complete (FROST)
     path("vbtc-v2/withdraw/complete/prepare/", VbtcV2WithdrawCompletePrepareView.as_view()),
     path("vbtc-v2/withdraw/complete/execute/", VbtcV2WithdrawCompleteExecuteView.as_view()),
+    path("vbtc-v2/withdraw/complete/status/<str:job_id>/", VbtcV2WithdrawCompleteStatusView.as_view()),
     # Withdrawal Cancel
     path("vbtc-v2/withdraw/cancel/prepare/", VbtcV2WithdrawCancelPrepareView.as_view()),
     path("vbtc-v2/withdraw/cancel/send/", VbtcV2WithdrawCancelSendView.as_view()),

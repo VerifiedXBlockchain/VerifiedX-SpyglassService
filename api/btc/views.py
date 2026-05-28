@@ -481,6 +481,12 @@ class VbtcV2WithdrawCompletePrepareView(GenericAPIView):
         return _vbtc_v2_proxy(prepare_complete_withdrawal, payload, "Withdrawal complete preparation failed")
 
 
+import threading
+import uuid
+
+_frost_jobs = {}  # job_id -> {"status": "pending"|"complete"|"failed", "result": {...}}
+
+
 class VbtcV2WithdrawCompleteExecuteView(GenericAPIView):
 
     def post(self, request, *args, **kwargs):
@@ -505,7 +511,68 @@ class VbtcV2WithdrawCompleteExecuteView(GenericAPIView):
             "BTCDestination": request.data.get("btc_destination", ""),
             "FeeRate": request.data.get("fee_rate", 0),
         }
-        return _vbtc_v2_proxy(execute_complete_withdrawal, payload, "Withdrawal completion failed")
+
+        job_id = str(uuid.uuid4())
+        _frost_jobs[job_id] = {"status": "pending", "result": None}
+
+        def _run_frost():
+            try:
+                result = execute_complete_withdrawal(payload)
+                success = result.get("Success", False)
+                if success:
+                    _frost_jobs[job_id] = {"status": "complete", "result": result}
+                else:
+                    _frost_jobs[job_id] = {
+                        "status": "failed",
+                        "result": {"message": result.get("Message", "FROST signing failed")},
+                    }
+            except Exception as e:
+                _frost_jobs[job_id] = {
+                    "status": "failed",
+                    "result": {"message": str(e)},
+                }
+
+        threading.Thread(target=_run_frost, daemon=True).start()
+
+        return Response({
+            "success": True,
+            "job_id": job_id,
+            "message": "FROST signing started. Poll /withdraw/complete/status/{job_id}/ for result.",
+        })
+
+
+class VbtcV2WithdrawCompleteStatusView(GenericAPIView):
+
+    def get(self, request, *args, **kwargs):
+        job_id = self.kwargs["job_id"]
+        job = _frost_jobs.get(job_id)
+
+        if job is None:
+            return Response(
+                {"success": False, "message": "Job not found"}, status=404
+            )
+
+        if job["status"] == "pending":
+            return Response({"success": True, "status": "pending"})
+
+        if job["status"] == "complete":
+            result = job["result"]
+            del _frost_jobs[job_id]
+            return Response({
+                "success": True,
+                "status": "complete",
+                "signed_btc_tx_hex": result.get("SignedBTCTxHex"),
+                "sc_identifier": result.get("SmartContractUID"),
+                "withdrawal_request_hash": result.get("WithdrawalRequestHash"),
+            })
+
+        # failed
+        result = job["result"]
+        del _frost_jobs[job_id]
+        return Response(
+            {"success": False, "status": "failed", "message": result.get("message", "FROST signing failed")},
+            status=500,
+        )
 
 
 # --- Withdrawal Cancel ---
