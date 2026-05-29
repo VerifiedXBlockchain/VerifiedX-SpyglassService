@@ -1178,6 +1178,24 @@ def execute_complete_withdrawal(payload: dict):
     )
 
 
+# Withdrawal Complete TX (Type 28 — after BTC broadcast)
+
+def get_raw_complete_withdrawal_tx(payload: dict):
+    return _vbtc_v2_request(
+        "post",
+        "vbtcapi/vbtc/GetRawCompleteWithdrawalTxData",
+        payload,
+    )
+
+
+def send_raw_complete_withdrawal_tx(payload: dict):
+    return _vbtc_v2_request(
+        "post",
+        "vbtcapi/vbtc/SendRawCompleteWithdrawalTx",
+        payload,
+    )
+
+
 # Withdrawal Cancel
 
 def get_raw_cancel_withdrawal_tx(payload: dict):

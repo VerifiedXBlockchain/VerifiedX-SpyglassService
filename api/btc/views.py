@@ -26,6 +26,8 @@ from rbx.client import (
     send_raw_request_withdrawal_tx,
     prepare_complete_withdrawal,
     execute_complete_withdrawal,
+    get_raw_complete_withdrawal_tx,
+    send_raw_complete_withdrawal_tx,
     get_raw_cancel_withdrawal_tx,
     send_raw_cancel_withdrawal_tx,
 )
@@ -573,6 +575,45 @@ class VbtcV2WithdrawCompleteStatusView(GenericAPIView):
             {"success": False, "status": "failed", "message": result.get("message", "FROST signing failed")},
             status=500,
         )
+
+
+# --- Withdrawal Complete TX (Step 4 — after BTC broadcast) ---
+
+
+class VbtcV2WithdrawCompleteTxPrepareView(GenericAPIView):
+
+    def post(self, request, *args, **kwargs):
+        err = _require_fields(request.data, [
+            "sc_identifier", "from_address", "withdrawal_request_hash",
+            "btc_transaction_hash", "amount", "btc_destination",
+        ])
+        if err:
+            return err
+
+        payload = {
+            "SmartContractUID": request.data["sc_identifier"],
+            "FromAddress": request.data["from_address"],
+            "WithdrawalRequestHash": request.data["withdrawal_request_hash"],
+            "BTCTransactionHash": request.data["btc_transaction_hash"],
+            "Amount": request.data["amount"],
+            "BTCDestination": request.data["btc_destination"],
+        }
+        return _vbtc_v2_proxy(get_raw_complete_withdrawal_tx, payload, "Withdrawal complete TX preparation failed")
+
+
+class VbtcV2WithdrawCompleteTxSendView(GenericAPIView):
+
+    def post(self, request, *args, **kwargs):
+        err = _require_fields(request.data, ["hash", "signature", "public_key"])
+        if err:
+            return err
+
+        payload = {
+            "Hash": request.data["hash"],
+            "Signature": request.data["signature"],
+            "PublicKey": request.data["public_key"],
+        }
+        return _vbtc_v2_proxy(send_raw_complete_withdrawal_tx, payload, "Withdrawal complete TX send failed")
 
 
 # --- Withdrawal Cancel ---

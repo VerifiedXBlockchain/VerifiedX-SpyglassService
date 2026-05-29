@@ -24,6 +24,8 @@ from .views import (
     VbtcV2WithdrawCompletePrepareView,
     VbtcV2WithdrawCompleteExecuteView,
     VbtcV2WithdrawCompleteStatusView,
+    VbtcV2WithdrawCompleteTxPrepareView,
+    VbtcV2WithdrawCompleteTxSendView,
     VbtcV2WithdrawCancelPrepareView,
     VbtcV2WithdrawCancelSendView,
 )
@@ -54,6 +56,9 @@ urlpatterns = [
     path("vbtc-v2/withdraw/complete/prepare/", VbtcV2WithdrawCompletePrepareView.as_view()),
     path("vbtc-v2/withdraw/complete/execute/", VbtcV2WithdrawCompleteExecuteView.as_view()),
     path("vbtc-v2/withdraw/complete/status/<str:job_id>/", VbtcV2WithdrawCompleteStatusView.as_view()),
+    # Withdrawal Complete TX (Step 4 — record on VFX chain after BTC broadcast)
+    path("vbtc-v2/withdraw/complete/tx/prepare/", VbtcV2WithdrawCompleteTxPrepareView.as_view()),
+    path("vbtc-v2/withdraw/complete/tx/send/", VbtcV2WithdrawCompleteTxSendView.as_view()),
     # Withdrawal Cancel
     path("vbtc-v2/withdraw/cancel/prepare/", VbtcV2WithdrawCancelPrepareView.as_view()),
     path("vbtc-v2/withdraw/cancel/send/", VbtcV2WithdrawCancelSendView.as_view()),
