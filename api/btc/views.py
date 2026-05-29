@@ -483,10 +483,14 @@ class VbtcV2WithdrawCompletePrepareView(GenericAPIView):
         return _vbtc_v2_proxy(prepare_complete_withdrawal, payload, "Withdrawal complete preparation failed")
 
 
+import json as _json
 import threading
 import uuid
 
-_frost_jobs = {}  # job_id -> {"status": "pending"|"complete"|"failed", "result": {...}}
+from django.core.cache import cache as _cache
+
+FROST_JOB_PREFIX = "frost_job:"
+FROST_JOB_TTL = 300  # 5 minutes
 
 
 class VbtcV2WithdrawCompleteExecuteView(GenericAPIView):
@@ -515,24 +519,30 @@ class VbtcV2WithdrawCompleteExecuteView(GenericAPIView):
         }
 
         job_id = str(uuid.uuid4())
-        _frost_jobs[job_id] = {"status": "pending", "result": None}
+        _cache.set(f"{FROST_JOB_PREFIX}{job_id}", _json.dumps({"status": "pending"}), FROST_JOB_TTL)
 
         def _run_frost():
             try:
                 result = execute_complete_withdrawal(payload)
                 success = result.get("Success", False)
                 if success:
-                    _frost_jobs[job_id] = {"status": "complete", "result": result}
+                    _cache.set(
+                        f"{FROST_JOB_PREFIX}{job_id}",
+                        _json.dumps({"status": "complete", "result": result}),
+                        FROST_JOB_TTL,
+                    )
                 else:
-                    _frost_jobs[job_id] = {
-                        "status": "failed",
-                        "result": {"message": result.get("Message", "FROST signing failed")},
-                    }
+                    _cache.set(
+                        f"{FROST_JOB_PREFIX}{job_id}",
+                        _json.dumps({"status": "failed", "message": result.get("Message", "FROST signing failed")}),
+                        FROST_JOB_TTL,
+                    )
             except Exception as e:
-                _frost_jobs[job_id] = {
-                    "status": "failed",
-                    "result": {"message": str(e)},
-                }
+                _cache.set(
+                    f"{FROST_JOB_PREFIX}{job_id}",
+                    _json.dumps({"status": "failed", "message": str(e)}),
+                    FROST_JOB_TTL,
+                )
 
         threading.Thread(target=_run_frost, daemon=True).start()
 
@@ -547,19 +557,21 @@ class VbtcV2WithdrawCompleteStatusView(GenericAPIView):
 
     def get(self, request, *args, **kwargs):
         job_id = self.kwargs["job_id"]
-        job = _frost_jobs.get(job_id)
+        raw = _cache.get(f"{FROST_JOB_PREFIX}{job_id}")
 
-        if job is None:
+        if raw is None:
             return Response(
                 {"success": False, "message": "Job not found"}, status=404
             )
+
+        job = _json.loads(raw)
 
         if job["status"] == "pending":
             return Response({"success": True, "status": "pending"})
 
         if job["status"] == "complete":
             result = job["result"]
-            del _frost_jobs[job_id]
+            _cache.delete(f"{FROST_JOB_PREFIX}{job_id}")
             return Response({
                 "success": True,
                 "status": "complete",
@@ -569,10 +581,9 @@ class VbtcV2WithdrawCompleteStatusView(GenericAPIView):
             })
 
         # failed
-        result = job["result"]
-        del _frost_jobs[job_id]
+        _cache.delete(f"{FROST_JOB_PREFIX}{job_id}")
         return Response(
-            {"success": False, "status": "failed", "message": result.get("message", "FROST signing failed")},
+            {"success": False, "status": "failed", "message": job.get("message", "FROST signing failed")},
             status=500,
         )
 
