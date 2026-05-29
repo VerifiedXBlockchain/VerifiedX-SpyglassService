@@ -873,6 +873,8 @@ def process_transaction(tx: Transaction):
 
     elif tx.type == Transaction.Type.VBTC_V2_TRANSFER:
         parsed = json.loads(tx.data)
+        if isinstance(parsed, str):
+            parsed = json.loads(parsed)
         if isinstance(parsed, list):
             parsed = parsed[0]
 
@@ -901,6 +903,8 @@ def process_transaction(tx: Transaction):
 
     elif tx.type == Transaction.Type.VBTC_V2_WITHDRAWAL_REQUEST:
         parsed = json.loads(tx.data)
+        if isinstance(parsed, str):
+            parsed = json.loads(parsed)
         if isinstance(parsed, list):
             parsed = parsed[0]
 
@@ -931,6 +935,8 @@ def process_transaction(tx: Transaction):
 
     elif tx.type == Transaction.Type.VBTC_V2_WITHDRAWAL_COMPLETE:
         parsed = json.loads(tx.data)
+        if isinstance(parsed, str):
+            parsed = json.loads(parsed)
         if isinstance(parsed, list):
             parsed = parsed[0]
 
