@@ -892,13 +892,15 @@ def process_transaction(tx: Transaction):
                 logging.error(f"VbtcV2Token with sc id of {sc_identifier} not found.")
                 return
 
-            VbtcV2TokenTransfer.objects.create(
+            VbtcV2TokenTransfer.objects.get_or_create(
                 token=token,
                 transaction=tx,
-                from_address=from_address,
-                to_address=to_address,
-                amount=amount,
-                created_at=tx.date_crafted,
+                defaults={
+                    "from_address": from_address,
+                    "to_address": to_address,
+                    "amount": amount,
+                    "created_at": tx.date_crafted,
+                },
             )
 
     elif tx.type == Transaction.Type.VBTC_V2_WITHDRAWAL_REQUEST:
@@ -919,15 +921,17 @@ def process_transaction(tx: Transaction):
                 logging.error(f"VbtcV2Token with sc id of {sc_identifier} not found.")
                 return
 
-            VbtcV2WithdrawalRequest.objects.create(
+            VbtcV2WithdrawalRequest.objects.get_or_create(
                 token=token,
                 request_transaction=tx,
-                requestor_address=parsed["RequestorAddress"],
-                btc_address=parsed["BTCAddress"],
-                amount=Decimal(parsed["Amount"]),
-                fee_rate=Decimal(parsed["FeeRate"]),
-                status=VbtcV2WithdrawalRequest.Status.REQUESTED,
-                created_at=tx.date_crafted,
+                defaults={
+                    "requestor_address": parsed["RequestorAddress"],
+                    "btc_address": parsed["BTCAddress"],
+                    "amount": Decimal(parsed["Amount"]),
+                    "fee_rate": Decimal(parsed["FeeRate"]),
+                    "status": VbtcV2WithdrawalRequest.Status.REQUESTED,
+                    "created_at": tx.date_crafted,
+                },
             )
 
             token.is_pending_withdrawal = True
