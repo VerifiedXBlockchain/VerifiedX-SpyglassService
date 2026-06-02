@@ -694,7 +694,7 @@ class VbtcV2OwnershipTransferDataView(GenericAPIView):
 
         # The CLI returns the TX data array directly on success, or {Success: false, Message} on error
         if isinstance(result, list):
-            return Response(result)
+            return Response({"success": True, "tx_data": result})
 
         if isinstance(result, dict) and result.get("Success") is False:
             return Response(
