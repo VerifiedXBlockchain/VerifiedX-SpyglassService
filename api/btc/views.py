@@ -30,6 +30,7 @@ from rbx.client import (
     send_raw_complete_withdrawal_tx,
     get_raw_cancel_withdrawal_tx,
     send_raw_cancel_withdrawal_tx,
+    vbtc_v2_beacon_upload,
     get_vbtc_v2_ownership_transfer_data,
 )
 from rbx.models import (
@@ -662,6 +663,24 @@ class VbtcV2WithdrawCancelSendView(GenericAPIView):
 
 
 # --- Ownership Transfer ---
+
+
+class VbtcV2BeaconUploadView(GenericAPIView):
+
+    def get(self, request, *args, **kwargs):
+        sc_identifier = self.kwargs["sc_identifier"]
+        to_address = self.kwargs["to_address"]
+        signature = self.kwargs["signature"]
+
+        result = vbtc_v2_beacon_upload(sc_identifier, to_address, signature)
+
+        if result.get("success"):
+            return Response(result)
+
+        return Response(
+            {"success": False, "message": result.get("message", "Beacon upload failed")},
+            status=500,
+        )
 
 
 class VbtcV2OwnershipTransferDataView(GenericAPIView):

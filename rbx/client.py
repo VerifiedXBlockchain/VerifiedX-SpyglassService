@@ -1216,6 +1216,24 @@ def send_raw_cancel_withdrawal_tx(payload: dict):
 
 # Ownership Transfer
 
+def vbtc_v2_beacon_upload(sc_uid: str, to_address: str, signature: str):
+    """Beacon upload via the V2 CLI (BASE_URL), not the shop CLI."""
+    logger = logging.getLogger(__name__)
+    url = join_url(
+        BASE_URL,
+        f"txapi/txV1/CreateBeaconUploadRequest/{sc_uid}/{to_address}/{signature}",
+    )
+    try:
+        response = requests.get(url, timeout=15)
+        data = response.json()
+        if data.get("Success"):
+            return {"success": True, "locator": data.get("Locator")}
+        return {"success": False, "message": data.get("Message", "Beacon upload failed")}
+    except Exception as e:
+        logger.error(f"V2 beacon upload failed: {e}")
+        return {"success": False, "message": str(e)}
+
+
 def get_vbtc_v2_ownership_transfer_data(sc_uid: str, to_address: str, locator: str):
     return _vbtc_v2_request(
         "get",
