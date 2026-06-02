@@ -1164,31 +1164,20 @@ class VbtcV2Token(models.Model):
     def addresses(self):
         owner_address = self.owner_address
 
-        completed_withdrawals = VbtcV2WithdrawalRequest.objects.filter(
-            token=self, status=VbtcV2WithdrawalRequest.Status.COMPLETED
-        )
-        total_withdrawn = sum(
-            (w.amount for w in completed_withdrawals), Decimal(0)
-        )
-
-        # Owner starts with all BTC ever deposited (current balance + withdrawn)
-        entries = {owner_address: self.global_balance + total_withdrawn}
-
-        # Transfers redistribute between VFX addresses
+        # Compute per-address ledger balance from transfers (received - sent)
         transfers = VbtcV2TokenTransfer.objects.filter(token=self).order_by(
             "created_at"
         )
+        entries = {}
         for t in transfers:
             entries[t.to_address] = entries.get(t.to_address, Decimal(0)) + t.amount
             entries[t.from_address] = entries.get(t.from_address, Decimal(0)) - t.amount
 
-        # Withdrawals deduct from the requestor's balance
-        for w in completed_withdrawals:
-            entries[w.requestor_address] = (
-                entries.get(w.requestor_address, Decimal(0)) - w.amount
-            )
+        # Owner gets the BTC deposit balance (global_balance from blockchain.info sync)
+        # This mirrors the CLI: owner = btcDepositBalance + ledgerBalance
+        entries[owner_address] = entries.get(owner_address, Decimal(0)) + self.global_balance
 
-        # Filter out zero/negative balances (can occur after ownership transfers)
+        # Filter out zero/negative balances
         return {addr: bal for addr, bal in entries.items() if bal > 0}
 
 
