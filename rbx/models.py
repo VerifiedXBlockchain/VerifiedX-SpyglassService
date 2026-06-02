@@ -1173,9 +1173,30 @@ class VbtcV2Token(models.Model):
             entries[t.to_address] = entries.get(t.to_address, Decimal(0)) + t.amount
             entries[t.from_address] = entries.get(t.from_address, Decimal(0)) - t.amount
 
-        # Owner gets the BTC deposit balance (global_balance from blockchain.info sync)
-        # This mirrors the CLI: owner = btcDepositBalance + ledgerBalance
-        entries[owner_address] = entries.get(owner_address, Decimal(0)) + self.global_balance
+        # Withdrawals reduce the withdrawer's balance (not the owner's).
+        # global_balance already reflects the BTC leaving the deposit address,
+        # so we add total_withdrawn back to the owner to compensate, then
+        # subtract each withdrawal from the requestor.
+        completed_withdrawals = VbtcV2WithdrawalRequest.objects.filter(
+            token=self, status=VbtcV2WithdrawalRequest.Status.COMPLETED
+        )
+        total_withdrawn = sum(
+            (w.amount for w in completed_withdrawals), Decimal(0)
+        )
+
+        # Owner = global_balance (actual BTC on deposit) + total_withdrawn (to undo
+        # the global_balance reduction) + net transfers
+        entries[owner_address] = (
+            entries.get(owner_address, Decimal(0))
+            + self.global_balance
+            + total_withdrawn
+        )
+
+        # Subtract each withdrawal from the requestor's balance
+        for w in completed_withdrawals:
+            entries[w.requestor_address] = (
+                entries.get(w.requestor_address, Decimal(0)) - w.amount
+            )
 
         # Filter out zero/negative balances
         return {addr: bal for addr, bal in entries.items() if bal > 0}
