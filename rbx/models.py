@@ -1188,7 +1188,8 @@ class VbtcV2Token(models.Model):
                 entries.get(w.requestor_address, Decimal(0)) - w.amount
             )
 
-        return entries
+        # Filter out zero/negative balances (can occur after ownership transfers)
+        return {addr: bal for addr, bal in entries.items() if bal > 0}
 
 
 class VbtcV2TokenTransfer(models.Model):
