@@ -805,7 +805,8 @@ def process_transaction(tx: Transaction):
     elif tx.type == Transaction.Type.TKNZ_TX:
 
         parsed = json.loads(tx.data)
-
+        if isinstance(parsed, str):
+            parsed = json.loads(parsed)
         if isinstance(parsed, list):
             parsed = parsed[0]
 
@@ -831,14 +832,31 @@ def process_transaction(tx: Transaction):
 
         elif func == "Transfer()":
             sc_identifier = parsed["ContractUID"]
+            # Try V1 token first
             try:
                 token = VbtcToken.objects.get(sc_identifier=sc_identifier)
-            except VbtcToken.DoesNotExist:
-                print(f"VbtcToken with sc id of{sc_identifier} not found.")
+                token.owner_address = tx.to_address
+                token.save()
                 return
+            except VbtcToken.DoesNotExist:
+                pass
 
-            token.owner_address = tx.to_address
-            token.save()
+            # Try V2 token
+            try:
+                v2_token = VbtcV2Token.objects.get(sc_identifier=sc_identifier)
+                v2_token.owner_address = tx.to_address
+                v2_token.save()
+                # Also update the NFT owner
+                try:
+                    nft = v2_token.nft
+                    nft.owner_address = tx.to_address
+                    nft.save()
+                except Exception:
+                    pass
+                return
+            except VbtcV2Token.DoesNotExist:
+                print(f"No VbtcToken or VbtcV2Token with sc id of {sc_identifier} found.")
+                return
 
         elif func == "TransferCoinMulti()":
             inputs = parsed["Inputs"]
