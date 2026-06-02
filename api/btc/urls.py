@@ -28,6 +28,7 @@ from .views import (
     VbtcV2WithdrawCompleteTxSendView,
     VbtcV2WithdrawCancelPrepareView,
     VbtcV2WithdrawCancelSendView,
+    VbtcV2OwnershipTransferDataView,
 )
 
 urlpatterns = [
@@ -62,6 +63,8 @@ urlpatterns = [
     # Withdrawal Cancel
     path("vbtc-v2/withdraw/cancel/prepare/", VbtcV2WithdrawCancelPrepareView.as_view()),
     path("vbtc-v2/withdraw/cancel/send/", VbtcV2WithdrawCancelSendView.as_view()),
+    # Ownership Transfer
+    path("vbtc-v2/ownership-transfer/<str:sc_identifier>/<str:to_address>/<path:locator>/", VbtcV2OwnershipTransferDataView.as_view()),
     # Read endpoints (catch-all last)
     path("vbtc-v2/detail/<str:sc_identifier>/", VbtcV2DetailView.as_view()),
     path("vbtc-v2/transfers/<str:sc_identifier>/", VbtcV2TransfersView.as_view()),

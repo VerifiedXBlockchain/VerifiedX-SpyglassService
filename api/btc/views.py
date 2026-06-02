@@ -30,6 +30,7 @@ from rbx.client import (
     send_raw_complete_withdrawal_tx,
     get_raw_cancel_withdrawal_tx,
     send_raw_cancel_withdrawal_tx,
+    get_vbtc_v2_ownership_transfer_data,
 )
 from rbx.models import (
     Price,
@@ -658,6 +659,31 @@ class VbtcV2WithdrawCancelSendView(GenericAPIView):
             "PublicKey": request.data["public_key"],
         }
         return _vbtc_v2_proxy(send_raw_cancel_withdrawal_tx, payload, "Cancel TX send failed")
+
+
+# --- Ownership Transfer ---
+
+
+class VbtcV2OwnershipTransferDataView(GenericAPIView):
+
+    def get(self, request, *args, **kwargs):
+        sc_identifier = self.kwargs["sc_identifier"]
+        to_address = self.kwargs["to_address"]
+        locator = self.kwargs["locator"]
+
+        result = get_vbtc_v2_ownership_transfer_data(sc_identifier, to_address, locator)
+
+        # The CLI returns the TX data array directly on success, or {Success: false, Message} on error
+        if isinstance(result, list):
+            return Response(result)
+
+        if isinstance(result, dict) and result.get("Success") is False:
+            return Response(
+                {"success": False, "message": result.get("Message", "Failed to get transfer data")},
+                status=500,
+            )
+
+        return Response(result)
 
 
 # --- BTC Broadcast ---

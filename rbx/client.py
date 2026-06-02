@@ -1214,4 +1214,13 @@ def send_raw_cancel_withdrawal_tx(payload: dict):
     )
 
 
+# Ownership Transfer
+
+def get_vbtc_v2_ownership_transfer_data(sc_uid: str, to_address: str, locator: str):
+    return _vbtc_v2_request(
+        "get",
+        f"vbtcapi/vbtc/GetVBTCOwnershipTransferData/{sc_uid}/{to_address}/{locator}",
+    )
+
+
 # endregion
