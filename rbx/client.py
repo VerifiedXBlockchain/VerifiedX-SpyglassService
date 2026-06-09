@@ -42,7 +42,7 @@ def get_status() -> str:
 
 def get_info() -> Optional[dict]:
     url = join_url(BASE_URL, "api/V1/GetWalletInfo")
-    response = requests.get(url)
+    response = requests.get(url, timeout=15)
 
     if response.status_code != 200:
         raise RBXException
@@ -68,7 +68,7 @@ def get_master_nodes() -> List[dict]:
 
 def get_block(height: int) -> Optional[dict]:
     url = join_url(BASE_URL, f"api/V1/SendBlock/{height}")
-    response = requests.get(url)
+    response = requests.get(url, timeout=15)
 
     if response.status_code != 200:
         raise RBXException

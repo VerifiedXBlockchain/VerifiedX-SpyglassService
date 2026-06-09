@@ -53,7 +53,7 @@ def sync_the_blocks():
     management.call_command("sync_blocks")
 
 
-@app.task
+@app.task(soft_time_limit=60, time_limit=90)
 def health_check():
     from django.core import management
 
