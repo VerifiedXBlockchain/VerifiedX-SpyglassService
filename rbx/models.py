@@ -1160,6 +1160,20 @@ class VbtcV2Token(models.Model):
             return "https://vfx-resources.s3.amazonaws.com/defaultvBTC.gif"
         return self.image_base64_url
 
+    def recompute_pending_withdrawal(self):
+        """Derive is_pending_withdrawal from open withdrawal requests.
+
+        The flag must stay true while ANY request is still REQUESTED —
+        setting/clearing it directly in individual tx handlers loses that
+        invariant when a token has multiple in-flight withdrawals.
+        """
+        pending = self.withdrawal_requests.filter(
+            status=VbtcV2WithdrawalRequest.Status.REQUESTED
+        ).exists()
+        if self.is_pending_withdrawal != pending:
+            self.is_pending_withdrawal = pending
+            self.save(update_fields=["is_pending_withdrawal"])
+
     @property
     def addresses(self):
         owner_address = self.owner_address
@@ -1218,6 +1232,7 @@ class VbtcV2WithdrawalRequest(models.Model):
     class Status(models.TextChoices):
         REQUESTED = "requested"
         COMPLETED = "completed"
+        CANCELLED = "cancelled"
 
     token = models.ForeignKey(
         VbtcV2Token, on_delete=models.CASCADE, related_name="withdrawal_requests"
@@ -1226,6 +1241,13 @@ class VbtcV2WithdrawalRequest(models.Model):
         Transaction, on_delete=models.CASCADE, related_name="+"
     )
     completion_transaction = models.ForeignKey(
+        Transaction,
+        on_delete=models.CASCADE,
+        blank=True,
+        null=True,
+        related_name="+",
+    )
+    cancel_transaction = models.ForeignKey(
         Transaction,
         on_delete=models.CASCADE,
         blank=True,
@@ -1242,6 +1264,7 @@ class VbtcV2WithdrawalRequest(models.Model):
     )
     created_at = models.DateTimeField()
     completed_at = models.DateTimeField(blank=True, null=True)
+    cancelled_at = models.DateTimeField(blank=True, null=True)
 
     def __str__(self):
         return f"{self.token.sc_identifier} withdrawal [{self.status}]"

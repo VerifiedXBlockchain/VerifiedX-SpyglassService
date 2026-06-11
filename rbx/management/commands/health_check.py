@@ -1,7 +1,10 @@
-from datetime import datetime
+import logging
+from datetime import datetime, timedelta
+
 from django.db.models import Q, Sum
 from django.core.management.base import BaseCommand
-from rbx.models import Transaction
+from django.utils import timezone
+from rbx.models import Transaction, VbtcV2WithdrawalRequest
 from decimal import Decimal
 from rbx.client import get_info, get_block
 from rbx.sms import send_sms
@@ -11,6 +14,7 @@ python manage.py health_check
 """
 
 THRESHOLD_SECONDS = 250
+STALE_WITHDRAWAL_HOURS = 24
 ALERT_NUMBERS = [
     "+14169974264",
     "+19729982871",
@@ -41,6 +45,29 @@ class Command(BaseCommand):
                 self.handle_success(height)
         except Exception as e:
             self.handle_exception(e)
+
+        # Isolated from the node check above: a DB hiccup here must not
+        # page "Explorer Wallet is Unreachable". Alerts via Sentry
+        # (logging.error), not SMS — this runs every 3 minutes undeduped.
+        try:
+            self.check_stale_withdrawals()
+        except Exception:
+            logging.exception("health_check: stale withdrawal check failed")
+
+    def check_stale_withdrawals(self):
+        cutoff = timezone.now() - timedelta(hours=STALE_WITHDRAWAL_HOURS)
+        stale = VbtcV2WithdrawalRequest.objects.filter(
+            status=VbtcV2WithdrawalRequest.Status.REQUESTED,
+            created_at__lt=cutoff,
+        ).select_related("token")
+
+        for withdrawal in stale:
+            logging.error(
+                f"vBTC v2 withdrawal {withdrawal.pk} on token "
+                f"{withdrawal.token.sc_identifier} stuck in 'requested' since "
+                f"{withdrawal.created_at:%Y-%m-%d %H:%M} "
+                f"({withdrawal.amount} BTC to {withdrawal.btc_address})"
+            )
 
     def handle_problem(self, height, delta):
         print(f"PROBLEM. Last block is {height}")

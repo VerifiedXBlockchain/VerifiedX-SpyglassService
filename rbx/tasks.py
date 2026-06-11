@@ -952,8 +952,7 @@ def process_transaction(tx: Transaction):
                 },
             )
 
-            token.is_pending_withdrawal = True
-            token.save()
+            token.recompute_pending_withdrawal()
 
     elif tx.type == Transaction.Type.VBTC_V2_WITHDRAWAL_COMPLETE:
         parsed = json.loads(tx.data)
@@ -984,6 +983,15 @@ def process_transaction(tx: Transaction):
                 )
                 return
 
+            if withdrawal.status == VbtcV2WithdrawalRequest.Status.CANCELLED:
+                # The chain is authoritative: if a completion landed on-chain,
+                # the BTC moved — but a completion after a cancel means the
+                # CLI's state machine broke, so make noise about it.
+                logging.error(
+                    f"VBTCWithdrawalComplete for cancelled withdrawal {withdrawal.pk} "
+                    f"(request hash {withdrawal_request_hash}) — completing anyway."
+                )
+
             withdrawal.completion_transaction = tx
             withdrawal.btc_transaction_hash = parsed["BTCTransactionHash"]
             withdrawal.status = VbtcV2WithdrawalRequest.Status.COMPLETED
@@ -992,8 +1000,50 @@ def process_transaction(tx: Transaction):
 
             # Balance fields (global_balance, total_sent) are updated by the
             # periodic BTC chain sync (update_vbtc_balances), not here.
-            token.is_pending_withdrawal = False
-            token.save()
+            token.recompute_pending_withdrawal()
+
+    elif tx.type == Transaction.Type.VBTC_V2_WITHDRAWAL_CANCEL:
+        parsed = json.loads(tx.data)
+        if isinstance(parsed, str):
+            parsed = json.loads(parsed)
+        if isinstance(parsed, list):
+            parsed = parsed[0]
+
+        # The exact Function string for type 29 is not yet confirmed (no
+        # on-chain examples exist), so key off the payload instead.
+        withdrawal_request_hash = parsed.get("WithdrawalRequestHash")
+        if not withdrawal_request_hash:
+            logging.error(
+                f"VBTC_V2_WITHDRAWAL_CANCEL tx {tx.hash}: no WithdrawalRequestHash "
+                f"in payload (function={parsed.get('Function')})"
+            )
+            return
+
+        try:
+            withdrawal = VbtcV2WithdrawalRequest.objects.get(
+                request_transaction__hash=withdrawal_request_hash
+            )
+        except VbtcV2WithdrawalRequest.DoesNotExist:
+            logging.error(
+                f"Withdrawal request with hash {withdrawal_request_hash} not found "
+                f"for cancel tx {tx.hash}."
+            )
+            return
+
+        if withdrawal.status == VbtcV2WithdrawalRequest.Status.COMPLETED:
+            # Never un-complete: the BTC already moved.
+            logging.error(
+                f"VBTC_V2_WITHDRAWAL_CANCEL for completed withdrawal {withdrawal.pk} "
+                f"(request hash {withdrawal_request_hash}) — ignoring."
+            )
+            return
+
+        withdrawal.cancel_transaction = tx
+        withdrawal.status = VbtcV2WithdrawalRequest.Status.CANCELLED
+        withdrawal.cancelled_at = tx.date_crafted
+        withdrawal.save()
+
+        withdrawal.token.recompute_pending_withdrawal()
 
 
 # def handle_unavailable_nft(tx: Transaction, data: dict):
