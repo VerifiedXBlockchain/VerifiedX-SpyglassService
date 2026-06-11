@@ -20,11 +20,14 @@ class Command(BaseCommand):
             for token in tokens:
                 balance_info = client.get_balance(token.deposit_address)
                 if balance_info:
-                    token.global_balance = balance_info["balance"]
-                    token.total_received = balance_info["total_received"]
-                    token.total_sent = balance_info["total_sent"]
-                    token.tx_count = balance_info["tx_count"]
-                    token.save()
+                    # Targeted update — a full save() would clobber fields
+                    # written by the vbtc-worker between read and save.
+                    VbtcV2Token.objects.filter(pk=token.pk).update(
+                        global_balance=balance_info["balance"],
+                        total_received=balance_info["total_received"],
+                        total_sent=balance_info["total_sent"],
+                        tx_count=balance_info["tx_count"],
+                    )
 
                 sleep(0.5)
                 progress.update()

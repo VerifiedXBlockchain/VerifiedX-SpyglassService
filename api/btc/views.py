@@ -228,11 +228,16 @@ class VbtcV2DetailView(RetrieveAPIView):
         client = BtcClient()
         balance_info = client.get_balance(token.deposit_address)
         if balance_info:
-            token.global_balance = balance_info["balance"]
-            token.total_received = balance_info["total_received"]
-            token.total_sent = balance_info["total_sent"]
-            token.tx_count = balance_info["tx_count"]
-            token.save()
+            # Targeted update: a full token.save() here would write back every
+            # field from an instance read before the HTTP call, racing the
+            # vbtc-worker (could revert owner_address / is_pending_withdrawal).
+            VbtcV2Token.objects.filter(pk=token.pk).update(
+                global_balance=balance_info["balance"],
+                total_received=balance_info["total_received"],
+                total_sent=balance_info["total_sent"],
+                tx_count=balance_info["tx_count"],
+            )
+            token.refresh_from_db()
         return Response(self.get_serializer(token).data)
 
 
