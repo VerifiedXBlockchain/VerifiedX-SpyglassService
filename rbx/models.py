@@ -1,5 +1,6 @@
 import base64
 import gzip
+import logging
 from django.db import models
 from django.utils.translation import gettext_lazy as _
 from django.db.models import Count, Sum
@@ -1174,11 +1175,13 @@ class VbtcV2Token(models.Model):
             self.is_pending_withdrawal = pending
             self.save(update_fields=["is_pending_withdrawal"])
 
-    @property
-    def addresses(self):
-        owner_address = self.owner_address
+    def ledger_entries(self):
+        """Per-address ledger from transfers and completed withdrawals,
+        WITHOUT the owner anchor (global_balance + withdrawn add-back).
 
-        # Compute per-address ledger balance from transfers (received - sent)
+        Settlement rows created at ownership transfer are ordinary
+        VbtcV2TokenTransfer rows, so they flow through here unchanged.
+        """
         transfers = VbtcV2TokenTransfer.objects.filter(token=self).order_by(
             "created_at"
         )
@@ -1188,31 +1191,60 @@ class VbtcV2Token(models.Model):
             entries[t.from_address] = entries.get(t.from_address, Decimal(0)) - t.amount
 
         # Withdrawals reduce the withdrawer's balance (not the owner's).
-        # global_balance already reflects the BTC leaving the deposit address,
-        # so we add total_withdrawn back to the owner to compensate, then
-        # subtract each withdrawal from the requestor.
         completed_withdrawals = VbtcV2WithdrawalRequest.objects.filter(
             token=self, status=VbtcV2WithdrawalRequest.Status.COMPLETED
         )
-        total_withdrawn = sum(
-            (w.amount for w in completed_withdrawals), Decimal(0)
-        )
-
-        # Owner = global_balance (actual BTC on deposit) + total_withdrawn (to undo
-        # the global_balance reduction) + net transfers
-        entries[owner_address] = (
-            entries.get(owner_address, Decimal(0))
-            + self.global_balance
-            + total_withdrawn
-        )
-
-        # Subtract each withdrawal from the requestor's balance
         for w in completed_withdrawals:
             entries[w.requestor_address] = (
                 entries.get(w.requestor_address, Decimal(0)) - w.amount
             )
 
-        # Filter out zero/negative balances
+        return entries
+
+    def settlement_amount_for(self, address):
+        """Signed amount that must move from `address` to the incoming owner
+        at ownership transfer (negative = the incoming owner owes `address`).
+
+        Settling the outgoing owner's ledger entry to zero is what makes the
+        new owner inherit the un-transferred deposits minus the old owner's
+        withdrawals. The old owner keeps exactly enough to cover their
+        still-open withdrawal requests — those will debit them when they
+        complete, and the BTC pays out to their address, not the new owner's.
+        """
+        pending = self.withdrawal_requests.filter(
+            status=VbtcV2WithdrawalRequest.Status.REQUESTED,
+            requestor_address=address,
+        ).aggregate(total=Sum("amount"))["total"] or Decimal(0)
+        return self.ledger_entries().get(address, Decimal(0)) - pending
+
+    @property
+    def addresses(self):
+        entries = self.ledger_entries()
+
+        # global_balance already reflects BTC that left the deposit address,
+        # so add total_withdrawn back to the owner to compensate (the
+        # per-requestor debits live in ledger_entries).
+        total_withdrawn = VbtcV2WithdrawalRequest.objects.filter(
+            token=self, status=VbtcV2WithdrawalRequest.Status.COMPLETED
+        ).aggregate(total=Sum("amount"))["total"] or Decimal(0)
+
+        # Owner anchor = global_balance (actual BTC on deposit) + total_withdrawn
+        entries[self.owner_address] = (
+            entries.get(self.owner_address, Decimal(0))
+            + self.global_balance
+            + total_withdrawn
+        )
+
+        # Pre-filter, entries always sum to global_balance. A negative entry
+        # therefore means the displayed total exceeds the BTC backing —
+        # that's ledger corruption, not display noise. Alarm before hiding.
+        negatives = {a: str(b) for a, b in entries.items() if b < 0}
+        if negatives:
+            logging.warning(
+                f"VbtcV2Token {self.sc_identifier}: hiding negative ledger "
+                f"entries {negatives} — displayed claims exceed BTC backing."
+            )
+
         return {addr: bal for addr, bal in entries.items() if bal > 0}
 
 
@@ -1223,6 +1255,17 @@ class VbtcV2TokenTransfer(models.Model):
     to_address = models.CharField(max_length=64, db_index=True)
     amount = models.DecimalField(decimal_places=16, max_digits=32)
     created_at = models.DateTimeField()
+
+    class Meta:
+        constraints = [
+            # get_or_create in the tx handlers is race-prone under concurrent
+            # (re)processing; duplicate rows double-count balances. The DB is
+            # the real guard.
+            models.UniqueConstraint(
+                fields=["token", "transaction"],
+                name="uniq_vbtcv2transfer_token_tx",
+            )
+        ]
 
     def __str__(self):
         return f"{self.from_address} => {self.to_address} [{self.amount}]"

@@ -844,15 +844,49 @@ def process_transaction(tx: Transaction):
             # Try V2 token
             try:
                 v2_token = VbtcV2Token.objects.get(sc_identifier=sc_identifier)
-                v2_token.owner_address = tx.to_address
-                v2_token.save()
+                # tx.from_address is the chain-authoritative outgoing owner
+                # (the local owner_address could be stale on reprocess).
+                old_owner = tx.from_address
+                new_owner = tx.to_address
+
+                if old_owner and old_owner != new_owner:
+                    # Settle the outgoing owner's ledger so the new owner
+                    # inherits the un-transferred deposits minus the old
+                    # owner's withdrawals (less what the old owner must keep
+                    # for still-open withdrawal requests). Without this row,
+                    # the owner anchor in `addresses` re-attributes the whole
+                    # deposit history to the new owner and the old owner's
+                    # debits go negative — claims then exceed BTC backing.
+                    residual = v2_token.settlement_amount_for(old_owner)
+                    if residual:
+                        from_addr, to_addr = (
+                            (old_owner, new_owner)
+                            if residual > 0
+                            else (new_owner, old_owner)
+                        )
+                        VbtcV2TokenTransfer.objects.get_or_create(
+                            token=v2_token,
+                            transaction=tx,
+                            defaults={
+                                "from_address": from_addr,
+                                "to_address": to_addr,
+                                "amount": abs(residual),
+                                "created_at": tx.date_crafted,
+                            },
+                        )
+
+                v2_token.owner_address = new_owner
+                v2_token.save(update_fields=["owner_address"])
                 # Also update the NFT owner
                 try:
                     nft = v2_token.nft
                     nft.owner_address = tx.to_address
-                    nft.save()
+                    nft.save(update_fields=["owner_address"])
                 except Exception:
-                    pass
+                    logging.exception(
+                        f"Failed to update NFT owner for V2 ownership "
+                        f"transfer {tx.hash} ({sc_identifier})"
+                    )
                 return
             except VbtcV2Token.DoesNotExist:
                 print(f"No VbtcToken or VbtcV2Token with sc id of {sc_identifier} found.")
