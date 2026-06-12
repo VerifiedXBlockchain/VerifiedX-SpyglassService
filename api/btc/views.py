@@ -3,6 +3,7 @@ import requests
 from decimal import Decimal
 from datetime import datetime
 from django.utils import timezone
+from django.core.cache import cache
 from rest_framework.response import Response
 from rest_framework.generics import GenericAPIView, RetrieveAPIView
 from api.btc.constants import FALLBACK_VBTC_IMAGE_DATA
@@ -225,19 +226,31 @@ class VbtcV2DetailView(RetrieveAPIView):
 
     def get(self, request, *args, **kwargs):
         token = self.get_object()
-        client = BtcClient()
-        balance_info = client.get_balance(token.deposit_address)
-        if balance_info:
-            # Targeted update: a full token.save() here would write back every
-            # field from an instance read before the HTTP call, racing the
-            # vbtc-worker (could revert owner_address / is_pending_withdrawal).
-            VbtcV2Token.objects.filter(pk=token.pk).update(
-                global_balance=balance_info["balance"],
-                total_received=balance_info["total_received"],
-                total_sent=balance_info["total_sent"],
-                tx_count=balance_info["tx_count"],
-            )
-            token.refresh_from_db()
+        # Throttle the live refresh per token — this endpoint doubles as the
+        # on-demand balance refresh (it updates the row), and UI polling
+        # shouldn't translate into one upstream provider call per request.
+        # Within the window, serve the row as-is (still fresh from the last
+        # refresh or the 10-min sweep). cache.add is atomic — only one
+        # concurrent request wins the refresh slot.
+        throttle_key = f"vbtcv2:balance_refresh:{token.sc_identifier}"
+        if cache.add(throttle_key, 1, timeout=15):
+            client = BtcClient()
+            balance_info = client.get_balance(token.deposit_address)
+            if balance_info:
+                # Targeted update: a full token.save() here would write back every
+                # field from an instance read before the HTTP call, racing the
+                # vbtc-worker (could revert owner_address / is_pending_withdrawal).
+                update_fields = {"global_balance": balance_info["balance"]}
+                if not balance_info.get("partial"):
+                    # The Blockdaemon rung only knows the current balance —
+                    # never zero the historical fields from a partial result.
+                    update_fields.update(
+                        total_received=balance_info["total_received"],
+                        total_sent=balance_info["total_sent"],
+                        tx_count=balance_info["tx_count"],
+                    )
+                VbtcV2Token.objects.filter(pk=token.pk).update(**update_fields)
+                token.refresh_from_db()
         return Response(self.get_serializer(token).data)
 
 
