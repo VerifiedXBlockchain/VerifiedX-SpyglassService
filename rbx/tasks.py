@@ -12,6 +12,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Optional
 import pytz
+from django.db import InterfaceError, InternalError, OperationalError
 from django.db.models import Q, Sum, F
 from django.db.transaction import atomic as atomic_transaction, on_commit
 from django.utils import timezone
@@ -260,6 +261,11 @@ def sync_block(height: int, data: Optional[dict] = None, notify: bool = True) ->
                             tx.total_amount + tx.total_fee
                         )
                         from_address.save()
+            except (OperationalError, InterfaceError, InternalError):
+                # Transient DB failures (deadlock, lost connection, failover)
+                # must fail the run so it retries — skipping would silently
+                # drop the tx from a block that then commits without it.
+                raise
             except Exception:
                 logging.exception(
                     f"Failed to process tx {transaction.get('Hash')} in block "
@@ -289,7 +295,12 @@ def sync_block(height: int, data: Optional[dict] = None, notify: bool = True) ->
                 cls=DecimalEncoder,
             )
 
-            notify_socket_service(socket_payload)
+            try:
+                notify_socket_service(socket_payload)
+            except Exception:
+                # Best effort: a socket-service hiccup must not fail (or
+                # celery-retry) a block that already committed.
+                logging.exception(f"Failed to send new_block event for {height}")
 
     end = time.time()
     logging.info(f"Synchronized Block {height} [elapsed: {end - start}]")
@@ -1142,7 +1153,10 @@ def process_shop(tx):
         dec_shop = parsed["DecShop"]
         url = dec_shop["DecShopURL"]
 
-        import_shop(url, shop_only=func == "DecShopCreate()", data=dec_shop)
+        # Post-commit and off this worker: the shop import crawls the shop
+        # over the network with retries/sleeps, which must not run inside
+        # the block's DB transaction holding row locks for the duration.
+        _enqueue_on_commit(import_shop, url, func == "DecShopCreate()", dec_shop)
 
     elif func == "DecShopDelete()":
         unique_id = parsed["UniqueId"]
@@ -1464,4 +1478,5 @@ def notify_socket_service(payload: dict):
             headers={
                 "Content-Type": "application/json",
             },
+            timeout=10,
         )

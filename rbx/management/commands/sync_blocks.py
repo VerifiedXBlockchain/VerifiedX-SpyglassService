@@ -64,7 +64,8 @@ class Command(BaseCommand):
         heights = iter(range(start_height, end_height + 1))
         pending = deque()
 
-        with ThreadPoolExecutor(max_workers=PREFETCH_WORKERS) as executor:
+        executor = ThreadPoolExecutor(max_workers=PREFETCH_WORKERS)
+        try:
             for height in itertools.islice(heights, PREFETCH_WINDOW):
                 pending.append((height, executor.submit(get_block, height)))
 
@@ -81,3 +82,8 @@ class Command(BaseCommand):
                     pending.append(
                         (next_height, executor.submit(get_block, next_height))
                     )
+        finally:
+            # On failure, drop the queued prefetches instead of letting them
+            # run out (and burn timeouts) against a CLI that is already
+            # erroring; the next beat tick resumes from local max height.
+            executor.shutdown(wait=True, cancel_futures=True)
