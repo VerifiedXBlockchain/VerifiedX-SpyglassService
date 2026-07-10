@@ -19,7 +19,9 @@ app.conf.task_default_queue = "default"
 @app.on_after_configure.connect
 def setup_periodic_tasks(sender, **kwargs):
 
-    sender.add_periodic_task(10, sync_the_blocks.s(), name="Sync Blocks")
+    # expires: a catch-up run can hold the blocks worker for hours; drop the
+    # ticks that pile up behind it instead of replaying them all afterward.
+    sender.add_periodic_task(10, sync_the_blocks.s(), name="Sync Blocks", expires=30)
 
     if settings.IS_DEVNET:
         return

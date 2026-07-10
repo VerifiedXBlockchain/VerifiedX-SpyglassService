@@ -1,8 +1,21 @@
+import itertools
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
+
 from django.core.management.base import BaseCommand
 
-from rbx.tasks import sync_block, sync_master_nodes
+from rbx.client import get_block
+from rbx.tasks import sync_block
 from rbx.utils import get_local_max_height, get_remote_max_height
-from rbx.models import Block, Nft, Callback, Recovery
+from rbx.models import Block, Callback, Recovery
+
+# Modest concurrency so a bulk catch-up doesn't hammer the CLI.
+PREFETCH_WORKERS = 8
+PREFETCH_WINDOW = 16
+
+# Only emit socket notifications this close to the chain tip — during a bulk
+# catch-up nobody is listening for per-block events.
+NOTIFY_WINDOW = 50
 
 
 class Command(BaseCommand):
@@ -19,8 +32,6 @@ class Command(BaseCommand):
         if apply_wipe:
             print("Wiping blocks...")
             Block.objects.all().delete()
-            # print("Wiping nfts...")
-            # Nft.objects.all().delete()
             print("Wiping callbacks...")
             Callback.objects.all().delete()
             print("Wiping recoveries...")
@@ -32,8 +43,29 @@ class Command(BaseCommand):
         start_height = 0 if sync_all or not local_max_height else local_max_height + 1
         end_height = remote_max_height
 
-        for height in range(start_height, end_height + 1):
-            if apply_async:
+        if apply_async:
+            for height in range(start_height, end_height + 1):
                 sync_block.apply_async(args=[height])
-            else:
-                sync_block(height)
+            return
+
+        # Fetch block data from the CLI ahead of processing; blocks are still
+        # processed strictly in height order.
+        heights = iter(range(start_height, end_height + 1))
+        pending = deque()
+
+        with ThreadPoolExecutor(max_workers=PREFETCH_WORKERS) as executor:
+            for height in itertools.islice(heights, PREFETCH_WINDOW):
+                pending.append((height, executor.submit(get_block, height)))
+
+            while pending:
+                height, future = pending.popleft()
+                sync_block(
+                    height,
+                    data=future.result(),
+                    notify=height > end_height - NOTIFY_WINDOW,
+                )
+
+                for next_height in itertools.islice(heights, 1):
+                    pending.append(
+                        (next_height, executor.submit(get_block, next_height))
+                    )
