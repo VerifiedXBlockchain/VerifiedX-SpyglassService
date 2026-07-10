@@ -8,9 +8,10 @@ import base64
 import gzip
 from datetime import datetime
 from decimal import Decimal
+from typing import Optional
 import pytz
 from django.db.models import Q, Sum, F
-from django.db.transaction import atomic as atomic_transaction
+from django.db.transaction import atomic as atomic_transaction, on_commit
 from django.utils import timezone
 from api.block.serializers import BlockSerializer
 from project.celery import app
@@ -144,103 +145,111 @@ def sync_master_nodes(update_blocks: bool = False) -> None:
 
 
 @app.task(autoretry_for=[RBXException])
-def sync_block(height: int) -> None:
+def sync_block(height: int, data: Optional[dict] = None, notify: bool = True) -> None:
     start = time.time()
 
-    data = get_block(height)
+    if data is None:
+        data = get_block(height)
     if not data:
         return
 
-    if height == 0:
-        Address.objects.all().delete()
+    # One transaction per block: a crash mid-block rolls the whole block back
+    # so the next run re-syncs it instead of silently skipping its remaining
+    # transactions, and the block's writes commit in a single round trip.
+    with atomic_transaction():
+        if height == 0:
+            Address.objects.all().delete()
 
-    validator_address = data["Validator"]
-    try:
-        master_node = MasterNode.objects.get(address=validator_address)
-        master_node.block_count = master_node.block_count + 1
-        master_node.save()
-    except MasterNode.DoesNotExist:
-        master_node = None
+        validator_address = data["Validator"]
+        try:
+            master_node = MasterNode.objects.get(address=validator_address)
+        except MasterNode.DoesNotExist:
+            master_node = None
 
-    block, block_created = Block.objects.get_or_create(
-        height=height,
-        defaults={
-            "master_node": master_node,
-            "hash": data["Hash"],
-            "previous_hash": data["PrevHash"],
-            "validator_address": validator_address,
-            "validator_signature": data["ValidatorSignature"],
-            "validator_answer": data["ValidatorAnswer"],
-            "chain_ref_id": data["ChainRefId"],
-            "merkle_root": data["MerkleRoot"],
-            "state_root": data["StateRoot"],
-            "total_reward": data["TotalReward"],
-            "total_amount": data["TotalAmount"],
-            "total_validators": data["TotalValidators"],
-            "version": data["Version"],
-            "size": data["Size"],
-            "craft_time": data["BCraftTime"],
-            "date_crafted": datetime.fromtimestamp(data["Timestamp"], pytz.UTC),
-        },
-    )
-
-    if block.master_node != master_node:
-        block.master_node = master_node
-        block.save()
-
-    for transaction in data["Transactions"]:
-        if transaction.get("TransactionStatus") == 999:
-            continue
-
-        unlock_time = None
-        if "UnlockTime" in transaction and transaction["UnlockTime"]:
-            unlock_time = timezone.make_aware(
-                datetime.fromtimestamp(transaction["UnlockTime"])
-            )
-
-        tx = Transaction.objects.create(
-            hash=transaction["Hash"],
-            block=block,
-            height=block.height,
-            type=transaction["TransactionType"],
-            to_address=transaction["ToAddress"],
-            from_address=transaction["FromAddress"],
-            total_amount=Decimal(transaction["Amount"]),
-            total_fee=Decimal(transaction["Fee"]),
-            data=transaction["Data"],
-            signature=transaction["Signature"],
-            date_crafted=datetime.fromtimestamp(data["Timestamp"], pytz.UTC),
-            unlock_time=unlock_time,
+        block, block_created = Block.objects.get_or_create(
+            height=height,
+            defaults={
+                "master_node": master_node,
+                "hash": data["Hash"],
+                "previous_hash": data["PrevHash"],
+                "validator_address": validator_address,
+                "validator_signature": data["ValidatorSignature"],
+                "validator_answer": data["ValidatorAnswer"],
+                "chain_ref_id": data["ChainRefId"],
+                "merkle_root": data["MerkleRoot"],
+                "state_root": data["StateRoot"],
+                "total_reward": data["TotalReward"],
+                "total_amount": data["TotalAmount"],
+                "total_validators": data["TotalValidators"],
+                "version": data["Version"],
+                "size": data["Size"],
+                "craft_time": data["BCraftTime"],
+                "date_crafted": datetime.fromtimestamp(data["Timestamp"], pytz.UTC),
+            },
         )
 
-        process_transaction(tx)
-
-        # Balances
-        to_address, _ = Address.objects.get_or_create(address=tx.to_address)
-        b = to_address.balance + tx.total_amount
-
-        # ADNR Transfer In
-        if tx.type == Transaction.Type.ADDRESS and to_address != "Adnr_Base":
-            if block.height > 832000 or settings.ENVIRONMENT == "testnet":
-                b -= Decimal(5.0)
-            else:
-                b -= Decimal(1.0)
-
-        to_address.balance = b
-
-        to_address.save()
-
-        if (
-            tx.from_address != "Coinbase_TrxFees"
-            and tx.from_address != "Coinbase_BlkRwd"
-        ):
-            from_address, _ = Address.objects.get_or_create(address=tx.from_address)
-            from_address.balance = from_address.balance - (
-                tx.total_amount + tx.total_fee
+        if block_created and master_node:
+            MasterNode.objects.filter(address=master_node.address).update(
+                block_count=F("block_count") + 1
             )
-            from_address.save()
 
-    if block_created:
+        if block.master_node != master_node:
+            block.master_node = master_node
+            block.save()
+
+        for transaction in data["Transactions"]:
+            if transaction.get("TransactionStatus") == 999:
+                continue
+
+            unlock_time = None
+            if "UnlockTime" in transaction and transaction["UnlockTime"]:
+                unlock_time = timezone.make_aware(
+                    datetime.fromtimestamp(transaction["UnlockTime"])
+                )
+
+            tx = Transaction.objects.create(
+                hash=transaction["Hash"],
+                block=block,
+                height=block.height,
+                type=transaction["TransactionType"],
+                to_address=transaction["ToAddress"],
+                from_address=transaction["FromAddress"],
+                total_amount=Decimal(transaction["Amount"]),
+                total_fee=Decimal(transaction["Fee"]),
+                data=transaction["Data"],
+                signature=transaction["Signature"],
+                date_crafted=datetime.fromtimestamp(data["Timestamp"], pytz.UTC),
+                unlock_time=unlock_time,
+            )
+
+            process_transaction(tx)
+
+            # Balances
+            to_address, _ = Address.objects.get_or_create(address=tx.to_address)
+            b = to_address.balance + tx.total_amount
+
+            # ADNR Transfer In
+            if tx.type == Transaction.Type.ADDRESS and to_address != "Adnr_Base":
+                if block.height > 832000 or settings.ENVIRONMENT == "testnet":
+                    b -= Decimal(5.0)
+                else:
+                    b -= Decimal(1.0)
+
+            to_address.balance = b
+
+            to_address.save()
+
+            if (
+                tx.from_address != "Coinbase_TrxFees"
+                and tx.from_address != "Coinbase_BlkRwd"
+            ):
+                from_address, _ = Address.objects.get_or_create(address=tx.from_address)
+                from_address.balance = from_address.balance - (
+                    tx.total_amount + tx.total_fee
+                )
+                from_address.save()
+
+    if block_created and notify:
         b = None
         try:
             b = Block.objects.get(height=block.height)
@@ -320,7 +329,6 @@ def resync_balances() -> None:
 
 
 def process_transaction(tx: Transaction):
-    print(f"Processing TX {tx.hash}")
     if tx.type in [Transaction.Type.NFT_MINT, Transaction.Type.TKNZ_MINT, Transaction.Type.VBTC_V2_MINT]:
         logging.info(f"NFT Mint: {tx.hash}")
 
@@ -416,7 +424,11 @@ def process_transaction(tx: Transaction):
                         nft.is_fungible_token = True
                         nft.save()
 
-                        handle_token_icon_upload.apply_async(args=[identifier])
+                        on_commit(
+                            lambda sc_id=identifier: handle_token_icon_upload.apply_async(
+                                args=[sc_id]
+                            )
+                        )
 
         if function == "Mint()":
 
@@ -446,7 +458,11 @@ def process_transaction(tx: Transaction):
                         nft.is_vbtc = True
                         nft.save()
 
-                        handle_vbtc_icon_upload.apply_async(args=[identifier])
+                        on_commit(
+                            lambda sc_id=identifier: handle_vbtc_icon_upload.apply_async(
+                                args=[sc_id]
+                            )
+                        )
 
                     if feature["FeatureName"] == 14:
                         v2_info = feature["FeatureFeatures"]
@@ -474,7 +490,11 @@ def process_transaction(tx: Transaction):
                         nft.is_vbtc = True
                         nft.save()
 
-                        handle_vbtc_v2_icon_upload.apply_async(args=[identifier])
+                        on_commit(
+                            lambda sc_id=identifier: handle_vbtc_v2_icon_upload.apply_async(
+                                args=[sc_id]
+                            )
+                        )
 
         return
 
@@ -515,11 +535,17 @@ def process_transaction(tx: Transaction):
         if func == "Sale_Start()":
             can_complete = handle_auction_sale_complete_tx(tx.hash, True)
             if can_complete:
-                handle_auction_sale_complete_tx.apply_async(
-                    args=[tx.hash, False], countdown=60
+                on_commit(
+                    lambda tx_hash=tx.hash: handle_auction_sale_complete_tx.apply_async(
+                        args=[tx_hash, False], countdown=60
+                    )
                 )
             else:
-                send_sale_started_email.apply_async(args=[tx.hash])
+                on_commit(
+                    lambda tx_hash=tx.hash: send_sale_started_email.apply_async(
+                        args=[tx_hash]
+                    )
+                )
 
         if func == "Sale_Complete()":
             sub_transactions = parsed["Transactions"]
