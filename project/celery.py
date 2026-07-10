@@ -21,7 +21,8 @@ def setup_periodic_tasks(sender, **kwargs):
 
     # expires: a catch-up run can hold the blocks worker for hours; drop the
     # ticks that pile up behind it instead of replaying them all afterward.
-    sender.add_periodic_task(10, sync_the_blocks.s(), name="Sync Blocks", expires=30)
+    # Generous enough that runner/worker clock skew can't expire live ticks.
+    sender.add_periodic_task(10, sync_the_blocks.s(), name="Sync Blocks", expires=120)
 
     if settings.IS_DEVNET:
         return

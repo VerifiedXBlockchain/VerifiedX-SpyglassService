@@ -2,6 +2,8 @@ import os
 import logging
 import time
 import json
+from functools import partial
+
 import requests
 from tqdm import tqdm
 import base64
@@ -144,7 +146,7 @@ def sync_master_nodes(update_blocks: bool = False) -> None:
     logging.info(f"Synchronized Master Nodes [elapsed: {end - start}]")
 
 
-@app.task(autoretry_for=[RBXException])
+@app.task(autoretry_for=[RBXException, requests.RequestException])
 def sync_block(height: int, data: Optional[dict] = None, notify: bool = True) -> None:
     start = time.time()
 
@@ -188,11 +190,6 @@ def sync_block(height: int, data: Optional[dict] = None, notify: bool = True) ->
             },
         )
 
-        if block_created and master_node:
-            MasterNode.objects.filter(address=master_node.address).update(
-                block_count=F("block_count") + 1
-            )
-
         if block.master_node != master_node:
             block.master_node = master_node
             block.save()
@@ -201,53 +198,78 @@ def sync_block(height: int, data: Optional[dict] = None, notify: bool = True) ->
             if transaction.get("TransactionStatus") == 999:
                 continue
 
-            unlock_time = None
-            if "UnlockTime" in transaction and transaction["UnlockTime"]:
-                unlock_time = timezone.make_aware(
-                    datetime.fromtimestamp(transaction["UnlockTime"])
+            try:
+                # Savepoint per tx: one bad transaction rolls back alone and
+                # gets logged instead of wedging the sync in a rollback/retry
+                # loop on this block (or, pre-atomic, silently losing every
+                # tx after it).
+                with atomic_transaction():
+                    unlock_time = None
+                    if "UnlockTime" in transaction and transaction["UnlockTime"]:
+                        unlock_time = timezone.make_aware(
+                            datetime.fromtimestamp(transaction["UnlockTime"])
+                        )
+
+                    tx = Transaction.objects.create(
+                        hash=transaction["Hash"],
+                        block=block,
+                        height=block.height,
+                        type=transaction["TransactionType"],
+                        to_address=transaction["ToAddress"],
+                        from_address=transaction["FromAddress"],
+                        total_amount=Decimal(transaction["Amount"]),
+                        total_fee=Decimal(transaction["Fee"]),
+                        data=transaction["Data"],
+                        signature=transaction["Signature"],
+                        date_crafted=datetime.fromtimestamp(
+                            data["Timestamp"], pytz.UTC
+                        ),
+                        unlock_time=unlock_time,
+                    )
+
+                    process_transaction(tx)
+
+                    # Balances
+                    to_address, _ = Address.objects.get_or_create(
+                        address=tx.to_address
+                    )
+                    b = to_address.balance + tx.total_amount
+
+                    # ADNR Transfer In
+                    if (
+                        tx.type == Transaction.Type.ADDRESS
+                        and tx.to_address != "Adnr_Base"
+                    ):
+                        if block.height > 832000 or settings.ENVIRONMENT == "testnet":
+                            b -= Decimal(5.0)
+                        else:
+                            b -= Decimal(1.0)
+
+                    to_address.balance = b
+
+                    to_address.save()
+
+                    if (
+                        tx.from_address != "Coinbase_TrxFees"
+                        and tx.from_address != "Coinbase_BlkRwd"
+                    ):
+                        from_address, _ = Address.objects.get_or_create(
+                            address=tx.from_address
+                        )
+                        from_address.balance = from_address.balance - (
+                            tx.total_amount + tx.total_fee
+                        )
+                        from_address.save()
+            except Exception:
+                logging.exception(
+                    f"Failed to process tx {transaction.get('Hash')} in block "
+                    f"{height}; skipping it"
                 )
 
-            tx = Transaction.objects.create(
-                hash=transaction["Hash"],
-                block=block,
-                height=block.height,
-                type=transaction["TransactionType"],
-                to_address=transaction["ToAddress"],
-                from_address=transaction["FromAddress"],
-                total_amount=Decimal(transaction["Amount"]),
-                total_fee=Decimal(transaction["Fee"]),
-                data=transaction["Data"],
-                signature=transaction["Signature"],
-                date_crafted=datetime.fromtimestamp(data["Timestamp"], pytz.UTC),
-                unlock_time=unlock_time,
+        if block_created and master_node:
+            MasterNode.objects.filter(address=master_node.address).update(
+                block_count=F("block_count") + 1
             )
-
-            process_transaction(tx)
-
-            # Balances
-            to_address, _ = Address.objects.get_or_create(address=tx.to_address)
-            b = to_address.balance + tx.total_amount
-
-            # ADNR Transfer In
-            if tx.type == Transaction.Type.ADDRESS and to_address != "Adnr_Base":
-                if block.height > 832000 or settings.ENVIRONMENT == "testnet":
-                    b -= Decimal(5.0)
-                else:
-                    b -= Decimal(1.0)
-
-            to_address.balance = b
-
-            to_address.save()
-
-            if (
-                tx.from_address != "Coinbase_TrxFees"
-                and tx.from_address != "Coinbase_BlkRwd"
-            ):
-                from_address, _ = Address.objects.get_or_create(address=tx.from_address)
-                from_address.balance = from_address.balance - (
-                    tx.total_amount + tx.total_fee
-                )
-                from_address.save()
 
     if block_created and notify:
         b = None
@@ -326,6 +348,13 @@ def resync_balances() -> None:
 #     end = time.time()
 
 #     logging.info(f"Synchronized NFTs [elapsed: {end - start}]")
+
+
+def _enqueue_on_commit(task, *task_args, **options):
+    # Dispatch after the enclosing DB transaction commits so a worker can't
+    # pick the task up before the rows it needs exist. Outside a transaction
+    # this fires immediately, so non-atomic callers behave as before.
+    on_commit(partial(task.apply_async, args=list(task_args), **options))
 
 
 def process_transaction(tx: Transaction):
@@ -424,11 +453,7 @@ def process_transaction(tx: Transaction):
                         nft.is_fungible_token = True
                         nft.save()
 
-                        on_commit(
-                            lambda sc_id=identifier: handle_token_icon_upload.apply_async(
-                                args=[sc_id]
-                            )
-                        )
+                        _enqueue_on_commit(handle_token_icon_upload, identifier)
 
         if function == "Mint()":
 
@@ -458,11 +483,7 @@ def process_transaction(tx: Transaction):
                         nft.is_vbtc = True
                         nft.save()
 
-                        on_commit(
-                            lambda sc_id=identifier: handle_vbtc_icon_upload.apply_async(
-                                args=[sc_id]
-                            )
-                        )
+                        _enqueue_on_commit(handle_vbtc_icon_upload, identifier)
 
                     if feature["FeatureName"] == 14:
                         v2_info = feature["FeatureFeatures"]
@@ -490,11 +511,7 @@ def process_transaction(tx: Transaction):
                         nft.is_vbtc = True
                         nft.save()
 
-                        on_commit(
-                            lambda sc_id=identifier: handle_vbtc_v2_icon_upload.apply_async(
-                                args=[sc_id]
-                            )
-                        )
+                        _enqueue_on_commit(handle_vbtc_v2_icon_upload, identifier)
 
         return
 
@@ -535,17 +552,11 @@ def process_transaction(tx: Transaction):
         if func == "Sale_Start()":
             can_complete = handle_auction_sale_complete_tx(tx.hash, True)
             if can_complete:
-                on_commit(
-                    lambda tx_hash=tx.hash: handle_auction_sale_complete_tx.apply_async(
-                        args=[tx_hash, False], countdown=60
-                    )
+                _enqueue_on_commit(
+                    handle_auction_sale_complete_tx, tx.hash, False, countdown=60
                 )
             else:
-                on_commit(
-                    lambda tx_hash=tx.hash: send_sale_started_email.apply_async(
-                        args=[tx_hash]
-                    )
-                )
+                _enqueue_on_commit(send_sale_started_email, tx.hash)
 
         if func == "Sale_Complete()":
             sub_transactions = parsed["Transactions"]

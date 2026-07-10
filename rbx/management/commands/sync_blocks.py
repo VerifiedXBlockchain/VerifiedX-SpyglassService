@@ -40,16 +40,27 @@ class Command(BaseCommand):
         local_max_height = get_local_max_height()
         remote_max_height = get_remote_max_height()
 
-        start_height = 0 if sync_all or not local_max_height else local_max_height + 1
+        start_height = (
+            0 if sync_all or local_max_height is None else local_max_height + 1
+        )
         end_height = remote_max_height
+        notify_floor = end_height - NOTIFY_WINDOW
 
         if apply_async:
             for height in range(start_height, end_height + 1):
                 sync_block.apply_async(args=[height])
             return
 
-        # Fetch block data from the CLI ahead of processing; blocks are still
-        # processed strictly in height order.
+        if end_height - start_height < PREFETCH_WINDOW:
+            # Steady state: a handful of new blocks per run. Fetch inline on
+            # this long-lived thread so its HTTP session persists across
+            # runs, instead of spinning up an executor for 1-2 blocks.
+            for height in range(start_height, end_height + 1):
+                sync_block(height, notify=height > notify_floor)
+            return
+
+        # Catch-up: fetch block data from the CLI ahead of processing;
+        # blocks are still processed strictly in height order.
         heights = iter(range(start_height, end_height + 1))
         pending = deque()
 
@@ -62,10 +73,11 @@ class Command(BaseCommand):
                 sync_block(
                     height,
                     data=future.result(),
-                    notify=height > end_height - NOTIFY_WINDOW,
+                    notify=height > notify_floor,
                 )
 
-                for next_height in itertools.islice(heights, 1):
+                next_height = next(heights, None)
+                if next_height is not None:
                     pending.append(
                         (next_height, executor.submit(get_block, next_height))
                     )
