@@ -1047,8 +1047,10 @@ def get_default_vbtc_base64_image_data():
 def send_testnet_funds(from_address: str, to_address: str, amount: Decimal):
 
     if settings.FAUCET_ENABLED:
-        # Strip trailing zeros from amount (e.g., 1.0 -> "1", 1.10000 -> "1.1")
-        amount_str = str(amount.normalize())
+        # Strip trailing zeros (1.0 -> "1", 1.10000 -> "1.1") without the
+        # scientific notation str(normalize()) produces for round numbers
+        # (10 -> "1E+1"), which the CLI can't parse.
+        amount_str = format(amount.normalize(), "f")
         url = join_url(
             BASE_URL, f"api/V1/SendTransaction/{from_address}/{to_address}/{amount_str}"
         )
