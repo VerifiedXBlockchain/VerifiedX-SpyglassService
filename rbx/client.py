@@ -1,5 +1,6 @@
 import json
 import string
+import threading
 import time
 from decimal import Decimal
 from typing import List, Optional, Tuple
@@ -22,6 +23,18 @@ BASE_URL = settings.RBX_WALLET_ADDRESS
 SHOP_BASE_URL = settings.RBX_SHOP_WALLET_ADDRESS
 SHOP_CRAWLER_BASE_URL = settings.RBX_SHOP_CRAWLER_ADDRESS
 
+_thread_local = threading.local()
+
+
+def _get_session() -> requests.Session:
+    # One Session per thread: connections get reused across requests without
+    # sharing a Session between the block-prefetch threads.
+    session = getattr(_thread_local, "session", None)
+    if session is None:
+        session = requests.Session()
+        _thread_local.session = session
+    return session
+
 
 def _fix_amount(amount):
     if amount == 0:
@@ -42,7 +55,7 @@ def get_status() -> str:
 
 def get_info() -> Optional[dict]:
     url = join_url(BASE_URL, "api/V1/GetWalletInfo")
-    response = requests.get(url)
+    response = _get_session().get(url, timeout=15)
 
     if response.status_code != 200:
         raise RBXException
@@ -68,7 +81,7 @@ def get_master_nodes() -> List[dict]:
 
 def get_block(height: int) -> Optional[dict]:
     url = join_url(BASE_URL, f"api/V1/SendBlock/{height}")
-    response = requests.get(url)
+    response = _get_session().get(url, timeout=15)
 
     if response.status_code != 200:
         raise RBXException
