@@ -39,6 +39,7 @@ from rbx.models import (
     VbtcV2Token,
     VbtcV2TokenTransfer,
     VbtcV2WithdrawalRequest,
+    UnindexedMint,
 )
 from rbx.utils import get_ip_location, network_metrics
 from dateutil import parser
@@ -319,6 +320,58 @@ def resync_balances() -> None:
 #     logging.info(f"Synchronized NFTs [elapsed: {end - start}]")
 
 
+def record_unindexed_mint(tx: Transaction, sc_identifier: str, reason: str) -> None:
+    """Remember a mint we could not index so the recovery job can retry it."""
+
+    marker, _ = UnindexedMint.objects.get_or_create(
+        sc_identifier=sc_identifier,
+        transaction=tx,
+        defaults={"transaction_type": tx.type},
+    )
+
+    if marker.status == UnindexedMint.Status.RESOLVED:
+        return
+
+    marker.attempts = F("attempts") + 1
+    marker.last_error = reason
+    marker.last_attempted_at = timezone.now()
+    marker.save(update_fields=["attempts", "last_error", "last_attempted_at"])
+
+
+def resolve_unindexed_mint(sc_identifier: str) -> None:
+    """Close out any marker for a mint that has now indexed successfully."""
+
+    UnindexedMint.objects.filter(
+        sc_identifier=sc_identifier, status=UnindexedMint.Status.PENDING
+    ).update(status=UnindexedMint.Status.RESOLVED, resolved_at=timezone.now())
+
+
+def retry_unindexed_mints():
+    """Re-run the mints the CLI could not serve when their block was indexed.
+
+    The smart contract usually shows up once the CLI has caught up, so this
+    keeps trying rather than leaving the token invisible to the wallet.
+    """
+
+    pending = UnindexedMint.objects.filter(
+        status=UnindexedMint.Status.PENDING
+    ).select_related("transaction")
+
+    for marker in pending:
+        try:
+            process_transaction(marker.transaction)
+        except Exception as e:
+            logging.error(
+                f"Mint recovery failed for {marker.sc_identifier}: {e}"
+            )
+            marker.attempts = F("attempts") + 1
+            marker.last_error = str(e)
+            marker.last_attempted_at = timezone.now()
+            marker.save(
+                update_fields=["attempts", "last_error", "last_attempted_at"]
+            )
+
+
 def process_transaction(tx: Transaction):
     print(f"Processing TX {tx.hash}")
     if tx.type in [Transaction.Type.NFT_MINT, Transaction.Type.TKNZ_MINT, Transaction.Type.VBTC_V2_MINT]:
@@ -334,8 +387,8 @@ def process_transaction(tx: Transaction):
         data = get_nft(identifier)
 
         if not data:
-            # handle_unavailable_nft(tx, parsed)
-            logging.error("No SC data found.")
+            logging.error(f"No SC data found for {identifier} (tx {tx.hash}).")
+            record_unindexed_mint(tx, identifier, "CLI returned no smart contract data")
             return
 
         smart_contract_data = data
@@ -475,6 +528,8 @@ def process_transaction(tx: Transaction):
                         nft.save()
 
                         handle_vbtc_v2_icon_upload.apply_async(args=[identifier])
+
+        resolve_unindexed_mint(identifier)
 
         return
 

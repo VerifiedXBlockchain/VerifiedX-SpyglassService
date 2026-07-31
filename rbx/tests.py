@@ -4,15 +4,18 @@ from decimal import Decimal
 from django.test import TestCase
 from django.utils import timezone
 
+from unittest.mock import patch
+
 from rbx.models import (
     Block,
     Nft,
     Transaction,
+    UnindexedMint,
     VbtcV2Token,
     VbtcV2TokenTransfer,
     VbtcV2WithdrawalRequest,
 )
-from rbx.tasks import process_transaction
+from rbx.tasks import process_transaction, retry_unindexed_mints
 
 
 def make_block(height=1):
@@ -322,3 +325,94 @@ class WithdrawalStateMachineTests(TestCase):
 
         withdrawal = self.token.withdrawal_requests.get()
         self.assertEqual(withdrawal.status, VbtcV2WithdrawalRequest.Status.COMPLETED)
+
+
+MINT_DATA = {
+    "Function": "Mint()",
+    "ContractUID": "dropped-sc:1",
+}
+
+CLI_PAYLOAD = {
+    "SmartContractMain": {
+        "Name": "Recovered vBTC",
+        "Description": "showed up once the CLI caught up",
+        "MinterName": "MINTER",
+        "IsPublished": True,
+        "SmartContractAsset": {"Name": "vbtc_v2_token", "FileSize": 0},
+        "Features": [
+            {
+                "FeatureName": 14,
+                "FeatureFeatures": {
+                    "DepositAddress": "bc1p-recovered",
+                    "FrostGroupPublicKey": "03ab",
+                    "RequiredThreshold": 51,
+                    "ProofBlockHeight": 42,
+                },
+            }
+        ],
+    }
+}
+
+
+class UnindexedMintTests(TestCase):
+    """A mint the CLI will not serve must leave a trace. Before markers
+    existed process_transaction returned silently and the token stayed
+    invisible to the wallet forever."""
+
+    def setUp(self):
+        self.block = make_block(height=10)
+        self.tx = make_tx(
+            self.block,
+            "mint-tx",
+            Transaction.Type.VBTC_V2_MINT,
+            from_address="MINTER",
+            data=[MINT_DATA],
+        )
+
+    @patch("rbx.tasks.get_nft", return_value=None)
+    def test_unavailable_contract_records_a_marker(self, _):
+        with self.assertLogs(level="ERROR"):
+            process_transaction(self.tx)
+
+        marker = UnindexedMint.objects.get()
+        self.assertEqual(marker.sc_identifier, "dropped-sc:1")
+        self.assertEqual(marker.status, UnindexedMint.Status.PENDING)
+        self.assertEqual(marker.attempts, 1)
+        self.assertFalse(VbtcV2Token.objects.exists())
+
+    @patch("rbx.tasks.get_nft", return_value=None)
+    def test_reprocessing_the_same_mint_does_not_duplicate_markers(self, _):
+        with self.assertLogs(level="ERROR"):
+            process_transaction(self.tx)
+            process_transaction(self.tx)
+
+        self.assertEqual(UnindexedMint.objects.count(), 1)
+        self.assertEqual(UnindexedMint.objects.get().attempts, 2)
+
+    def test_recovery_indexes_the_token_and_resolves_the_marker(self):
+        with patch("rbx.tasks.get_nft", return_value=None):
+            with self.assertLogs(level="ERROR"):
+                process_transaction(self.tx)
+
+        with patch("rbx.tasks.get_nft", return_value=CLI_PAYLOAD):
+            with patch("rbx.tasks.handle_vbtc_v2_icon_upload"):
+                retry_unindexed_mints()
+
+        token = VbtcV2Token.objects.get(sc_identifier="dropped-sc:1")
+        self.assertEqual(token.deposit_address, "bc1p-recovered")
+        self.assertEqual(token.required_threshold, 51)
+
+        marker = UnindexedMint.objects.get()
+        self.assertEqual(marker.status, UnindexedMint.Status.RESOLVED)
+        self.assertIsNotNone(marker.resolved_at)
+
+    def test_recovery_leaves_the_marker_pending_while_the_cli_still_refuses(self):
+        with patch("rbx.tasks.get_nft", return_value=None):
+            with self.assertLogs(level="ERROR"):
+                process_transaction(self.tx)
+                retry_unindexed_mints()
+
+        marker = UnindexedMint.objects.get()
+        self.assertEqual(marker.status, UnindexedMint.Status.PENDING)
+        self.assertEqual(marker.attempts, 2)
+        self.assertFalse(VbtcV2Token.objects.exists())
