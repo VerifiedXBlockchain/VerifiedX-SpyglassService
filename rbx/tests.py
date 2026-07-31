@@ -1,3 +1,5 @@
+import base64
+import gzip
 import json
 from decimal import Decimal
 
@@ -15,6 +17,7 @@ from rbx.models import (
     VbtcV2TokenTransfer,
     VbtcV2WithdrawalRequest,
 )
+from rbx.chain_contract import smart_contract_from_chain
 from rbx.tasks import process_transaction, retry_unindexed_mints
 
 
@@ -416,3 +419,194 @@ class UnindexedMintTests(TestCase):
         self.assertEqual(marker.status, UnindexedMint.Status.PENDING)
         self.assertEqual(marker.attempts, 2)
         self.assertFalse(VbtcV2Token.objects.exists())
+
+
+class ChainContractTests(TestCase):
+    """A V2 mint carries its whole contract on chain, so the explorer can
+    index it even when the CLI refuses to serve the contract."""
+
+    def setUp(self):
+        self.block = make_block(height=20)
+
+    def source(self, features="14", deposit="bc1p-from-chain", validators=None):
+        validators = "VAL1,VAL2,VAL3" if validators is None else validators
+        return "\n".join([
+            'let AssetName = "Bfly vBTC @sam"',
+            'let AssetTicker = "vBTC"',
+            f'let DepositAddress = "{deposit}"',
+            "let TokenizationVersion = 2",
+            "let RequiredThreshold = 51",
+            "let ProofBlockHeight = 6991101",
+            'let Name = "Bfly vBTC @sam"',
+            "let Description = \"@sam's vBTC Token\"",
+            'let MinterAddress = "MINTER"',
+            'let MinterName = "MINTER"',
+            'let SmartContractUID = "chain-sc:1"',
+            f'let Features = "{features}"',
+            "let SCVersion = 1",
+            'let FileSize = "0"',
+            'let FileName = "vbtc_v2_token"',
+            'let AssetAuthorName = "MINTER"',
+            "function GetFrostGroupPublicKey() : string",
+            "{",
+            '   var frostGroupKey = "0339cf9e"',
+            "   return (frostGroupKey)",
+            "}",
+            "function GetValidatorSnapshot() : string",
+            "{",
+            f'   var validators = "{validators}"',
+            "   return (validators)",
+            "}",
+            "function GetCeremonyId() : string",
+            "{",
+            '   var ceremonyId = "50f64306-e3c7"',
+            "   return (ceremonyId)",
+            "}",
+            "function GetDKGProof() : string",
+            "{",
+            '   var proof = "eyJTZXNzaW9uSWQ"',
+            '   var blockHeight = "6991101"',
+            '   return (proof + "|->" + blockHeight)',
+            "}",
+            "function GetImageBase() : string",
+            "{",
+            '   var imageBase = ""',
+            "   return (imageBase)",
+            "}",
+        ])
+
+    def mint_tx(self, tx_hash="chain-mint", compress=True, **kwargs):
+        source = self.source(**kwargs)
+        if compress:
+            source = base64.b64encode(
+                gzip.compress(source.encode("utf-16-le"))
+            ).decode()
+        return make_tx(
+            self.block,
+            tx_hash,
+            Transaction.Type.VBTC_V2_MINT,
+            from_address="MINTER",
+            data=[{
+                "Function": "Mint()",
+                "ContractUID": "chain-sc:1",
+                "Data": source,
+            }],
+        )
+
+    def test_rebuilds_the_cli_payload_shape(self):
+        data = smart_contract_from_chain(self.mint_tx())
+
+        main = data["SmartContractMain"]
+        self.assertEqual(main["Name"], "Bfly vBTC @sam")
+        self.assertEqual(main["SmartContractAsset"]["Name"], "vbtc_v2_token")
+
+        feature = main["Features"][0]
+        self.assertEqual(feature["FeatureName"], 14)
+
+        ff = feature["FeatureFeatures"]
+        self.assertEqual(ff["DepositAddress"], "bc1p-from-chain")
+        self.assertEqual(ff["FrostGroupPublicKey"], "0339cf9e")
+        self.assertEqual(ff["RequiredThreshold"], 51)
+        self.assertEqual(ff["ProofBlockHeight"], 6991101)
+        self.assertEqual(ff["ValidatorAddressesSnapshot"], ["VAL1", "VAL2", "VAL3"])
+        # Only the proof is stored, not the "|->" concatenation the getter returns.
+        self.assertEqual(ff["DKGProof"], "eyJTZXNzaW9uSWQ")
+
+    def test_reads_uncompressed_sources(self):
+        data = smart_contract_from_chain(self.mint_tx(compress=False))
+        self.assertEqual(
+            data["SmartContractMain"]["Features"][0]["FeatureFeatures"][
+                "DepositAddress"
+            ],
+            "bc1p-from-chain",
+        )
+
+    def test_ignores_contracts_that_are_not_vbtc_v2(self):
+        self.assertIsNone(smart_contract_from_chain(self.mint_tx(features="13")))
+
+    def test_refuses_to_build_a_token_with_no_deposit_address(self):
+        with self.assertLogs(level="ERROR"):
+            self.assertIsNone(smart_contract_from_chain(self.mint_tx(deposit="")))
+
+    def test_mint_falls_back_to_chain_when_the_cli_refuses(self):
+        tx = self.mint_tx()
+
+        with patch("rbx.tasks.get_nft", return_value=None):
+            with patch("rbx.tasks.handle_vbtc_v2_icon_upload"):
+                with self.assertLogs(level="WARNING"):
+                    process_transaction(tx)
+
+        token = VbtcV2Token.objects.get(sc_identifier="chain-sc:1")
+        self.assertEqual(token.deposit_address, "bc1p-from-chain")
+        self.assertEqual(token.frost_group_public_key, "0339cf9e")
+        self.assertEqual(token.required_threshold, 51)
+        self.assertEqual(token.validator_snapshot, ["VAL1", "VAL2", "VAL3"])
+        self.assertEqual(token.owner_address, "MINTER")
+        # Nothing was left outstanding, so no marker should survive.
+        self.assertFalse(
+            UnindexedMint.objects.filter(
+                status=UnindexedMint.Status.PENDING
+            ).exists()
+        )
+
+    def test_a_field_declared_with_no_value_does_not_eat_the_next_line(self):
+        # The two 2026-05-27 mainnet mints carry `let SCVersion = ` with no
+        # value, which is what the CLI's parser chokes on.
+        source = self.source().replace("let SCVersion = 1", "let SCVersion = ")
+        tx = make_tx(
+            self.block,
+            "empty-scversion",
+            Transaction.Type.VBTC_V2_MINT,
+            from_address="MINTER",
+            data=[{
+                "Function": "Mint()",
+                "ContractUID": "chain-sc:1",
+                "Data": source,
+            }],
+        )
+
+        data = smart_contract_from_chain(tx)
+        main = data["SmartContractMain"]
+
+        self.assertEqual(main["SCVersion"], 1)
+        # FileSize is declared on the line after SCVersion and must survive.
+        self.assertEqual(main["SmartContractAsset"]["Name"], "vbtc_v2_token")
+        self.assertEqual(
+            main["Features"][0]["FeatureFeatures"]["DepositAddress"],
+            "bc1p-from-chain",
+        )
+
+    def test_newer_template_with_extra_getters_still_parses(self):
+        # The 2026-07-31 mints add GetIsS3C/GetLinkedContractUID, which the
+        # deployed CLI node cannot parse. The chain path must not care.
+        source = self.source() + "\n".join([
+            "",
+            "function GetIsS3C() : string",
+            "{",
+            '   var isS3C = "false"',
+            "   return (isS3C)",
+            "}",
+            "function GetLinkedContractUID() : string",
+            "{",
+            '   var linkedContractUID = ""',
+            "   return (linkedContractUID)",
+            "}",
+        ])
+        tx = make_tx(
+            self.block,
+            "newer-template",
+            Transaction.Type.VBTC_V2_MINT,
+            from_address="MINTER",
+            data=[{
+                "Function": "Mint()",
+                "ContractUID": "chain-sc:1",
+                "Data": source,
+            }],
+        )
+
+        ff = smart_contract_from_chain(tx)["SmartContractMain"]["Features"][0][
+            "FeatureFeatures"
+        ]
+        self.assertIs(ff["IsS3C"], False)
+        self.assertIsNone(ff["LinkedContractUID"])
+        self.assertEqual(ff["DepositAddress"], "bc1p-from-chain")

@@ -15,6 +15,7 @@ from django.utils import timezone
 from api.block.serializers import BlockSerializer
 from project.celery import app
 from project.utils.encoders import DecimalEncoder
+from rbx.chain_contract import smart_contract_from_chain
 from rbx.client import get_master_nodes, get_block, get_nft, get_topics
 from shop.media import scp_down_folder, upload_to_s3
 from rbx.exceptions import RBXException
@@ -387,6 +388,18 @@ def process_transaction(tx: Transaction):
         data = get_nft(identifier)
 
         if not data:
+            # The CLI can refuse a contract indefinitely, but a V2 mint carries
+            # the whole contract on chain, so rebuild it from the transaction
+            # rather than losing the token.
+            data = smart_contract_from_chain(tx)
+
+            if data:
+                logging.warning(
+                    f"CLI would not serve {identifier}; rebuilt the contract "
+                    f"from mint tx {tx.hash}."
+                )
+
+        if not data:
             logging.error(f"No SC data found for {identifier} (tx {tx.hash}).")
             record_unindexed_mint(tx, identifier, "CLI returned no smart contract data")
             return
@@ -517,7 +530,9 @@ def process_transaction(tx: Transaction):
                         v2_token.deposit_address = v2_info["DepositAddress"]
                         v2_token.frost_group_public_key = v2_info.get("FrostGroupPublicKey", "")
                         v2_token.dkg_proof = v2_info.get("DKGProof", "")
-                        v2_token.validator_snapshot = v2_info.get("ValidatorSnapshot")
+                        v2_token.validator_snapshot = v2_info.get(
+                            "ValidatorAddressesSnapshot"
+                        )
                         v2_token.required_threshold = v2_info.get("RequiredThreshold", 0)
                         v2_token.proof_block_height = v2_info.get("ProofBlockHeight", 0)
                         v2_token.global_balance = Decimal(0)
