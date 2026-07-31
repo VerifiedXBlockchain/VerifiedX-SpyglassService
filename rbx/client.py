@@ -22,6 +22,12 @@ BASE_URL = settings.RBX_WALLET_ADDRESS
 SHOP_BASE_URL = settings.RBX_SHOP_WALLET_ADDRESS
 SHOP_CRAWLER_BASE_URL = settings.RBX_SHOP_CRAWLER_ADDRESS
 
+# (connect, read) timeout for the smart-contract fetch. This runs inline on the
+# concurrency-1 blocks worker, so an unbounded call there stops block sync for
+# as long as the CLI holds the socket open. The read half is generous because
+# the CLI can take ~30s to answer while its validator registry loads.
+NFT_TIMEOUT = (5, 30)
+
 
 def _fix_amount(amount):
     if amount == 0:
@@ -474,10 +480,27 @@ def get_nft(id: str, attempt=0) -> Tuple[dict, int]:
     url = join_url(BASE_URL, f"/scapi/scv1/GetSmartContractData/{id}/")
 
     try:
-        response = requests.get(url)
-        return response.json()
+        response = requests.get(url, timeout=NFT_TIMEOUT)
     except Exception as e:
         logger.error(f"NFT get data exception: {e}")
+        time.sleep(5)
+        return get_nft(id, attempt)
+
+    if response.status_code != 200:
+        # The CLI answered and refused. Sleeping through five more attempts
+        # would stall the single-slot blocks worker for 25s on a verdict that
+        # will not change within the block; process_transaction records the
+        # gap and the mint-recovery job retries it later.
+        logger.error(
+            f"NFT get data for {id} returned HTTP {response.status_code} "
+            f"({len(response.content)} bytes)"
+        )
+        return None
+
+    try:
+        return response.json()
+    except ValueError as e:
+        logger.error(f"NFT get data could not parse response for {id}: {e}")
         time.sleep(5)
         return get_nft(id, attempt)
 

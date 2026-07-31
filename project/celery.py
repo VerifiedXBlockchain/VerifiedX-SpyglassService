@@ -30,6 +30,10 @@ def setup_periodic_tasks(sender, **kwargs):
         10 * 60, update_vbtc_balances.s(), name="Update VBTC Balances"
     )
 
+    sender.add_periodic_task(
+        15 * 60, retry_unindexed_mints.s(), name="Retry Unindexed Mints"
+    )
+
     if settings.HEALTH_CHECK_ENABLED:
         sender.add_periodic_task(3 * 60, health_check.s(), name="Health Check")
 
@@ -96,6 +100,13 @@ def update_cmc_prices():
     from django.core import management
 
     management.call_command("fetch_cmc_prices")
+
+
+@app.task
+def retry_unindexed_mints():
+    from django.core import management
+
+    management.call_command("retry_unindexed_mints")
 
 
 @app.task(queue="vbtc_queue")

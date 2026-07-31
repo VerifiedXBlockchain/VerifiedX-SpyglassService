@@ -1311,3 +1311,38 @@ class VbtcV2WithdrawalRequest(models.Model):
 
     def __str__(self):
         return f"{self.token.sc_identifier} withdrawal [{self.status}]"
+
+
+class UnindexedMint(models.Model):
+    """A mint whose smart-contract data the CLI would not hand over.
+
+    Without that payload process_transaction cannot build the Nft or token
+    rows, and the block it came from is already committed, so nothing would
+    ever revisit it. Recording the gap here keeps the mint visible to the
+    recovery job and to operators instead of losing it to a log line.
+    """
+
+    class Status(models.TextChoices):
+        PENDING = "pending", "Pending"
+        RESOLVED = "resolved", "Resolved"
+
+    sc_identifier = models.CharField(max_length=64, db_index=True)
+    transaction = models.ForeignKey(
+        Transaction, on_delete=models.CASCADE, related_name="unindexed_mints"
+    )
+    transaction_type = models.IntegerField()
+    status = models.CharField(
+        max_length=16, choices=Status.choices, default=Status.PENDING, db_index=True
+    )
+    attempts = models.IntegerField(default=0)
+    last_error = models.TextField(blank=True)
+    first_seen_at = models.DateTimeField(auto_now_add=True)
+    last_attempted_at = models.DateTimeField(blank=True, null=True)
+    resolved_at = models.DateTimeField(blank=True, null=True)
+
+    def __str__(self):
+        return f"{self.sc_identifier} [{self.status}, {self.attempts} attempts]"
+
+    class Meta:
+        unique_together = ("sc_identifier", "transaction")
+        ordering = ["-first_seen_at"]

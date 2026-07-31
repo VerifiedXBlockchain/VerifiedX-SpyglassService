@@ -1,16 +1,14 @@
-import requests
 from django.core.management.base import BaseCommand
-from price.utils import update_price
-from django.utils import timezone
-from price.models import CoinPrice
+
+from price.utils import update_prices
 
 """
-python manage.py fetch_cmc_price
+python manage.py fetch_cmc_prices
 """
 
 
 class Command(BaseCommand):
-    def handle(self, *args, **options):
+    help = "Record the latest CoinMarketCap price for each tracked coin."
 
-        update_price(CoinPrice.CoinType.VFX)
-        update_price(CoinPrice.CoinType.BTC)
+    def handle(self, *args, **options):
+        update_prices()
