@@ -5,6 +5,7 @@ from decimal import Decimal
 from datetime import datetime
 from django.utils import timezone
 from django.core.cache import cache
+from django.db import close_old_connections
 from rest_framework.response import Response
 from rest_framework.generics import GenericAPIView, RetrieveAPIView
 from api.btc.constants import FALLBACK_VBTC_IMAGE_DATA
@@ -519,6 +520,55 @@ FROST_JOB_TTL = 300  # 5 minutes
 FROST_JOB_FAILED_TTL = 24 * 60 * 60
 
 
+def _mark_withdrawal_signed(withdrawal_request_hash, signed_btc_tx_hex):
+    """Record that a FROST ceremony produced a signed Bitcoin transaction.
+
+    Nothing else records this. btc_transaction_hash is only written when the
+    Type 28 completion lands, so between signing and that completion a
+    withdrawal whose Bitcoin transaction is on the wire looks exactly like one
+    that was never signed at all. That difference is the whole retry decision:
+    retrying re-runs the ceremony and can put a SECOND Bitcoin transaction on
+    the network, paying the destination twice.
+    """
+
+    try:
+        withdrawal = VbtcV2WithdrawalRequest.objects.get(
+            request_transaction__hash=withdrawal_request_hash
+        )
+    except VbtcV2WithdrawalRequest.DoesNotExist:
+        # Signing succeeded for something the explorer never indexed. Loud,
+        # because the signature exists whether or not there is a row for it.
+        logging.error(
+            f"FROST signed withdrawal request {withdrawal_request_hash} but no "
+            f"indexed withdrawal matches it — a signed BTC transaction exists "
+            f"with no record in the explorer."
+        )
+        return
+    except Exception as e:
+        logging.error(
+            f"Could not load withdrawal {withdrawal_request_hash} to record "
+            f"FROST signing: {e}"
+        )
+        return
+
+    try:
+        withdrawal.signed_btc_tx_hex = signed_btc_tx_hex
+        withdrawal.signed_at = timezone.now()
+        # Never walk a completed withdrawal backwards: the Type 28 completion
+        # is chain-confirmed and outranks anything observed here.
+        if withdrawal.status != VbtcV2WithdrawalRequest.Status.COMPLETED:
+            withdrawal.status = VbtcV2WithdrawalRequest.Status.PENDING_BTC
+        withdrawal.save(
+            update_fields=["signed_btc_tx_hex", "signed_at", "status"]
+        )
+        withdrawal.token.recompute_pending_withdrawal()
+    except Exception as e:
+        logging.error(
+            f"Could not record FROST signing for withdrawal {withdrawal.pk} "
+            f"(request {withdrawal_request_hash}): {e}"
+        )
+
+
 class VbtcV2WithdrawCompleteExecuteView(GenericAPIView):
 
     def post(self, request, *args, **kwargs):
@@ -552,6 +602,10 @@ class VbtcV2WithdrawCompleteExecuteView(GenericAPIView):
                 result = execute_complete_withdrawal(payload)
                 success = result.get("Success", False)
                 if success:
+                    _mark_withdrawal_signed(
+                        payload["WithdrawalRequestHash"],
+                        result.get("SignedBTCTxHex") or "",
+                    )
                     _cache.set(
                         f"{FROST_JOB_PREFIX}{job_id}",
                         _json.dumps({"status": "complete", "result": result}),
@@ -580,6 +634,10 @@ class VbtcV2WithdrawCompleteExecuteView(GenericAPIView):
                     _json.dumps({"status": "failed", "message": str(e)}),
                     FROST_JOB_FAILED_TTL,
                 )
+            finally:
+                # This thread opens its own connection when the withdrawal is
+                # marked; nothing else will ever close it.
+                close_old_connections()
 
         threading.Thread(target=_run_frost, daemon=True).start()
 

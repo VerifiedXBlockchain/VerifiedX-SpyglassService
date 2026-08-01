@@ -17,6 +17,8 @@ from rbx.models import (
     VbtcV2TokenTransfer,
     VbtcV2WithdrawalRequest,
 )
+from api.btc.serializers import VbtcV2WithdrawalRequestSerializer
+from api.btc.views import _mark_withdrawal_signed
 from rbx.chain_contract import smart_contract_from_chain
 from rbx.tasks import (
     expire_stale_withdrawals,
@@ -688,3 +690,125 @@ class WithdrawalExpiryTests(TestCase):
 
         self.token.refresh_from_db()
         self.assertFalse(self.token.is_pending_withdrawal)
+
+
+class PendingBtcWithdrawalTests(TestCase):
+    """A withdrawal whose Bitcoin transaction has been FROST-signed must look
+    different from one that was never signed. Nothing else records that: the
+    BTC transaction hash only arrives with the Type 28 completion, so without
+    this an operator deciding whether to retry sees two identical rows — and a
+    retry re-runs the ceremony and can broadcast a second Bitcoin payout."""
+
+    def setUp(self):
+        self.block = make_block(height=1000)
+        self.token = make_token(owner="O", global_balance="0.001")
+        self.tx = make_tx(
+            self.block, "w-req", Transaction.Type.VBTC_V2_WITHDRAWAL_REQUEST
+        )
+        self.withdrawal = add_withdrawal(
+            self.token, self.tx, "U", "0.0001",
+            VbtcV2WithdrawalRequest.Status.REQUESTED,
+        )
+
+    def test_signing_marks_the_withdrawal_pending_btc(self):
+        _mark_withdrawal_signed("w-req", "0200000001deadbeef")
+
+        self.withdrawal.refresh_from_db()
+        self.assertEqual(
+            self.withdrawal.status, VbtcV2WithdrawalRequest.Status.PENDING_BTC
+        )
+        self.assertEqual(self.withdrawal.signed_btc_tx_hex, "0200000001deadbeef")
+        self.assertIsNotNone(self.withdrawal.signed_at)
+
+    def test_signed_and_unsigned_requests_are_distinguishable(self):
+        other_tx = make_tx(
+            self.block, "w-req-2", Transaction.Type.VBTC_V2_WITHDRAWAL_REQUEST
+        )
+        never_signed = add_withdrawal(
+            self.token, other_tx, "U", "0.0001",
+            VbtcV2WithdrawalRequest.Status.REQUESTED,
+        )
+
+        _mark_withdrawal_signed("w-req", "0200000001deadbeef")
+
+        self.withdrawal.refresh_from_db()
+        never_signed.refresh_from_db()
+        self.assertNotEqual(self.withdrawal.status, never_signed.status)
+        self.assertIsNone(never_signed.signed_at)
+
+    def test_completed_withdrawal_is_not_walked_backwards(self):
+        # The Type 28 completion is chain-confirmed and outranks a late
+        # observation of the ceremony that produced it.
+        self.withdrawal.status = VbtcV2WithdrawalRequest.Status.COMPLETED
+        self.withdrawal.save(update_fields=["status"])
+
+        _mark_withdrawal_signed("w-req", "0200000001deadbeef")
+
+        self.withdrawal.refresh_from_db()
+        self.assertEqual(
+            self.withdrawal.status, VbtcV2WithdrawalRequest.Status.COMPLETED
+        )
+        self.assertEqual(self.withdrawal.signed_btc_tx_hex, "0200000001deadbeef")
+
+    def test_unknown_request_hash_does_not_raise(self):
+        # The signature exists whether or not the explorer indexed the request.
+        _mark_withdrawal_signed("no-such-request", "0200000001deadbeef")
+
+        self.withdrawal.refresh_from_db()
+        self.assertEqual(
+            self.withdrawal.status, VbtcV2WithdrawalRequest.Status.REQUESTED
+        )
+
+    def test_pending_btc_still_blocks_new_withdrawals(self):
+        # Mirrors VBTCContractV2.HasActiveWithdrawal: Requested OR Pending_BTC.
+        # Treating pending_btc as settled would free the token while its BTC
+        # transaction is still in flight.
+        _mark_withdrawal_signed("w-req", "0200000001deadbeef")
+
+        self.token.recompute_pending_withdrawal(current_height=1100)
+
+        self.token.refresh_from_db()
+        self.assertTrue(self.token.is_pending_withdrawal)
+
+    def test_pending_btc_amount_stays_reserved_at_ownership_transfer(self):
+        t1 = make_tx(self.block, "t-1", Transaction.Type.VBTC_V2_TRANSFER)
+        add_transfer(self.token, t1, "O", "U", "0.0005")
+        _mark_withdrawal_signed("w-req", "0200000001deadbeef")
+
+        # U holds 0.0005 and has 0.0001 signed but unconfirmed: only 0.0004
+        # may settle to the incoming owner.
+        self.assertEqual(
+            self.token.settlement_amount_for("U"), Decimal("0.0004")
+        )
+
+    def test_api_exposes_pending_btc_without_leaking_the_signed_tx(self):
+        _mark_withdrawal_signed("w-req", "0200000001deadbeef")
+
+        self.withdrawal.refresh_from_db()
+        data = VbtcV2WithdrawalRequestSerializer(self.withdrawal).data
+
+        self.assertEqual(data["status"], "pending_btc")
+        self.assertIsNotNone(data["signed_at"])
+        # Anyone holding the signed hex can broadcast it; that is the
+        # requestor's call, not a public block explorer's.
+        self.assertNotIn("signed_btc_tx_hex", data)
+
+    def test_cancelling_a_signed_withdrawal_is_logged(self):
+        _mark_withdrawal_signed("w-req", "0200000001deadbeef")
+        cancel_tx = make_tx(
+            self.block, "w-cancel", Transaction.Type.VBTC_V2_WITHDRAWAL_CANCEL,
+            data=[{"Function": "VBTCWithdrawalCancel()",
+                   "WithdrawalRequestHash": "w-req"}],
+        )
+
+        with self.assertLogs(level="ERROR") as logs:
+            process_transaction(cancel_tx)
+
+        self.assertTrue(
+            any("already FROST-signed" in line for line in logs.output),
+            logs.output,
+        )
+        self.withdrawal.refresh_from_db()
+        self.assertEqual(
+            self.withdrawal.status, VbtcV2WithdrawalRequest.Status.CANCELLED
+        )

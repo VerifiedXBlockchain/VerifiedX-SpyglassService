@@ -1167,6 +1167,18 @@ def process_transaction(tx: Transaction):
             )
             return
 
+        if withdrawal.signed_at:
+            # A signed Bitcoin transaction for this withdrawal already exists
+            # and may be on the network. The chain is authoritative, so the
+            # cancel still applies — but the BTC can still confirm afterwards,
+            # so this must not pass unnoticed.
+            logging.error(
+                f"VBTC_V2_WITHDRAWAL_CANCEL for withdrawal {withdrawal.pk} "
+                f"(request hash {withdrawal_request_hash}) whose BTC transaction "
+                f"was already FROST-signed at {withdrawal.signed_at} — the "
+                f"signed transaction may still confirm."
+            )
+
         withdrawal.cancel_transaction = tx
         withdrawal.status = VbtcV2WithdrawalRequest.Status.CANCELLED
         withdrawal.cancelled_at = tx.date_crafted

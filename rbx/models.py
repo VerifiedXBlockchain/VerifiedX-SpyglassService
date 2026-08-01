@@ -1171,9 +1171,10 @@ class VbtcV2Token(models.Model):
     def recompute_pending_withdrawal(self, current_height=None):
         """Derive is_pending_withdrawal from open withdrawal requests.
 
-        The flag must stay true while ANY request is still REQUESTED —
-        setting/clearing it directly in individual tx handlers loses that
-        invariant when a token has multiple in-flight withdrawals.
+        The flag must stay true while ANY request is still open — REQUESTED or
+        PENDING_BTC, matching the CLI's HasActiveWithdrawal. Setting/clearing
+        it directly in individual tx handlers loses that invariant when a
+        token has multiple in-flight withdrawals.
 
         A request that never completes stays REQUESTED forever, but the chain
         stops treating it as blocking after WITHDRAWAL_EXPIRY_BLOCKS. Without
@@ -1188,7 +1189,7 @@ class VbtcV2Token(models.Model):
             current_height = Block.objects.aggregate(v=Max("height"))["v"] or 0
 
         pending = self.withdrawal_requests.filter(
-            status=VbtcV2WithdrawalRequest.Status.REQUESTED,
+            status__in=VbtcV2WithdrawalRequest.ACTIVE_STATUSES,
             request_transaction__height__gte=current_height
             - WITHDRAWAL_EXPIRY_BLOCKS,
         ).exists()
@@ -1233,7 +1234,7 @@ class VbtcV2Token(models.Model):
         complete, and the BTC pays out to their address, not the new owner's.
         """
         pending = self.withdrawal_requests.filter(
-            status=VbtcV2WithdrawalRequest.Status.REQUESTED,
+            status__in=VbtcV2WithdrawalRequest.ACTIVE_STATUSES,
             requestor_address=address,
         ).aggregate(total=Sum("amount"))["total"] or Decimal(0)
         return self.ledger_entries().get(address, Decimal(0)) - pending
@@ -1294,9 +1295,20 @@ class VbtcV2TokenTransfer(models.Model):
 
 class VbtcV2WithdrawalRequest(models.Model):
     class Status(models.TextChoices):
+        # Mirrors VBTCWithdrawalStatus in the CLI
+        # (ReserveBlockCore/Bitcoin/Models/VBTCContractV2.cs). `None` is
+        # omitted: it is the contract-level "no active withdrawal" state and
+        # has no meaning for a row that exists because a request was made.
         REQUESTED = "requested"
+        PENDING_BTC = "pending_btc", "Pending BTC"
         COMPLETED = "completed"
+        CANCELLATION_REQUESTED = "cancellation_requested"
         CANCELLED = "cancelled"
+
+    # Mirrors VBTCContractV2.HasActiveWithdrawal: both states still commit the
+    # contract's funds, so both must keep blocking new withdrawals and keep
+    # their amount reserved at ownership transfer.
+    ACTIVE_STATUSES = (Status.REQUESTED, Status.PENDING_BTC)
 
     token = models.ForeignKey(
         VbtcV2Token, on_delete=models.CASCADE, related_name="withdrawal_requests"
@@ -1323,8 +1335,14 @@ class VbtcV2WithdrawalRequest(models.Model):
     amount = models.DecimalField(decimal_places=16, max_digits=32)
     fee_rate = models.DecimalField(decimal_places=8, max_digits=16)
     btc_transaction_hash = models.CharField(max_length=128, blank=True)
+    # btc_transaction_hash only arrives with the Type 28 completion, so on its
+    # own it cannot tell an operator whether Bitcoin has already moved. These
+    # two record the FROST ceremony that produced a signed, broadcastable
+    # Bitcoin transaction — the point after which a retry can pay out twice.
+    signed_btc_tx_hex = models.TextField(blank=True)
+    signed_at = models.DateTimeField(blank=True, null=True)
     status = models.CharField(
-        max_length=16, choices=Status.choices, default=Status.REQUESTED
+        max_length=32, choices=Status.choices, default=Status.REQUESTED
     )
     created_at = models.DateTimeField()
     completed_at = models.DateTimeField(blank=True, null=True)
