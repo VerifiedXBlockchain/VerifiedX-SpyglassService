@@ -37,6 +37,21 @@ def _unquote(value: str) -> str:
     return value
 
 
+def _first_declared(fields: dict, *names: str) -> str:
+    """Return the first of `names` the contract source actually declared.
+
+    The node's source generator renames identifiers over time — `isS3C`
+    became `isStC` on 2026-07-31 (Core-CLI 88e8a288). Reading only one
+    spelling makes every contract on the other side of a rename decode to a
+    default with no exception and no log, so both are accepted.
+    """
+
+    for name in names:
+        if name in fields:
+            return fields[name]
+    return ""
+
+
 def _as_int(value, default=0) -> int:
     try:
         return int(str(value).strip() or default)
@@ -136,7 +151,9 @@ def smart_contract_from_chain(tx) -> Optional[dict]:
         "ProofBlockHeight": _as_int(fields.get("ProofBlockHeight")),
         "CeremonyId": fields.get("ceremonyId", ""),
         "ImageBase": fields.get("imageBase", ""),
-        "IsS3C": str(fields.get("isS3C", "")).lower() == "true",
+        # `isStC` is the current spelling; `isS3C` is what contracts minted
+        # before 2026-07-31 carry.
+        "IsS3C": str(_first_declared(fields, "isStC", "isS3C")).lower() == "true",
         "LinkedContractUID": fields.get("linkedContractUID") or None,
     }
 

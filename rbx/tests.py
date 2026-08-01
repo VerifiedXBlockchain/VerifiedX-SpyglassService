@@ -582,40 +582,77 @@ class ChainContractTests(TestCase):
             "bc1p-from-chain",
         )
 
-    def test_newer_template_with_extra_getters_still_parses(self):
-        # The 2026-07-31 mints add GetIsS3C/GetLinkedContractUID, which the
-        # deployed CLI node cannot parse. The chain path must not care.
-        source = self.source() + "\n".join([
+    def s3c_source(self, var_name, value, linked=""):
+        """Contract source carrying the S3C getters under either spelling.
+
+        The node's generator emitted `var isS3C` until 2026-07-31 and
+        `var isStC` after it (Core-CLI 88e8a288). Both spellings are on
+        chain, so both have to parse.
+        """
+
+        getter = "GetIsStC" if var_name == "isStC" else "GetIsS3C"
+        return self.source() + "\n".join([
             "",
-            "function GetIsS3C() : string",
+            f"function {getter}() : string",
             "{",
-            '   var isS3C = "false"',
-            "   return (isS3C)",
+            f'   var {var_name} = "{value}"',
+            f"   return ({var_name})",
             "}",
             "function GetLinkedContractUID() : string",
             "{",
-            '   var linkedContractUID = ""',
+            f'   var linkedContractUID = "{linked}"',
             "   return (linkedContractUID)",
             "}",
         ])
+
+    def parse_s3c(self, tx_hash, var_name, value, linked=""):
         tx = make_tx(
             self.block,
-            "newer-template",
+            tx_hash,
             Transaction.Type.VBTC_V2_MINT,
             from_address="MINTER",
             data=[{
                 "Function": "Mint()",
                 "ContractUID": "chain-sc:1",
-                "Data": source,
+                "Data": self.s3c_source(var_name, value, linked),
             }],
         )
-
-        ff = smart_contract_from_chain(tx)["SmartContractMain"]["Features"][0][
+        return smart_contract_from_chain(tx)["SmartContractMain"]["Features"][0][
             "FeatureFeatures"
         ]
+
+    def test_pre_rename_contracts_still_parse(self):
+        # Contracts minted before 2026-07-31 carry `isS3C`.
+        ff = self.parse_s3c("old-true", "isS3C", "true", linked="linked-sc:9")
+
+        self.assertIs(ff["IsS3C"], True)
+        self.assertEqual(ff["LinkedContractUID"], "linked-sc:9")
+        self.assertEqual(ff["DepositAddress"], "bc1p-from-chain")
+
+    def test_post_rename_contracts_parse(self):
+        # Everything minted after 2026-07-31 carries `isStC`. Reading only the
+        # old spelling made these decode to False with no exception and no
+        # log — the failure the true case is here to catch.
+        ff = self.parse_s3c("new-true", "isStC", "true", linked="linked-sc:9")
+
+        self.assertIs(ff["IsS3C"], True)
+        self.assertEqual(ff["LinkedContractUID"], "linked-sc:9")
+        self.assertEqual(ff["DepositAddress"], "bc1p-from-chain")
+
+    def test_false_parses_under_both_spellings(self):
+        for tx_hash, var_name in (("old-false", "isS3C"), ("new-false", "isStC")):
+            with self.subTest(var_name=var_name):
+                ff = self.parse_s3c(tx_hash, var_name, "false")
+                self.assertIs(ff["IsS3C"], False)
+                self.assertIsNone(ff["LinkedContractUID"])
+
+    def test_contracts_without_the_getters_default_to_false(self):
+        ff = smart_contract_from_chain(self.mint_tx())["SmartContractMain"][
+            "Features"
+        ][0]["FeatureFeatures"]
+
         self.assertIs(ff["IsS3C"], False)
         self.assertIsNone(ff["LinkedContractUID"])
-        self.assertEqual(ff["DepositAddress"], "bc1p-from-chain")
 
 
 class WithdrawalExpiryTests(TestCase):
