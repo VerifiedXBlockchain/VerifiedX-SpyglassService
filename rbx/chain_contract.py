@@ -143,7 +143,7 @@ def smart_contract_from_chain(tx) -> Optional[dict]:
         "DepositAddress": fields["DepositAddress"],
         "Version": _as_int(fields.get("TokenizationVersion"), 2),
         "ValidatorAddressesSnapshot": validators,
-        "FrostGroupPublicKey": fields.get("frostGroupKey", ""),
+        "FrostGroupPublicKey": _first_declared(fields, "frostGroupKey", "mpcKey"),
         "RequiredThreshold": _as_int(fields.get("RequiredThreshold")),
         # The getter returns proof + "|->" + blockHeight, but only the proof
         # itself is stored, matching what the CLI hands back.

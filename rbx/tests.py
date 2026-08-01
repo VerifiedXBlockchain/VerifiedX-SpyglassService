@@ -627,6 +627,38 @@ class ChainContractTests(TestCase):
             "FeatureFeatures"
         ]
 
+    def test_pre_frost_rename_contracts_keep_their_group_key(self):
+        """`var mpcKey` became `var frostGroupKey` at Core-CLI 9fd937e1.
+
+        Same rename hazard as isS3C/isStC: reading only the current spelling
+        decodes a pre-9fd937e1 contract to an EMPTY FROST group public key,
+        which is then published as `frost_group_public_key` on every V2 API
+        response with no exception and no log.
+        """
+
+        old = self.source().replace(
+            '   var frostGroupKey = "0339cf9e"', '   var mpcKey = "0339cf9e"'
+        ).replace("   return (frostGroupKey)", "   return (mpcKey)")
+        tx = make_tx(
+            self.block,
+            "old-frost-key",
+            Transaction.Type.VBTC_V2_MINT,
+            from_address="MINTER",
+            data=[{
+                "Function": "Mint()",
+                "ContractUID": "chain-sc:1",
+                "Data": old,
+            }],
+        )
+        ff = smart_contract_from_chain(tx)["SmartContractMain"]["Features"][0][
+            "FeatureFeatures"
+        ]
+        self.assertEqual(ff["FrostGroupPublicKey"], "0339cf9e")
+
+    def test_post_frost_rename_contracts_keep_their_group_key(self):
+        ff = self.parse_s3c("new-frost-key", "isStC", "false")
+        self.assertEqual(ff["FrostGroupPublicKey"], "0339cf9e")
+
     def test_pre_rename_contracts_still_parse(self):
         # Contracts minted before 2026-07-31 carry `isS3C`.
         ff = self.parse_s3c("old-true", "isS3C", "true", linked="linked-sc:9")
