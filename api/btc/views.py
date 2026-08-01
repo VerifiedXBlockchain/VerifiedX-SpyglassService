@@ -576,6 +576,12 @@ class VbtcV2WithdrawCompleteExecuteView(GenericAPIView):
             "sc_identifier", "withdrawal_request_hash", "owner_address",
             "session_id", "start_signature", "start_timestamp",
             "share_distribution_signature", "share_distribution_timestamp",
+            # The CLI falls back to these when the withdrawal request is not
+            # in its own DB (VBTCService.CompleteWithdrawal), and it treats
+            # amount 0 or an empty destination as "no delegated params" —
+            # so a caller that omits them gets "withdrawal request not found"
+            # rather than anything naming the field it left out.
+            "amount", "btc_destination",
         ])
         if err:
             return err
@@ -589,8 +595,10 @@ class VbtcV2WithdrawCompleteExecuteView(GenericAPIView):
             "StartSignature": request.data["start_signature"],
             "ShareDistributionTimestamp": request.data["share_distribution_timestamp"],
             "ShareDistributionSignature": request.data["share_distribution_signature"],
-            "Amount": request.data.get("amount", 0),
-            "BTCDestination": request.data.get("btc_destination", ""),
+            "Amount": request.data["amount"],
+            "BTCDestination": request.data["btc_destination"],
+            # fee_rate stays optional: the CLI substitutes its own default
+            # when this is 0 (delegatedFeeRate ?? 10).
             "FeeRate": request.data.get("fee_rate", 0),
         }
 

@@ -17,8 +17,14 @@ from rbx.models import (
     VbtcV2TokenTransfer,
     VbtcV2WithdrawalRequest,
 )
+from rest_framework.test import APIRequestFactory, force_authenticate
+
+from access.models import User
 from api.btc.serializers import VbtcV2WithdrawalRequestSerializer
-from api.btc.views import _mark_withdrawal_signed
+from api.btc.views import (
+    VbtcV2WithdrawCompleteExecuteView,
+    _mark_withdrawal_signed,
+)
 from rbx.chain_contract import smart_contract_from_chain
 from rbx.tasks import (
     expire_stale_withdrawals,
@@ -928,3 +934,54 @@ class UnhandledTransactionTypeTests(TestCase):
 
         with self.assertNoLogs(level="WARNING"):
             process_transaction(tx)
+
+
+class WithdrawCompleteExecuteRequiredFieldsTests(TestCase):
+    """Amount and BTCDestination are what the CLI falls back to when the
+    withdrawal request is not in its own DB. It reads amount 0 or an empty
+    destination as "no delegated params" and answers "withdrawal request not
+    found", so silently defaulting a missing field turned a caller's typo into
+    a failure that names nothing."""
+
+    URL = "/api/btc/vbtc-v2/withdraw/complete/execute/"
+
+    def payload(self, **overrides):
+        data = {
+            "sc_identifier": "sc:1",
+            "withdrawal_request_hash": "w-req",
+            "owner_address": "OWNER",
+            "session_id": "session-1",
+            "start_signature": "sig-start",
+            "start_timestamp": 1,
+            "share_distribution_signature": "sig-share",
+            "share_distribution_timestamp": 1,
+            "amount": "0.0001",
+            "btc_destination": "bc1p-payout",
+        }
+        data.update(overrides)
+        return {k: v for k, v in data.items() if v is not None}
+
+    def post(self, data):
+        user = User.objects.create_user(email="t@example.com", password="x")
+        request = APIRequestFactory().post(self.URL, data, format="json")
+        force_authenticate(request, user=user)
+        return VbtcV2WithdrawCompleteExecuteView.as_view()(request)
+
+    def test_missing_amount_is_rejected(self):
+        response = self.post(self.payload(amount=None))
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("amount", response.data["message"])
+
+    def test_missing_btc_destination_is_rejected(self):
+        response = self.post(self.payload(btc_destination=None))
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("btc_destination", response.data["message"])
+
+    def test_zero_amount_is_rejected(self):
+        # The CLI treats 0 as absent, so accepting it only defers the failure.
+        response = self.post(self.payload(amount=0))
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("amount", response.data["message"])
