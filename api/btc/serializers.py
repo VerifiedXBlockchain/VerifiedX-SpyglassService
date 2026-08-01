@@ -44,6 +44,11 @@ class VbtcV2WithdrawalRequestSerializer(serializers.ModelSerializer):
             "fee_rate",
             "btc_transaction_hash",
             "status",
+            # signed_at is what separates a "pending_btc" withdrawal whose
+            # Bitcoin transaction has been signed from one that never was.
+            # The signed hex itself stays out of the public payload: anyone
+            # holding it can broadcast it, and that is the requestor's call.
+            "signed_at",
             "request_transaction_hash",
             "completion_transaction_hash",
             "created_at",

@@ -17,6 +17,14 @@ from rbx.models import (
     VbtcV2TokenTransfer,
     VbtcV2WithdrawalRequest,
 )
+from rest_framework.test import APIRequestFactory, force_authenticate
+
+from access.models import User
+from api.btc.serializers import VbtcV2WithdrawalRequestSerializer
+from api.btc.views import (
+    VbtcV2WithdrawCompleteExecuteView,
+    _mark_withdrawal_signed,
+)
 from rbx.chain_contract import smart_contract_from_chain
 from rbx.tasks import (
     expire_stale_withdrawals,
@@ -580,40 +588,109 @@ class ChainContractTests(TestCase):
             "bc1p-from-chain",
         )
 
-    def test_newer_template_with_extra_getters_still_parses(self):
-        # The 2026-07-31 mints add GetIsS3C/GetLinkedContractUID, which the
-        # deployed CLI node cannot parse. The chain path must not care.
-        source = self.source() + "\n".join([
+    def s3c_source(self, var_name, value, linked=""):
+        """Contract source carrying the S3C getters under either spelling.
+
+        The node's generator emitted `var isS3C` until 2026-07-31 and
+        `var isStC` after it (Core-CLI 88e8a288). Both spellings are on
+        chain, so both have to parse.
+        """
+
+        getter = "GetIsStC" if var_name == "isStC" else "GetIsS3C"
+        return self.source() + "\n".join([
             "",
-            "function GetIsS3C() : string",
+            f"function {getter}() : string",
             "{",
-            '   var isS3C = "false"',
-            "   return (isS3C)",
+            f'   var {var_name} = "{value}"',
+            f"   return ({var_name})",
             "}",
             "function GetLinkedContractUID() : string",
             "{",
-            '   var linkedContractUID = ""',
+            f'   var linkedContractUID = "{linked}"',
             "   return (linkedContractUID)",
             "}",
         ])
+
+    def parse_s3c(self, tx_hash, var_name, value, linked=""):
         tx = make_tx(
             self.block,
-            "newer-template",
+            tx_hash,
             Transaction.Type.VBTC_V2_MINT,
             from_address="MINTER",
             data=[{
                 "Function": "Mint()",
                 "ContractUID": "chain-sc:1",
-                "Data": source,
+                "Data": self.s3c_source(var_name, value, linked),
             }],
         )
+        return smart_contract_from_chain(tx)["SmartContractMain"]["Features"][0][
+            "FeatureFeatures"
+        ]
 
+    def test_pre_frost_rename_contracts_keep_their_group_key(self):
+        """`var mpcKey` became `var frostGroupKey` at Core-CLI 9fd937e1.
+
+        Same rename hazard as isS3C/isStC: reading only the current spelling
+        decodes a pre-9fd937e1 contract to an EMPTY FROST group public key,
+        which is then published as `frost_group_public_key` on every V2 API
+        response with no exception and no log.
+        """
+
+        old = self.source().replace(
+            '   var frostGroupKey = "0339cf9e"', '   var mpcKey = "0339cf9e"'
+        ).replace("   return (frostGroupKey)", "   return (mpcKey)")
+        tx = make_tx(
+            self.block,
+            "old-frost-key",
+            Transaction.Type.VBTC_V2_MINT,
+            from_address="MINTER",
+            data=[{
+                "Function": "Mint()",
+                "ContractUID": "chain-sc:1",
+                "Data": old,
+            }],
+        )
         ff = smart_contract_from_chain(tx)["SmartContractMain"]["Features"][0][
             "FeatureFeatures"
         ]
+        self.assertEqual(ff["FrostGroupPublicKey"], "0339cf9e")
+
+    def test_post_frost_rename_contracts_keep_their_group_key(self):
+        ff = self.parse_s3c("new-frost-key", "isStC", "false")
+        self.assertEqual(ff["FrostGroupPublicKey"], "0339cf9e")
+
+    def test_pre_rename_contracts_still_parse(self):
+        # Contracts minted before 2026-07-31 carry `isS3C`.
+        ff = self.parse_s3c("old-true", "isS3C", "true", linked="linked-sc:9")
+
+        self.assertIs(ff["IsS3C"], True)
+        self.assertEqual(ff["LinkedContractUID"], "linked-sc:9")
+        self.assertEqual(ff["DepositAddress"], "bc1p-from-chain")
+
+    def test_post_rename_contracts_parse(self):
+        # Everything minted after 2026-07-31 carries `isStC`. Reading only the
+        # old spelling made these decode to False with no exception and no
+        # log — the failure the true case is here to catch.
+        ff = self.parse_s3c("new-true", "isStC", "true", linked="linked-sc:9")
+
+        self.assertIs(ff["IsS3C"], True)
+        self.assertEqual(ff["LinkedContractUID"], "linked-sc:9")
+        self.assertEqual(ff["DepositAddress"], "bc1p-from-chain")
+
+    def test_false_parses_under_both_spellings(self):
+        for tx_hash, var_name in (("old-false", "isS3C"), ("new-false", "isStC")):
+            with self.subTest(var_name=var_name):
+                ff = self.parse_s3c(tx_hash, var_name, "false")
+                self.assertIs(ff["IsS3C"], False)
+                self.assertIsNone(ff["LinkedContractUID"])
+
+    def test_contracts_without_the_getters_default_to_false(self):
+        ff = smart_contract_from_chain(self.mint_tx())["SmartContractMain"][
+            "Features"
+        ][0]["FeatureFeatures"]
+
         self.assertIs(ff["IsS3C"], False)
         self.assertIsNone(ff["LinkedContractUID"])
-        self.assertEqual(ff["DepositAddress"], "bc1p-from-chain")
 
 
 class WithdrawalExpiryTests(TestCase):
@@ -686,5 +763,399 @@ class WithdrawalExpiryTests(TestCase):
         make_block(height=1500)
         expire_stale_withdrawals()
 
+        self.token.refresh_from_db()
+        self.assertFalse(self.token.is_pending_withdrawal)
+
+
+class PendingBtcWithdrawalTests(TestCase):
+    """A withdrawal whose Bitcoin transaction has been FROST-signed must look
+    different from one that was never signed. Nothing else records that: the
+    BTC transaction hash only arrives with the Type 28 completion, so without
+    this an operator deciding whether to retry sees two identical rows — and a
+    retry re-runs the ceremony and can broadcast a second Bitcoin payout."""
+
+    def setUp(self):
+        self.block = make_block(height=1000)
+        self.token = make_token(owner="O", global_balance="0.001")
+        self.tx = make_tx(
+            self.block, "w-req", Transaction.Type.VBTC_V2_WITHDRAWAL_REQUEST
+        )
+        self.withdrawal = add_withdrawal(
+            self.token, self.tx, "U", "0.0001",
+            VbtcV2WithdrawalRequest.Status.REQUESTED,
+        )
+
+    def test_signing_marks_the_withdrawal_pending_btc(self):
+        _mark_withdrawal_signed("w-req", "0200000001deadbeef")
+
+        self.withdrawal.refresh_from_db()
+        self.assertEqual(
+            self.withdrawal.status, VbtcV2WithdrawalRequest.Status.PENDING_BTC
+        )
+        self.assertEqual(self.withdrawal.signed_btc_tx_hex, "0200000001deadbeef")
+        self.assertIsNotNone(self.withdrawal.signed_at)
+
+    def test_signed_and_unsigned_requests_are_distinguishable(self):
+        other_tx = make_tx(
+            self.block, "w-req-2", Transaction.Type.VBTC_V2_WITHDRAWAL_REQUEST
+        )
+        never_signed = add_withdrawal(
+            self.token, other_tx, "U", "0.0001",
+            VbtcV2WithdrawalRequest.Status.REQUESTED,
+        )
+
+        _mark_withdrawal_signed("w-req", "0200000001deadbeef")
+
+        self.withdrawal.refresh_from_db()
+        never_signed.refresh_from_db()
+        self.assertNotEqual(self.withdrawal.status, never_signed.status)
+        self.assertIsNone(never_signed.signed_at)
+
+    def test_completed_withdrawal_is_not_walked_backwards(self):
+        # The Type 28 completion is chain-confirmed and outranks a late
+        # observation of the ceremony that produced it.
+        self.withdrawal.status = VbtcV2WithdrawalRequest.Status.COMPLETED
+        self.withdrawal.save(update_fields=["status"])
+
+        _mark_withdrawal_signed("w-req", "0200000001deadbeef")
+
+        self.withdrawal.refresh_from_db()
+        self.assertEqual(
+            self.withdrawal.status, VbtcV2WithdrawalRequest.Status.COMPLETED
+        )
+        self.assertEqual(self.withdrawal.signed_btc_tx_hex, "0200000001deadbeef")
+
+    def test_unknown_request_hash_does_not_raise(self):
+        # The signature exists whether or not the explorer indexed the request.
+        _mark_withdrawal_signed("no-such-request", "0200000001deadbeef")
+
+        self.withdrawal.refresh_from_db()
+        self.assertEqual(
+            self.withdrawal.status, VbtcV2WithdrawalRequest.Status.REQUESTED
+        )
+
+    def test_pending_btc_still_blocks_new_withdrawals(self):
+        # Mirrors VBTCContractV2.HasActiveWithdrawal: Requested OR Pending_BTC.
+        # Treating pending_btc as settled would free the token while its BTC
+        # transaction is still in flight.
+        _mark_withdrawal_signed("w-req", "0200000001deadbeef")
+
+        self.token.recompute_pending_withdrawal(current_height=1100)
+
+        self.token.refresh_from_db()
+        self.assertTrue(self.token.is_pending_withdrawal)
+
+    def test_pending_btc_amount_stays_reserved_at_ownership_transfer(self):
+        t1 = make_tx(self.block, "t-1", Transaction.Type.VBTC_V2_TRANSFER)
+        add_transfer(self.token, t1, "O", "U", "0.0005")
+        _mark_withdrawal_signed("w-req", "0200000001deadbeef")
+
+        # U holds 0.0005 and has 0.0001 signed but unconfirmed: only 0.0004
+        # may settle to the incoming owner.
+        self.assertEqual(
+            self.token.settlement_amount_for("U"), Decimal("0.0004")
+        )
+
+    def test_api_exposes_pending_btc_without_leaking_the_signed_tx(self):
+        _mark_withdrawal_signed("w-req", "0200000001deadbeef")
+
+        self.withdrawal.refresh_from_db()
+        data = VbtcV2WithdrawalRequestSerializer(self.withdrawal).data
+
+        self.assertEqual(data["status"], "pending_btc")
+        self.assertIsNotNone(data["signed_at"])
+        # Anyone holding the signed hex can broadcast it; that is the
+        # requestor's call, not a public block explorer's.
+        self.assertNotIn("signed_btc_tx_hex", data)
+
+    def test_cancelling_a_signed_withdrawal_is_logged(self):
+        _mark_withdrawal_signed("w-req", "0200000001deadbeef")
+        cancel_tx = make_tx(
+            self.block, "w-cancel", Transaction.Type.VBTC_V2_WITHDRAWAL_CANCEL,
+            data=[{"Function": "VBTCWithdrawalCancel()",
+                   "WithdrawalRequestHash": "w-req"}],
+        )
+
+        with self.assertLogs(level="ERROR") as logs:
+            process_transaction(cancel_tx)
+
+        self.assertTrue(
+            any("already FROST-signed" in line for line in logs.output),
+            logs.output,
+        )
+        self.withdrawal.refresh_from_db()
+        self.assertEqual(
+            self.withdrawal.status, VbtcV2WithdrawalRequest.Status.CANCELLED
+        )
+
+
+class TransactionTypeCoverageTests(TestCase):
+    """Transaction.Type mirrors TransactionType in the node
+    (ReserveBlockCore/Models/Transaction.cs), which uses implicit positional
+    ordinals. A member missing here is not a cosmetic gap: the dispatch chain
+    never matches it and the explorer shows a bare ordinal for it."""
+
+    # ordinal -> the node's enum member at that position
+    NODE_ORDINALS = {
+        24: "VBTC_V2_VALIDATOR_EXIT",
+        39: "VBTC_V2_BRIDGE_POOL_UNLOCK",
+        40: "VBTC_V2_BRIDGE_EXIT_TO_BTC",
+        41: "VBTC_V2_BRIDGE_EXIT_TO_BTC_COMPLETE",
+        42: "VBTC_V2_BRIDGE_EXIT_TO_BTC_FAIL",
+    }
+
+    def test_no_gaps_in_the_ordinal_range(self):
+        values = sorted(Transaction.Type.values)
+        self.assertEqual(values, list(range(0, max(values) + 1)))
+
+    def test_node_ordinals_are_represented(self):
+        for ordinal in self.NODE_ORDINALS:
+            self.assertIn(
+                ordinal, Transaction.Type.values,
+                f"node ordinal {ordinal} ({self.NODE_ORDINALS[ordinal]}) missing",
+            )
+
+    def test_every_type_has_a_label(self):
+        block = make_block()
+        for ordinal in Transaction.Type.values:
+            tx = Transaction(hash=f"t-{ordinal}", block=block, type=ordinal)
+            # The fallback returns the bare ordinal as a string.
+            self.assertNotEqual(
+                tx.type_label, str(ordinal),
+                f"type {ordinal} renders as a bare ordinal",
+            )
+
+
+class UnhandledTransactionTypeTests(TestCase):
+    """Silent fallthrough is how the Base-bridge types stayed invisible: an
+    unhandled type produced no output at all, so nothing distinguished it from
+    one that was processed."""
+
+    def setUp(self):
+        self.block = make_block()
+
+    def test_unhandled_type_is_logged(self):
+        tx = make_tx(
+            self.block, "bridge-exit",
+            Transaction.Type.VBTC_BRIDGE_EXIT_TO_BTC,
+        )
+
+        with self.assertLogs(level="WARNING") as logs:
+            process_transaction(tx)
+
+        self.assertTrue(
+            any("No handler for transaction type 40" in line for line in logs.output),
+            logs.output,
+        )
+
+    def test_unknown_ordinal_is_logged(self):
+        tx = make_tx(self.block, "future-type", 99)
+
+        with self.assertLogs(level="WARNING") as logs:
+            process_transaction(tx)
+
+        self.assertTrue(
+            any("No handler for transaction type 99" in line for line in logs.output),
+            logs.output,
+        )
+
+    def test_deliberately_unindexed_type_stays_quiet(self):
+        # A plain value transfer is the most common type on chain; warning on
+        # every one of them would bury the types that actually need a handler.
+        tx = make_tx(self.block, "plain-tx", Transaction.Type.TX)
+
+        with self.assertNoLogs(level="WARNING"):
+            process_transaction(tx)
+
+
+class WithdrawCompleteExecuteRequiredFieldsTests(TestCase):
+    """Amount and BTCDestination are what the CLI falls back to when the
+    withdrawal request is not in its own DB. It reads amount 0 or an empty
+    destination as "no delegated params" and answers "withdrawal request not
+    found", so silently defaulting a missing field turned a caller's typo into
+    a failure that names nothing."""
+
+    URL = "/api/btc/vbtc-v2/withdraw/complete/execute/"
+
+    def payload(self, **overrides):
+        data = {
+            "sc_identifier": "sc:1",
+            "withdrawal_request_hash": "w-req",
+            "owner_address": "OWNER",
+            "session_id": "session-1",
+            "start_signature": "sig-start",
+            "start_timestamp": 1,
+            "share_distribution_signature": "sig-share",
+            "share_distribution_timestamp": 1,
+            "amount": "0.0001",
+            "btc_destination": "bc1p-payout",
+        }
+        data.update(overrides)
+        return {k: v for k, v in data.items() if v is not None}
+
+    def post(self, data):
+        user = User.objects.create_user(email="t@example.com", password="x")
+        request = APIRequestFactory().post(self.URL, data, format="json")
+        force_authenticate(request, user=user)
+        return VbtcV2WithdrawCompleteExecuteView.as_view()(request)
+
+    def test_missing_amount_is_rejected(self):
+        response = self.post(self.payload(amount=None))
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("amount", response.data["message"])
+
+    def test_missing_btc_destination_is_rejected(self):
+        response = self.post(self.payload(btc_destination=None))
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("btc_destination", response.data["message"])
+
+    def test_zero_amount_is_rejected(self):
+        # The CLI treats 0 as absent, so accepting it only defers the failure.
+        response = self.post(self.payload(amount=0))
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("amount", response.data["message"])
+
+
+class WithdrawalStatusRaceTests(TestCase):
+    """The FROST path runs in a thread in the web process; Type 28 and 29 are
+    indexed by the sync worker, a different process. Neither serialises against
+    the other, so a read-modify-write in either direction loses data:
+    signing-last reverts a settled withdrawal to a fund-committing status, and
+    completion-last erases the record of the signature it was completing."""
+
+    def setUp(self):
+        self.block = make_block(height=1000)
+        self.token = make_token(owner="O", global_balance="0.001")
+        self.tx = make_tx(
+            self.block, "w-req", Transaction.Type.VBTC_V2_WITHDRAWAL_REQUEST
+        )
+        self.withdrawal = add_withdrawal(
+            self.token, self.tx, "U", "0.0001",
+            VbtcV2WithdrawalRequest.Status.REQUESTED,
+        )
+
+    def completion_tx(self):
+        return make_tx(
+            self.block, "w-complete",
+            Transaction.Type.VBTC_V2_WITHDRAWAL_COMPLETE,
+            data=[{
+                "Function": "VBTCWithdrawalComplete()",
+                "ContractUID": self.token.sc_identifier,
+                "WithdrawalRequestHash": "w-req",
+                "BTCTransactionHash": "btc-txid",
+            }],
+        )
+
+    def cancel_tx(self):
+        return make_tx(
+            self.block, "w-cancel",
+            Transaction.Type.VBTC_V2_WITHDRAWAL_CANCEL,
+            data=[{
+                "Function": "VBTCWithdrawalCancel()",
+                "WithdrawalRequestHash": "w-req",
+            }],
+        )
+
+    # --- signing arrives last -------------------------------------------
+
+    def test_signing_does_not_revert_a_completed_withdrawal(self):
+        # The completion committed while the ceremony was still running.
+        process_transaction(self.completion_tx())
+
+        _mark_withdrawal_signed("w-req", "0200000001deadbeef")
+
+        self.withdrawal.refresh_from_db()
+        self.assertEqual(
+            self.withdrawal.status, VbtcV2WithdrawalRequest.Status.COMPLETED
+        )
+        # The evidence is still recorded — a signed transaction did exist.
+        self.assertEqual(self.withdrawal.signed_btc_tx_hex, "0200000001deadbeef")
+        self.assertIsNotNone(self.withdrawal.signed_at)
+
+    def test_reverted_completion_would_have_re_reserved_funds(self):
+        # Why the above matters: PENDING_BTC is fund-committing, so a revert
+        # would block the next withdrawal on a token that is actually free.
+        process_transaction(self.completion_tx())
+        self.token.refresh_from_db()
+        self.assertFalse(self.token.is_pending_withdrawal)
+
+        _mark_withdrawal_signed("w-req", "0200000001deadbeef")
+
+        self.token.refresh_from_db()
+        self.assertFalse(self.token.is_pending_withdrawal)
+
+    def test_signing_does_not_revert_a_cancelled_withdrawal(self):
+        process_transaction(self.cancel_tx())
+
+        _mark_withdrawal_signed("w-req", "0200000001deadbeef")
+
+        self.withdrawal.refresh_from_db()
+        self.assertEqual(
+            self.withdrawal.status, VbtcV2WithdrawalRequest.Status.CANCELLED
+        )
+        self.assertIsNotNone(self.withdrawal.signed_at)
+
+    # --- completion arrives last, from an instance loaded before signing --
+
+    def stale_instance(self):
+        """A model instance loaded before the FROST path commits — exactly
+        what the sync handler holds when the two overlap."""
+        return VbtcV2WithdrawalRequest.objects.get(pk=self.withdrawal.pk)
+
+    def test_completion_does_not_erase_signing_metadata(self):
+        stale = self.stale_instance()
+        _mark_withdrawal_signed("w-req", "0200000001deadbeef")
+
+        with patch.object(
+            VbtcV2WithdrawalRequest.objects, "get", return_value=stale
+        ):
+            process_transaction(self.completion_tx())
+
+        self.withdrawal.refresh_from_db()
+        self.assertEqual(
+            self.withdrawal.status, VbtcV2WithdrawalRequest.Status.COMPLETED
+        )
+        self.assertEqual(self.withdrawal.btc_transaction_hash, "btc-txid")
+        # A bare save() would have written this instance's every column,
+        # including the signed_at it was loaded without.
+        self.assertIsNotNone(self.withdrawal.signed_at)
+        self.assertEqual(self.withdrawal.signed_btc_tx_hex, "0200000001deadbeef")
+
+    def test_cancel_does_not_erase_signing_metadata(self):
+        stale = self.stale_instance()
+        _mark_withdrawal_signed("w-req", "0200000001deadbeef")
+
+        with patch.object(
+            VbtcV2WithdrawalRequest.objects, "get", return_value=stale
+        ):
+            process_transaction(self.cancel_tx())
+
+        self.withdrawal.refresh_from_db()
+        self.assertEqual(
+            self.withdrawal.status, VbtcV2WithdrawalRequest.Status.CANCELLED
+        )
+        self.assertIsNotNone(self.withdrawal.signed_at)
+        self.assertEqual(self.withdrawal.signed_btc_tx_hex, "0200000001deadbeef")
+
+    # --- the ordinary ordering still works -------------------------------
+
+    def test_signing_then_completion_settles_completed(self):
+        _mark_withdrawal_signed("w-req", "0200000001deadbeef")
+        self.withdrawal.refresh_from_db()
+        self.assertEqual(
+            self.withdrawal.status, VbtcV2WithdrawalRequest.Status.PENDING_BTC
+        )
+
+        process_transaction(self.completion_tx())
+
+        self.withdrawal.refresh_from_db()
+        self.assertEqual(
+            self.withdrawal.status, VbtcV2WithdrawalRequest.Status.COMPLETED
+        )
+        self.assertEqual(self.withdrawal.btc_transaction_hash, "btc-txid")
+        self.assertIsNotNone(self.withdrawal.signed_at)
         self.token.refresh_from_db()
         self.assertFalse(self.token.is_pending_withdrawal)

@@ -5,6 +5,8 @@ from decimal import Decimal
 from datetime import datetime
 from django.utils import timezone
 from django.core.cache import cache
+from django.db import close_old_connections
+from django.db.models import Case, F, Value, When
 from rest_framework.response import Response
 from rest_framework.generics import GenericAPIView, RetrieveAPIView
 from api.btc.constants import FALLBACK_VBTC_IMAGE_DATA
@@ -519,6 +521,73 @@ FROST_JOB_TTL = 300  # 5 minutes
 FROST_JOB_FAILED_TTL = 24 * 60 * 60
 
 
+def _mark_withdrawal_signed(withdrawal_request_hash, signed_btc_tx_hex):
+    """Record that a FROST ceremony produced a signed Bitcoin transaction.
+
+    Nothing else records this. btc_transaction_hash is only written when the
+    Type 28 completion lands, so between signing and that completion a
+    withdrawal whose Bitcoin transaction is on the wire looks exactly like one
+    that was never signed at all. That difference is the whole retry decision:
+    retrying re-runs the ceremony and can put a SECOND Bitcoin transaction on
+    the network, paying the destination twice.
+    """
+
+    rows = VbtcV2WithdrawalRequest.objects.filter(
+        request_transaction__hash=withdrawal_request_hash
+    )
+
+    try:
+        # One statement, evaluated against whatever is committed at the time
+        # the UPDATE runs. Reading the row, deciding, and saving would leave a
+        # window in which the Type 28 completion — indexed by the sync worker,
+        # a different process entirely — commits between the read and the
+        # write, and this would then overwrite COMPLETED with PENDING_BTC. That
+        # withdrawal is finished and its BTC has left, but PENDING_BTC is a
+        # fund-committing status, so it would re-reserve the amount and block
+        # the next withdrawal.
+        #
+        # The signing evidence is written unconditionally: a signed, spendable
+        # transaction exists whatever the row says about it. Only the status is
+        # conditional, and a status the chain has already settled wins.
+        updated = rows.update(
+            signed_btc_tx_hex=signed_btc_tx_hex,
+            signed_at=timezone.now(),
+            status=Case(
+                When(
+                    status__in=VbtcV2WithdrawalRequest.TERMINAL_STATUSES,
+                    then=F("status"),
+                ),
+                default=Value(VbtcV2WithdrawalRequest.Status.PENDING_BTC),
+            ),
+        )
+    except Exception as e:
+        logging.error(
+            f"Could not record FROST signing for withdrawal request "
+            f"{withdrawal_request_hash}: {e}"
+        )
+        return
+
+    if not updated:
+        # Signing succeeded for something the explorer never indexed. Loud,
+        # because the signature exists whether or not there is a row for it.
+        logging.error(
+            f"FROST signed withdrawal request {withdrawal_request_hash} but no "
+            f"indexed withdrawal matches it — a signed BTC transaction exists "
+            f"with no record in the explorer."
+        )
+        return
+
+    try:
+        withdrawal = rows.select_related("token").first()
+        withdrawal.token.recompute_pending_withdrawal()
+    except Exception as e:
+        logging.error(
+            f"Recorded FROST signing for withdrawal request "
+            f"{withdrawal_request_hash} but could not recompute the token's "
+            f"pending flag: {e}"
+        )
+
+
 class VbtcV2WithdrawCompleteExecuteView(GenericAPIView):
 
     def post(self, request, *args, **kwargs):
@@ -526,6 +595,12 @@ class VbtcV2WithdrawCompleteExecuteView(GenericAPIView):
             "sc_identifier", "withdrawal_request_hash", "owner_address",
             "session_id", "start_signature", "start_timestamp",
             "share_distribution_signature", "share_distribution_timestamp",
+            # The CLI falls back to these when the withdrawal request is not
+            # in its own DB (VBTCService.CompleteWithdrawal), and it treats
+            # amount 0 or an empty destination as "no delegated params" —
+            # so a caller that omits them gets "withdrawal request not found"
+            # rather than anything naming the field it left out.
+            "amount", "btc_destination",
         ])
         if err:
             return err
@@ -539,8 +614,10 @@ class VbtcV2WithdrawCompleteExecuteView(GenericAPIView):
             "StartSignature": request.data["start_signature"],
             "ShareDistributionTimestamp": request.data["share_distribution_timestamp"],
             "ShareDistributionSignature": request.data["share_distribution_signature"],
-            "Amount": request.data.get("amount", 0),
-            "BTCDestination": request.data.get("btc_destination", ""),
+            "Amount": request.data["amount"],
+            "BTCDestination": request.data["btc_destination"],
+            # fee_rate stays optional: the CLI substitutes its own default
+            # when this is 0 (delegatedFeeRate ?? 10).
             "FeeRate": request.data.get("fee_rate", 0),
         }
 
@@ -552,6 +629,10 @@ class VbtcV2WithdrawCompleteExecuteView(GenericAPIView):
                 result = execute_complete_withdrawal(payload)
                 success = result.get("Success", False)
                 if success:
+                    _mark_withdrawal_signed(
+                        payload["WithdrawalRequestHash"],
+                        result.get("SignedBTCTxHex") or "",
+                    )
                     _cache.set(
                         f"{FROST_JOB_PREFIX}{job_id}",
                         _json.dumps({"status": "complete", "result": result}),
@@ -580,6 +661,10 @@ class VbtcV2WithdrawCompleteExecuteView(GenericAPIView):
                     _json.dumps({"status": "failed", "message": str(e)}),
                     FROST_JOB_FAILED_TTL,
                 )
+            finally:
+                # This thread opens its own connection when the withdrawal is
+                # marked; nothing else will ever close it.
+                close_old_connections()
 
         threading.Thread(target=_run_frost, daemon=True).start()
 

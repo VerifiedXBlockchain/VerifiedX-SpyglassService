@@ -398,6 +398,40 @@ def expire_stale_withdrawals():
             )
 
 
+# Types that reach process_transaction with nothing for it to index: plain
+# value transfers, validator lifecycle, topic voting, standard (non-tokenized)
+# smart contracts, the shielded-transaction family, and legacy V1 tokenization
+# burns and withdrawals.
+#
+# Anything neither matched by a branch below nor listed here is a type nobody
+# wired up, and until now it looked exactly like a type nobody needed to —
+# which is how every Base-bridge transaction (37-42) has been passing through
+# the indexer unnoticed.
+UNINDEXED_TX_TYPES = frozenset(
+    {
+        Transaction.Type.TX,
+        Transaction.Type.NODE,
+        Transaction.Type.VOTE_TOPIC,
+        Transaction.Type.VOTE,
+        Transaction.Type.SC_MINT,
+        Transaction.Type.SC_TX,
+        Transaction.Type.SC_BURN,
+        Transaction.Type.TKNZ_BURN,
+        Transaction.Type.TKNZ_WITHDRAWAL_REQUEST,
+        Transaction.Type.TKNZ_WITHDRAWAL_COMPLETE,
+        Transaction.Type.VALIDATOR_REGISTRATION,
+        Transaction.Type.VALIDATOR_HEARTBEAT,
+        Transaction.Type.VALIDATOR_EXIT,
+        Transaction.Type.VFX_SHIELD,
+        Transaction.Type.VFX_UNSHIELD,
+        Transaction.Type.VFX_PRIVATE_TRANSFER,
+        Transaction.Type.VBTC_SHIELD,
+        Transaction.Type.VBTC_UNSHIELD,
+        Transaction.Type.VBTC_PRIVATE_TRANSFER,
+    }
+)
+
+
 def process_transaction(tx: Transaction):
     print(f"Processing TX {tx.hash}")
     if tx.type in [Transaction.Type.NFT_MINT, Transaction.Type.TKNZ_MINT, Transaction.Type.VBTC_V2_MINT]:
@@ -1125,7 +1159,19 @@ def process_transaction(tx: Transaction):
             withdrawal.btc_transaction_hash = parsed["BTCTransactionHash"]
             withdrawal.status = VbtcV2WithdrawalRequest.Status.COMPLETED
             withdrawal.completed_at = tx.date_crafted
-            withdrawal.save()
+            # update_fields, not a bare save: this instance was loaded earlier
+            # in this function, and the FROST path writes signed_at and
+            # signed_btc_tx_hex from the web process. A bare save writes every
+            # column from this instance and would erase whatever landed in
+            # between — the record of the signature this completion is for.
+            withdrawal.save(
+                update_fields=[
+                    "completion_transaction",
+                    "btc_transaction_hash",
+                    "status",
+                    "completed_at",
+                ]
+            )
 
             # Balance fields (global_balance, total_sent) are updated by the
             # periodic BTC chain sync (update_vbtc_balances), not here.
@@ -1167,12 +1213,35 @@ def process_transaction(tx: Transaction):
             )
             return
 
+        if withdrawal.signed_at:
+            # A signed Bitcoin transaction for this withdrawal already exists
+            # and may be on the network. The chain is authoritative, so the
+            # cancel still applies — but the BTC can still confirm afterwards,
+            # so this must not pass unnoticed.
+            logging.error(
+                f"VBTC_V2_WITHDRAWAL_CANCEL for withdrawal {withdrawal.pk} "
+                f"(request hash {withdrawal_request_hash}) whose BTC transaction "
+                f"was already FROST-signed at {withdrawal.signed_at} — the "
+                f"signed transaction may still confirm."
+            )
+
         withdrawal.cancel_transaction = tx
         withdrawal.status = VbtcV2WithdrawalRequest.Status.CANCELLED
         withdrawal.cancelled_at = tx.date_crafted
-        withdrawal.save()
+        # Same reason as the completion handler: a bare save from this
+        # instance would erase signing metadata written after it was loaded.
+        withdrawal.save(
+            update_fields=["cancel_transaction", "status", "cancelled_at"]
+        )
 
         withdrawal.token.recompute_pending_withdrawal()
+
+    elif tx.type not in UNINDEXED_TX_TYPES:
+        logging.warning(
+            f"No handler for transaction type {tx.type} ({tx.type_label}) on "
+            f"tx {tx.hash} — recorded but not indexed. Either add a handler or "
+            f"add the type to UNINDEXED_TX_TYPES."
+        )
 
 
 # def handle_unavailable_nft(tx: Transaction, data: dict):

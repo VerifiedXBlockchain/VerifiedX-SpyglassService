@@ -171,6 +171,7 @@ class Transaction(models.Model):
         TKNZ_WITHDRAWAL_COMPLETE = 21
         VALIDATOR_REGISTRATION = 22
         VALIDATOR_HEARTBEAT = 23
+        VALIDATOR_EXIT = 24
         VBTC_V2_MINT = 25
         VBTC_V2_TRANSFER = 26
         VBTC_V2_WITHDRAWAL_REQUEST = 27
@@ -185,6 +186,10 @@ class Transaction(models.Model):
         VBTC_PRIVATE_TRANSFER = 36
         VBTC_BRIDGE_LOCK = 37
         VBTC_BRIDGE_UNLOCK = 38
+        VBTC_BRIDGE_POOL_UNLOCK = 39
+        VBTC_BRIDGE_EXIT_TO_BTC = 40
+        VBTC_BRIDGE_EXIT_TO_BTC_COMPLETE = 41
+        VBTC_BRIDGE_EXIT_TO_BTC_FAIL = 42
 
     hash = models.CharField(_("Hash"), primary_key=True, max_length=255, db_index=True)
     block = models.ForeignKey(
@@ -262,6 +267,12 @@ class Transaction(models.Model):
             return "NFT Sale"
         if self.type == Transaction.Type.ADDRESS:
             return "Address"
+        if self.type == Transaction.Type.DST_REGISTRATION:
+            return "DST Registration"
+        if self.type == Transaction.Type.VOTE_TOPIC:
+            return "Vote Topic"
+        if self.type == Transaction.Type.VOTE:
+            return "Vote"
         if self.type == Transaction.Type.RESERVE:
             return "Reserve"
         if self.type == Transaction.Type.SC_MINT:
@@ -290,6 +301,8 @@ class Transaction(models.Model):
             return "Validator Registration"
         if self.type == Transaction.Type.VALIDATOR_HEARTBEAT:
             return "Validator Heartbeat"
+        if self.type == Transaction.Type.VALIDATOR_EXIT:
+            return "Validator Exit"
         if self.type == Transaction.Type.VBTC_V2_MINT:
             return "vBTC V2 Mint"
         if self.type == Transaction.Type.VBTC_V2_TRANSFER:
@@ -318,6 +331,14 @@ class Transaction(models.Model):
             return "vBTC Bridge Lock"
         if self.type == Transaction.Type.VBTC_BRIDGE_UNLOCK:
             return "vBTC Bridge Unlock"
+        if self.type == Transaction.Type.VBTC_BRIDGE_POOL_UNLOCK:
+            return "vBTC Bridge Pool Unlock"
+        if self.type == Transaction.Type.VBTC_BRIDGE_EXIT_TO_BTC:
+            return "vBTC Bridge Exit to BTC"
+        if self.type == Transaction.Type.VBTC_BRIDGE_EXIT_TO_BTC_COMPLETE:
+            return "vBTC Bridge Exit to BTC Complete"
+        if self.type == Transaction.Type.VBTC_BRIDGE_EXIT_TO_BTC_FAIL:
+            return "vBTC Bridge Exit to BTC Failed"
 
         return f"{self.type}"
 
@@ -1171,9 +1192,10 @@ class VbtcV2Token(models.Model):
     def recompute_pending_withdrawal(self, current_height=None):
         """Derive is_pending_withdrawal from open withdrawal requests.
 
-        The flag must stay true while ANY request is still REQUESTED —
-        setting/clearing it directly in individual tx handlers loses that
-        invariant when a token has multiple in-flight withdrawals.
+        The flag must stay true while ANY request is still open — REQUESTED or
+        PENDING_BTC, matching the CLI's HasActiveWithdrawal. Setting/clearing
+        it directly in individual tx handlers loses that invariant when a
+        token has multiple in-flight withdrawals.
 
         A request that never completes stays REQUESTED forever, but the chain
         stops treating it as blocking after WITHDRAWAL_EXPIRY_BLOCKS. Without
@@ -1188,7 +1210,7 @@ class VbtcV2Token(models.Model):
             current_height = Block.objects.aggregate(v=Max("height"))["v"] or 0
 
         pending = self.withdrawal_requests.filter(
-            status=VbtcV2WithdrawalRequest.Status.REQUESTED,
+            status__in=VbtcV2WithdrawalRequest.ACTIVE_STATUSES,
             request_transaction__height__gte=current_height
             - WITHDRAWAL_EXPIRY_BLOCKS,
         ).exists()
@@ -1233,7 +1255,7 @@ class VbtcV2Token(models.Model):
         complete, and the BTC pays out to their address, not the new owner's.
         """
         pending = self.withdrawal_requests.filter(
-            status=VbtcV2WithdrawalRequest.Status.REQUESTED,
+            status__in=VbtcV2WithdrawalRequest.ACTIVE_STATUSES,
             requestor_address=address,
         ).aggregate(total=Sum("amount"))["total"] or Decimal(0)
         return self.ledger_entries().get(address, Decimal(0)) - pending
@@ -1294,9 +1316,27 @@ class VbtcV2TokenTransfer(models.Model):
 
 class VbtcV2WithdrawalRequest(models.Model):
     class Status(models.TextChoices):
+        # Mirrors VBTCWithdrawalStatus in the CLI
+        # (ReserveBlockCore/Bitcoin/Models/VBTCContractV2.cs). `None` is
+        # omitted: it is the contract-level "no active withdrawal" state and
+        # has no meaning for a row that exists because a request was made.
         REQUESTED = "requested"
+        PENDING_BTC = "pending_btc", "Pending BTC"
         COMPLETED = "completed"
+        CANCELLATION_REQUESTED = "cancellation_requested"
         CANCELLED = "cancelled"
+
+    # Mirrors VBTCContractV2.HasActiveWithdrawal: both states still commit the
+    # contract's funds, so both must keep blocking new withdrawals and keep
+    # their amount reserved at ownership transfer.
+    ACTIVE_STATUSES = (Status.REQUESTED, Status.PENDING_BTC)
+
+    # Settled on chain. These outrank anything observed off chain and must
+    # never be walked backwards — a completed withdrawal that reverts to an
+    # ACTIVE status would re-reserve funds that have already left and block
+    # the next withdrawal. CANCELLATION_REQUESTED is deliberately absent: the
+    # validator vote has not resolved, so it is not settled either way.
+    TERMINAL_STATUSES = (Status.COMPLETED, Status.CANCELLED)
 
     token = models.ForeignKey(
         VbtcV2Token, on_delete=models.CASCADE, related_name="withdrawal_requests"
@@ -1323,8 +1363,14 @@ class VbtcV2WithdrawalRequest(models.Model):
     amount = models.DecimalField(decimal_places=16, max_digits=32)
     fee_rate = models.DecimalField(decimal_places=8, max_digits=16)
     btc_transaction_hash = models.CharField(max_length=128, blank=True)
+    # btc_transaction_hash only arrives with the Type 28 completion, so on its
+    # own it cannot tell an operator whether Bitcoin has already moved. These
+    # two record the FROST ceremony that produced a signed, broadcastable
+    # Bitcoin transaction — the point after which a retry can pay out twice.
+    signed_btc_tx_hex = models.TextField(blank=True)
+    signed_at = models.DateTimeField(blank=True, null=True)
     status = models.CharField(
-        max_length=16, choices=Status.choices, default=Status.REQUESTED
+        max_length=32, choices=Status.choices, default=Status.REQUESTED
     )
     created_at = models.DateTimeField()
     completed_at = models.DateTimeField(blank=True, null=True)

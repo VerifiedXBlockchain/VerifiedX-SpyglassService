@@ -483,6 +483,6 @@ class UnindexedMintAdmin(RbxModelAdmin):
 @admin.register(VbtcV2WithdrawalRequest)
 class VbtcV2WithdrawalRequestAdmin(RbxModelAdmin):
     search_fields = ["requestor_address", "btc_address", "btc_transaction_hash"]
-    list_display = ["token", "requestor_address", "amount", "status", "created_at", "completed_at"]
+    list_display = ["token", "requestor_address", "amount", "status", "created_at", "signed_at", "completed_at"]
     list_filter = ["status"]
     autocomplete_fields = ["token", "request_transaction", "completion_transaction"]
