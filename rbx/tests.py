@@ -18,7 +18,11 @@ from rbx.models import (
     VbtcV2WithdrawalRequest,
 )
 from rbx.chain_contract import smart_contract_from_chain
-from rbx.tasks import process_transaction, retry_unindexed_mints
+from rbx.tasks import (
+    expire_stale_withdrawals,
+    process_transaction,
+    retry_unindexed_mints,
+)
 
 
 def make_block(height=1):
@@ -610,3 +614,77 @@ class ChainContractTests(TestCase):
         self.assertIs(ff["IsS3C"], False)
         self.assertIsNone(ff["LinkedContractUID"])
         self.assertEqual(ff["DepositAddress"], "bc1p-from-chain")
+
+
+class WithdrawalExpiryTests(TestCase):
+    """The chain stops honouring an incomplete withdrawal request after
+    WITHDRAWAL_EXPIRY_BLOCKS. A flag that outlives that blocks users from
+    withdrawals the chain would accept."""
+
+    def setUp(self):
+        self.block = make_block(height=1000)
+        self.token = make_token(owner="O", global_balance="0.001")
+
+    def add_request(self, tx_hash, height, status=None):
+        block = Block.objects.filter(height=height).first() or make_block(height)
+        tx = make_tx(block, tx_hash, Transaction.Type.VBTC_V2_WITHDRAWAL_REQUEST)
+        return add_withdrawal(
+            self.token, tx, "U", "0.0001",
+            status or VbtcV2WithdrawalRequest.Status.REQUESTED,
+        )
+
+    def test_recent_request_still_blocks(self):
+        self.add_request("w-recent", 1000)
+
+        self.token.recompute_pending_withdrawal(current_height=1100)
+
+        self.token.refresh_from_db()
+        self.assertTrue(self.token.is_pending_withdrawal)
+
+    def test_request_past_the_window_stops_blocking(self):
+        self.add_request("w-old", 1000)
+        self.token.recompute_pending_withdrawal(current_height=1100)
+
+        # 361 blocks on, the chain would accept a new request.
+        self.token.recompute_pending_withdrawal(current_height=1361)
+
+        self.token.refresh_from_db()
+        self.assertFalse(self.token.is_pending_withdrawal)
+
+    def test_boundary_block_still_blocks(self):
+        self.add_request("w-edge", 1000)
+
+        self.token.recompute_pending_withdrawal(current_height=1360)
+
+        self.token.refresh_from_db()
+        self.assertTrue(self.token.is_pending_withdrawal)
+
+    def test_a_newer_request_keeps_the_flag_while_an_old_one_expires(self):
+        self.add_request("w-old", 1000)
+        self.add_request("w-new", 1300)
+
+        self.token.recompute_pending_withdrawal(current_height=1361)
+
+        self.token.refresh_from_db()
+        self.assertTrue(self.token.is_pending_withdrawal)
+
+    def test_unknown_height_leaves_the_flag_set(self):
+        # Failing toward "still pending" matches the CLI; wrongly clearing
+        # would invite a duplicate request the chain then rejects.
+        self.add_request("w-any", 1000)
+
+        self.token.recompute_pending_withdrawal(current_height=0)
+
+        self.token.refresh_from_db()
+        self.assertTrue(self.token.is_pending_withdrawal)
+
+    def test_sweep_clears_expired_flags(self):
+        self.add_request("w-old", 1000)
+        self.token.recompute_pending_withdrawal(current_height=1100)
+        self.assertTrue(self.token.is_pending_withdrawal)
+
+        make_block(height=1500)
+        expire_stale_withdrawals()
+
+        self.token.refresh_from_db()
+        self.assertFalse(self.token.is_pending_withdrawal)

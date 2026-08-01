@@ -3,7 +3,7 @@ import gzip
 import logging
 from django.db import models
 from django.utils.translation import gettext_lazy as _
-from django.db.models import Count, Sum
+from django.db.models import Count, Max, Sum
 from decimal import Decimal
 from django.conf import settings
 from shop.models import Listing
@@ -1127,6 +1127,13 @@ class VbtcTokenAmountTransfer(models.Model):
         return f"{self.token.deposit_address} => {self.address} [{self.amount}]"
 
 
+# Mirrors VBTCWithdrawalRequest.EXPIRY_BLOCKS in the CLI. Past this many
+# blocks the chain stops letting an incomplete request block new withdrawals,
+# so the explorer must stop reporting one too or the wallet and the chain
+# disagree about whether a token is free.
+WITHDRAWAL_EXPIRY_BLOCKS = 360
+
+
 class VbtcV2Token(models.Model):
     sc_identifier = models.CharField(max_length=64, db_index=True)
     nft = models.ForeignKey(Nft, on_delete=models.CASCADE)
@@ -1161,15 +1168,29 @@ class VbtcV2Token(models.Model):
             return "https://vfx-resources.s3.amazonaws.com/defaultvBTC.gif"
         return self.image_base64_url
 
-    def recompute_pending_withdrawal(self):
+    def recompute_pending_withdrawal(self, current_height=None):
         """Derive is_pending_withdrawal from open withdrawal requests.
 
         The flag must stay true while ANY request is still REQUESTED —
         setting/clearing it directly in individual tx handlers loses that
         invariant when a token has multiple in-flight withdrawals.
+
+        A request that never completes stays REQUESTED forever, but the chain
+        stops treating it as blocking after WITHDRAWAL_EXPIRY_BLOCKS. Without
+        the same cutoff here the flag pins a token permanently and the wallet
+        keeps refusing withdrawals the chain would accept.
+
+        An unknown chain height keeps every open request blocking — the same
+        direction the CLI fails toward, since wrongly clearing the flag would
+        invite a duplicate request the chain then rejects.
         """
+        if current_height is None:
+            current_height = Block.objects.aggregate(v=Max("height"))["v"] or 0
+
         pending = self.withdrawal_requests.filter(
-            status=VbtcV2WithdrawalRequest.Status.REQUESTED
+            status=VbtcV2WithdrawalRequest.Status.REQUESTED,
+            request_transaction__height__gte=current_height
+            - WITHDRAWAL_EXPIRY_BLOCKS,
         ).exists()
         if self.is_pending_withdrawal != pending:
             self.is_pending_withdrawal = pending

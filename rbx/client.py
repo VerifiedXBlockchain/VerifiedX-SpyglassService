@@ -1095,10 +1095,21 @@ def _vbtc_v2_request(method, path, payload=None, timeout=30):
             response = requests.get(url, timeout=timeout)
         else:
             response = requests.post(url, json=payload, timeout=timeout)
-        return response.json()
+        result = response.json()
     except Exception as e:
         logger.error(f"Error in vBTC V2 request {path}: {e}")
         return {"Success": False, "Message": str(e)}
+
+    # The CLI reports a refusal in the body with HTTP 200, and logs nothing of
+    # its own on several of these paths. Unless the reason is recorded here it
+    # reaches the caller once and is then gone, which leaves a failed
+    # withdrawal with no account of why it failed.
+    if isinstance(result, dict) and not result.get("Success", True):
+        logger.error(
+            f"vBTC V2 request {path} refused: {result.get('Message')}"
+        )
+
+    return result
 
 
 # MPC Ceremony (DKG)

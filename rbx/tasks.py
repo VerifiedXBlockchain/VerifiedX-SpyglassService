@@ -9,7 +9,7 @@ import gzip
 from datetime import datetime
 from decimal import Decimal
 import pytz
-from django.db.models import Q, Sum, F
+from django.db.models import Q, Sum, F, Max
 from django.db.transaction import atomic as atomic_transaction
 from django.utils import timezone
 from api.block.serializers import BlockSerializer
@@ -370,6 +370,31 @@ def retry_unindexed_mints():
             marker.last_attempted_at = timezone.now()
             marker.save(
                 update_fields=["attempts", "last_error", "last_attempted_at"]
+            )
+
+
+def expire_stale_withdrawals():
+    """Clear is_pending_withdrawal on tokens whose request has aged out.
+
+    recompute_pending_withdrawal only runs when a withdrawal transaction is
+    processed, but a request that never completes produces no further
+    transactions — so nothing revisits the token and the flag stays set long
+    after the chain stopped honouring it. This sweeps the flagged tokens as
+    the chain advances.
+    """
+
+    current_height = Block.objects.aggregate(v=Max("height"))["v"] or 0
+
+    if not current_height:
+        logging.warning("Skipping withdrawal expiry sweep: no blocks synced")
+        return
+
+    for token in VbtcV2Token.objects.filter(is_pending_withdrawal=True):
+        was_pending = token.is_pending_withdrawal
+        token.recompute_pending_withdrawal(current_height=current_height)
+        if was_pending and not token.is_pending_withdrawal:
+            logging.info(
+                f"Cleared expired withdrawal flag on {token.sc_identifier}"
             )
 
 
