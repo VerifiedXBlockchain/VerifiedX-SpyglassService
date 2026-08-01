@@ -1017,3 +1017,145 @@ class WithdrawCompleteExecuteRequiredFieldsTests(TestCase):
 
         self.assertEqual(response.status_code, 400)
         self.assertIn("amount", response.data["message"])
+
+
+class WithdrawalStatusRaceTests(TestCase):
+    """The FROST path runs in a thread in the web process; Type 28 and 29 are
+    indexed by the sync worker, a different process. Neither serialises against
+    the other, so a read-modify-write in either direction loses data:
+    signing-last reverts a settled withdrawal to a fund-committing status, and
+    completion-last erases the record of the signature it was completing."""
+
+    def setUp(self):
+        self.block = make_block(height=1000)
+        self.token = make_token(owner="O", global_balance="0.001")
+        self.tx = make_tx(
+            self.block, "w-req", Transaction.Type.VBTC_V2_WITHDRAWAL_REQUEST
+        )
+        self.withdrawal = add_withdrawal(
+            self.token, self.tx, "U", "0.0001",
+            VbtcV2WithdrawalRequest.Status.REQUESTED,
+        )
+
+    def completion_tx(self):
+        return make_tx(
+            self.block, "w-complete",
+            Transaction.Type.VBTC_V2_WITHDRAWAL_COMPLETE,
+            data=[{
+                "Function": "VBTCWithdrawalComplete()",
+                "ContractUID": self.token.sc_identifier,
+                "WithdrawalRequestHash": "w-req",
+                "BTCTransactionHash": "btc-txid",
+            }],
+        )
+
+    def cancel_tx(self):
+        return make_tx(
+            self.block, "w-cancel",
+            Transaction.Type.VBTC_V2_WITHDRAWAL_CANCEL,
+            data=[{
+                "Function": "VBTCWithdrawalCancel()",
+                "WithdrawalRequestHash": "w-req",
+            }],
+        )
+
+    # --- signing arrives last -------------------------------------------
+
+    def test_signing_does_not_revert_a_completed_withdrawal(self):
+        # The completion committed while the ceremony was still running.
+        process_transaction(self.completion_tx())
+
+        _mark_withdrawal_signed("w-req", "0200000001deadbeef")
+
+        self.withdrawal.refresh_from_db()
+        self.assertEqual(
+            self.withdrawal.status, VbtcV2WithdrawalRequest.Status.COMPLETED
+        )
+        # The evidence is still recorded — a signed transaction did exist.
+        self.assertEqual(self.withdrawal.signed_btc_tx_hex, "0200000001deadbeef")
+        self.assertIsNotNone(self.withdrawal.signed_at)
+
+    def test_reverted_completion_would_have_re_reserved_funds(self):
+        # Why the above matters: PENDING_BTC is fund-committing, so a revert
+        # would block the next withdrawal on a token that is actually free.
+        process_transaction(self.completion_tx())
+        self.token.refresh_from_db()
+        self.assertFalse(self.token.is_pending_withdrawal)
+
+        _mark_withdrawal_signed("w-req", "0200000001deadbeef")
+
+        self.token.refresh_from_db()
+        self.assertFalse(self.token.is_pending_withdrawal)
+
+    def test_signing_does_not_revert_a_cancelled_withdrawal(self):
+        process_transaction(self.cancel_tx())
+
+        _mark_withdrawal_signed("w-req", "0200000001deadbeef")
+
+        self.withdrawal.refresh_from_db()
+        self.assertEqual(
+            self.withdrawal.status, VbtcV2WithdrawalRequest.Status.CANCELLED
+        )
+        self.assertIsNotNone(self.withdrawal.signed_at)
+
+    # --- completion arrives last, from an instance loaded before signing --
+
+    def stale_instance(self):
+        """A model instance loaded before the FROST path commits — exactly
+        what the sync handler holds when the two overlap."""
+        return VbtcV2WithdrawalRequest.objects.get(pk=self.withdrawal.pk)
+
+    def test_completion_does_not_erase_signing_metadata(self):
+        stale = self.stale_instance()
+        _mark_withdrawal_signed("w-req", "0200000001deadbeef")
+
+        with patch.object(
+            VbtcV2WithdrawalRequest.objects, "get", return_value=stale
+        ):
+            process_transaction(self.completion_tx())
+
+        self.withdrawal.refresh_from_db()
+        self.assertEqual(
+            self.withdrawal.status, VbtcV2WithdrawalRequest.Status.COMPLETED
+        )
+        self.assertEqual(self.withdrawal.btc_transaction_hash, "btc-txid")
+        # A bare save() would have written this instance's every column,
+        # including the signed_at it was loaded without.
+        self.assertIsNotNone(self.withdrawal.signed_at)
+        self.assertEqual(self.withdrawal.signed_btc_tx_hex, "0200000001deadbeef")
+
+    def test_cancel_does_not_erase_signing_metadata(self):
+        stale = self.stale_instance()
+        _mark_withdrawal_signed("w-req", "0200000001deadbeef")
+
+        with patch.object(
+            VbtcV2WithdrawalRequest.objects, "get", return_value=stale
+        ):
+            process_transaction(self.cancel_tx())
+
+        self.withdrawal.refresh_from_db()
+        self.assertEqual(
+            self.withdrawal.status, VbtcV2WithdrawalRequest.Status.CANCELLED
+        )
+        self.assertIsNotNone(self.withdrawal.signed_at)
+        self.assertEqual(self.withdrawal.signed_btc_tx_hex, "0200000001deadbeef")
+
+    # --- the ordinary ordering still works -------------------------------
+
+    def test_signing_then_completion_settles_completed(self):
+        _mark_withdrawal_signed("w-req", "0200000001deadbeef")
+        self.withdrawal.refresh_from_db()
+        self.assertEqual(
+            self.withdrawal.status, VbtcV2WithdrawalRequest.Status.PENDING_BTC
+        )
+
+        process_transaction(self.completion_tx())
+
+        self.withdrawal.refresh_from_db()
+        self.assertEqual(
+            self.withdrawal.status, VbtcV2WithdrawalRequest.Status.COMPLETED
+        )
+        self.assertEqual(self.withdrawal.btc_transaction_hash, "btc-txid")
+        self.assertIsNotNone(self.withdrawal.signed_at)
+        self.token.refresh_from_db()
+        self.assertFalse(self.token.is_pending_withdrawal)

@@ -6,6 +6,7 @@ from datetime import datetime
 from django.utils import timezone
 from django.core.cache import cache
 from django.db import close_old_connections
+from django.db.models import Case, F, Value, When
 from rest_framework.response import Response
 from rest_framework.generics import GenericAPIView, RetrieveAPIView
 from api.btc.constants import FALLBACK_VBTC_IMAGE_DATA
@@ -531,11 +532,42 @@ def _mark_withdrawal_signed(withdrawal_request_hash, signed_btc_tx_hex):
     the network, paying the destination twice.
     """
 
+    rows = VbtcV2WithdrawalRequest.objects.filter(
+        request_transaction__hash=withdrawal_request_hash
+    )
+
     try:
-        withdrawal = VbtcV2WithdrawalRequest.objects.get(
-            request_transaction__hash=withdrawal_request_hash
+        # One statement, evaluated against whatever is committed at the time
+        # the UPDATE runs. Reading the row, deciding, and saving would leave a
+        # window in which the Type 28 completion — indexed by the sync worker,
+        # a different process entirely — commits between the read and the
+        # write, and this would then overwrite COMPLETED with PENDING_BTC. That
+        # withdrawal is finished and its BTC has left, but PENDING_BTC is a
+        # fund-committing status, so it would re-reserve the amount and block
+        # the next withdrawal.
+        #
+        # The signing evidence is written unconditionally: a signed, spendable
+        # transaction exists whatever the row says about it. Only the status is
+        # conditional, and a status the chain has already settled wins.
+        updated = rows.update(
+            signed_btc_tx_hex=signed_btc_tx_hex,
+            signed_at=timezone.now(),
+            status=Case(
+                When(
+                    status__in=VbtcV2WithdrawalRequest.TERMINAL_STATUSES,
+                    then=F("status"),
+                ),
+                default=Value(VbtcV2WithdrawalRequest.Status.PENDING_BTC),
+            ),
         )
-    except VbtcV2WithdrawalRequest.DoesNotExist:
+    except Exception as e:
+        logging.error(
+            f"Could not record FROST signing for withdrawal request "
+            f"{withdrawal_request_hash}: {e}"
+        )
+        return
+
+    if not updated:
         # Signing succeeded for something the explorer never indexed. Loud,
         # because the signature exists whether or not there is a row for it.
         logging.error(
@@ -544,28 +576,15 @@ def _mark_withdrawal_signed(withdrawal_request_hash, signed_btc_tx_hex):
             f"with no record in the explorer."
         )
         return
-    except Exception as e:
-        logging.error(
-            f"Could not load withdrawal {withdrawal_request_hash} to record "
-            f"FROST signing: {e}"
-        )
-        return
 
     try:
-        withdrawal.signed_btc_tx_hex = signed_btc_tx_hex
-        withdrawal.signed_at = timezone.now()
-        # Never walk a completed withdrawal backwards: the Type 28 completion
-        # is chain-confirmed and outranks anything observed here.
-        if withdrawal.status != VbtcV2WithdrawalRequest.Status.COMPLETED:
-            withdrawal.status = VbtcV2WithdrawalRequest.Status.PENDING_BTC
-        withdrawal.save(
-            update_fields=["signed_btc_tx_hex", "signed_at", "status"]
-        )
+        withdrawal = rows.select_related("token").first()
         withdrawal.token.recompute_pending_withdrawal()
     except Exception as e:
         logging.error(
-            f"Could not record FROST signing for withdrawal {withdrawal.pk} "
-            f"(request {withdrawal_request_hash}): {e}"
+            f"Recorded FROST signing for withdrawal request "
+            f"{withdrawal_request_hash} but could not recompute the token's "
+            f"pending flag: {e}"
         )
 
 

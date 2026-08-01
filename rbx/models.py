@@ -1331,6 +1331,13 @@ class VbtcV2WithdrawalRequest(models.Model):
     # their amount reserved at ownership transfer.
     ACTIVE_STATUSES = (Status.REQUESTED, Status.PENDING_BTC)
 
+    # Settled on chain. These outrank anything observed off chain and must
+    # never be walked backwards — a completed withdrawal that reverts to an
+    # ACTIVE status would re-reserve funds that have already left and block
+    # the next withdrawal. CANCELLATION_REQUESTED is deliberately absent: the
+    # validator vote has not resolved, so it is not settled either way.
+    TERMINAL_STATUSES = (Status.COMPLETED, Status.CANCELLED)
+
     token = models.ForeignKey(
         VbtcV2Token, on_delete=models.CASCADE, related_name="withdrawal_requests"
     )

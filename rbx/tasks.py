@@ -1159,7 +1159,19 @@ def process_transaction(tx: Transaction):
             withdrawal.btc_transaction_hash = parsed["BTCTransactionHash"]
             withdrawal.status = VbtcV2WithdrawalRequest.Status.COMPLETED
             withdrawal.completed_at = tx.date_crafted
-            withdrawal.save()
+            # update_fields, not a bare save: this instance was loaded earlier
+            # in this function, and the FROST path writes signed_at and
+            # signed_btc_tx_hex from the web process. A bare save writes every
+            # column from this instance and would erase whatever landed in
+            # between — the record of the signature this completion is for.
+            withdrawal.save(
+                update_fields=[
+                    "completion_transaction",
+                    "btc_transaction_hash",
+                    "status",
+                    "completed_at",
+                ]
+            )
 
             # Balance fields (global_balance, total_sent) are updated by the
             # periodic BTC chain sync (update_vbtc_balances), not here.
@@ -1216,7 +1228,11 @@ def process_transaction(tx: Transaction):
         withdrawal.cancel_transaction = tx
         withdrawal.status = VbtcV2WithdrawalRequest.Status.CANCELLED
         withdrawal.cancelled_at = tx.date_crafted
-        withdrawal.save()
+        # Same reason as the completion handler: a bare save from this
+        # instance would erase signing metadata written after it was loaded.
+        withdrawal.save(
+            update_fields=["cancel_transaction", "status", "cancelled_at"]
+        )
 
         withdrawal.token.recompute_pending_withdrawal()
 
