@@ -171,6 +171,7 @@ class Transaction(models.Model):
         TKNZ_WITHDRAWAL_COMPLETE = 21
         VALIDATOR_REGISTRATION = 22
         VALIDATOR_HEARTBEAT = 23
+        VALIDATOR_EXIT = 24
         VBTC_V2_MINT = 25
         VBTC_V2_TRANSFER = 26
         VBTC_V2_WITHDRAWAL_REQUEST = 27
@@ -185,6 +186,10 @@ class Transaction(models.Model):
         VBTC_PRIVATE_TRANSFER = 36
         VBTC_BRIDGE_LOCK = 37
         VBTC_BRIDGE_UNLOCK = 38
+        VBTC_BRIDGE_POOL_UNLOCK = 39
+        VBTC_BRIDGE_EXIT_TO_BTC = 40
+        VBTC_BRIDGE_EXIT_TO_BTC_COMPLETE = 41
+        VBTC_BRIDGE_EXIT_TO_BTC_FAIL = 42
 
     hash = models.CharField(_("Hash"), primary_key=True, max_length=255, db_index=True)
     block = models.ForeignKey(
@@ -262,6 +267,12 @@ class Transaction(models.Model):
             return "NFT Sale"
         if self.type == Transaction.Type.ADDRESS:
             return "Address"
+        if self.type == Transaction.Type.DST_REGISTRATION:
+            return "DST Registration"
+        if self.type == Transaction.Type.VOTE_TOPIC:
+            return "Vote Topic"
+        if self.type == Transaction.Type.VOTE:
+            return "Vote"
         if self.type == Transaction.Type.RESERVE:
             return "Reserve"
         if self.type == Transaction.Type.SC_MINT:
@@ -290,6 +301,8 @@ class Transaction(models.Model):
             return "Validator Registration"
         if self.type == Transaction.Type.VALIDATOR_HEARTBEAT:
             return "Validator Heartbeat"
+        if self.type == Transaction.Type.VALIDATOR_EXIT:
+            return "Validator Exit"
         if self.type == Transaction.Type.VBTC_V2_MINT:
             return "vBTC V2 Mint"
         if self.type == Transaction.Type.VBTC_V2_TRANSFER:
@@ -318,6 +331,14 @@ class Transaction(models.Model):
             return "vBTC Bridge Lock"
         if self.type == Transaction.Type.VBTC_BRIDGE_UNLOCK:
             return "vBTC Bridge Unlock"
+        if self.type == Transaction.Type.VBTC_BRIDGE_POOL_UNLOCK:
+            return "vBTC Bridge Pool Unlock"
+        if self.type == Transaction.Type.VBTC_BRIDGE_EXIT_TO_BTC:
+            return "vBTC Bridge Exit to BTC"
+        if self.type == Transaction.Type.VBTC_BRIDGE_EXIT_TO_BTC_COMPLETE:
+            return "vBTC Bridge Exit to BTC Complete"
+        if self.type == Transaction.Type.VBTC_BRIDGE_EXIT_TO_BTC_FAIL:
+            return "vBTC Bridge Exit to BTC Failed"
 
         return f"{self.type}"
 

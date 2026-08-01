@@ -398,6 +398,40 @@ def expire_stale_withdrawals():
             )
 
 
+# Types that reach process_transaction with nothing for it to index: plain
+# value transfers, validator lifecycle, topic voting, standard (non-tokenized)
+# smart contracts, the shielded-transaction family, and legacy V1 tokenization
+# burns and withdrawals.
+#
+# Anything neither matched by a branch below nor listed here is a type nobody
+# wired up, and until now it looked exactly like a type nobody needed to —
+# which is how every Base-bridge transaction (37-42) has been passing through
+# the indexer unnoticed.
+UNINDEXED_TX_TYPES = frozenset(
+    {
+        Transaction.Type.TX,
+        Transaction.Type.NODE,
+        Transaction.Type.VOTE_TOPIC,
+        Transaction.Type.VOTE,
+        Transaction.Type.SC_MINT,
+        Transaction.Type.SC_TX,
+        Transaction.Type.SC_BURN,
+        Transaction.Type.TKNZ_BURN,
+        Transaction.Type.TKNZ_WITHDRAWAL_REQUEST,
+        Transaction.Type.TKNZ_WITHDRAWAL_COMPLETE,
+        Transaction.Type.VALIDATOR_REGISTRATION,
+        Transaction.Type.VALIDATOR_HEARTBEAT,
+        Transaction.Type.VALIDATOR_EXIT,
+        Transaction.Type.VFX_SHIELD,
+        Transaction.Type.VFX_UNSHIELD,
+        Transaction.Type.VFX_PRIVATE_TRANSFER,
+        Transaction.Type.VBTC_SHIELD,
+        Transaction.Type.VBTC_UNSHIELD,
+        Transaction.Type.VBTC_PRIVATE_TRANSFER,
+    }
+)
+
+
 def process_transaction(tx: Transaction):
     print(f"Processing TX {tx.hash}")
     if tx.type in [Transaction.Type.NFT_MINT, Transaction.Type.TKNZ_MINT, Transaction.Type.VBTC_V2_MINT]:
@@ -1185,6 +1219,13 @@ def process_transaction(tx: Transaction):
         withdrawal.save()
 
         withdrawal.token.recompute_pending_withdrawal()
+
+    elif tx.type not in UNINDEXED_TX_TYPES:
+        logging.warning(
+            f"No handler for transaction type {tx.type} ({tx.type_label}) on "
+            f"tx {tx.hash} — recorded but not indexed. Either add a handler or "
+            f"add the type to UNINDEXED_TX_TYPES."
+        )
 
 
 # def handle_unavailable_nft(tx: Transaction, data: dict):

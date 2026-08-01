@@ -812,3 +812,82 @@ class PendingBtcWithdrawalTests(TestCase):
         self.assertEqual(
             self.withdrawal.status, VbtcV2WithdrawalRequest.Status.CANCELLED
         )
+
+
+class TransactionTypeCoverageTests(TestCase):
+    """Transaction.Type mirrors TransactionType in the node
+    (ReserveBlockCore/Models/Transaction.cs), which uses implicit positional
+    ordinals. A member missing here is not a cosmetic gap: the dispatch chain
+    never matches it and the explorer shows a bare ordinal for it."""
+
+    # ordinal -> the node's enum member at that position
+    NODE_ORDINALS = {
+        24: "VBTC_V2_VALIDATOR_EXIT",
+        39: "VBTC_V2_BRIDGE_POOL_UNLOCK",
+        40: "VBTC_V2_BRIDGE_EXIT_TO_BTC",
+        41: "VBTC_V2_BRIDGE_EXIT_TO_BTC_COMPLETE",
+        42: "VBTC_V2_BRIDGE_EXIT_TO_BTC_FAIL",
+    }
+
+    def test_no_gaps_in_the_ordinal_range(self):
+        values = sorted(Transaction.Type.values)
+        self.assertEqual(values, list(range(0, max(values) + 1)))
+
+    def test_node_ordinals_are_represented(self):
+        for ordinal in self.NODE_ORDINALS:
+            self.assertIn(
+                ordinal, Transaction.Type.values,
+                f"node ordinal {ordinal} ({self.NODE_ORDINALS[ordinal]}) missing",
+            )
+
+    def test_every_type_has_a_label(self):
+        block = make_block()
+        for ordinal in Transaction.Type.values:
+            tx = Transaction(hash=f"t-{ordinal}", block=block, type=ordinal)
+            # The fallback returns the bare ordinal as a string.
+            self.assertNotEqual(
+                tx.type_label, str(ordinal),
+                f"type {ordinal} renders as a bare ordinal",
+            )
+
+
+class UnhandledTransactionTypeTests(TestCase):
+    """Silent fallthrough is how the Base-bridge types stayed invisible: an
+    unhandled type produced no output at all, so nothing distinguished it from
+    one that was processed."""
+
+    def setUp(self):
+        self.block = make_block()
+
+    def test_unhandled_type_is_logged(self):
+        tx = make_tx(
+            self.block, "bridge-exit",
+            Transaction.Type.VBTC_BRIDGE_EXIT_TO_BTC,
+        )
+
+        with self.assertLogs(level="WARNING") as logs:
+            process_transaction(tx)
+
+        self.assertTrue(
+            any("No handler for transaction type 40" in line for line in logs.output),
+            logs.output,
+        )
+
+    def test_unknown_ordinal_is_logged(self):
+        tx = make_tx(self.block, "future-type", 99)
+
+        with self.assertLogs(level="WARNING") as logs:
+            process_transaction(tx)
+
+        self.assertTrue(
+            any("No handler for transaction type 99" in line for line in logs.output),
+            logs.output,
+        )
+
+    def test_deliberately_unindexed_type_stays_quiet(self):
+        # A plain value transfer is the most common type on chain; warning on
+        # every one of them would bury the types that actually need a handler.
+        tx = make_tx(self.block, "plain-tx", Transaction.Type.TX)
+
+        with self.assertNoLogs(level="WARNING"):
+            process_transaction(tx)
