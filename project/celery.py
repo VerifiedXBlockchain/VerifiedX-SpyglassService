@@ -33,6 +33,9 @@ def setup_periodic_tasks(sender, **kwargs):
     sender.add_periodic_task(
         15 * 60, retry_unindexed_mints.s(), name="Retry Unindexed Mints"
     )
+    sender.add_periodic_task(
+        10 * 60, expire_stale_withdrawals.s(), name="Expire Stale Withdrawals"
+    )
 
     if settings.HEALTH_CHECK_ENABLED:
         sender.add_periodic_task(3 * 60, health_check.s(), name="Health Check")
@@ -107,6 +110,13 @@ def retry_unindexed_mints():
     from django.core import management
 
     management.call_command("retry_unindexed_mints")
+
+
+@app.task
+def expire_stale_withdrawals():
+    from django.core import management
+
+    management.call_command("expire_stale_withdrawals")
 
 
 @app.task(queue="vbtc_queue")

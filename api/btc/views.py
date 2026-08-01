@@ -1,3 +1,4 @@
+import logging
 import time
 import requests
 from decimal import Decimal
@@ -511,6 +512,11 @@ from django.core.cache import cache as _cache
 
 FROST_JOB_PREFIX = "frost_job:"
 FROST_JOB_TTL = 300  # 5 minutes
+# A failed ceremony's message is the only account of why a withdrawal did not
+# go through — the CLI does not log its own refusals on this path. Outliving
+# the polling client by a wide margin is what makes the failure diagnosable
+# after the user reports it rather than only while they are still waiting.
+FROST_JOB_FAILED_TTL = 24 * 60 * 60
 
 
 class VbtcV2WithdrawCompleteExecuteView(GenericAPIView):
@@ -552,16 +558,27 @@ class VbtcV2WithdrawCompleteExecuteView(GenericAPIView):
                         FROST_JOB_TTL,
                     )
                 else:
+                    message = result.get("Message", "FROST signing failed")
+                    logging.error(
+                        f"FROST job {job_id} failed for "
+                        f"{payload['SmartContractUID']} "
+                        f"(request {payload['WithdrawalRequestHash']}): {message}"
+                    )
                     _cache.set(
                         f"{FROST_JOB_PREFIX}{job_id}",
-                        _json.dumps({"status": "failed", "message": result.get("Message", "FROST signing failed")}),
-                        FROST_JOB_TTL,
+                        _json.dumps({"status": "failed", "message": message}),
+                        FROST_JOB_FAILED_TTL,
                     )
             except Exception as e:
+                logging.error(
+                    f"FROST job {job_id} raised for "
+                    f"{payload['SmartContractUID']} "
+                    f"(request {payload['WithdrawalRequestHash']}): {e}"
+                )
                 _cache.set(
                     f"{FROST_JOB_PREFIX}{job_id}",
                     _json.dumps({"status": "failed", "message": str(e)}),
-                    FROST_JOB_TTL,
+                    FROST_JOB_FAILED_TTL,
                 )
 
         threading.Thread(target=_run_frost, daemon=True).start()
@@ -589,9 +606,13 @@ class VbtcV2WithdrawCompleteStatusView(GenericAPIView):
         if job["status"] == "pending":
             return Response({"success": True, "status": "pending"})
 
+        # Neither terminal state is deleted on read. Deleting turned a second
+        # poll into a 404 the client could not tell apart from an expired or
+        # bogus job — it hid the failure reason after a single read, and on
+        # success it could strand a signed BTC transaction the caller never
+        # managed to receive. Both now stand until their TTL.
         if job["status"] == "complete":
             result = job["result"]
-            _cache.delete(f"{FROST_JOB_PREFIX}{job_id}")
             return Response({
                 "success": True,
                 "status": "complete",
@@ -601,7 +622,6 @@ class VbtcV2WithdrawCompleteStatusView(GenericAPIView):
             })
 
         # failed
-        _cache.delete(f"{FROST_JOB_PREFIX}{job_id}")
         return Response(
             {"success": False, "status": "failed", "message": job.get("message", "FROST signing failed")},
             status=500,

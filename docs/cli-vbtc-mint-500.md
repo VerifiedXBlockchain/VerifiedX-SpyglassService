@@ -14,29 +14,45 @@ System.NullReferenceException: Object reference not set to an instance of an obj
       in /home/ubuntu/vfx-cli/Res…
 ```
 
-So nothing is lost on the node — `GenerateSmartContractInMemory` just cannot parse these four contract texts. There appear to be **two distinct triggers**, one per pair.
+So nothing is lost on the node — `GenerateSmartContractInMemory` just cannot parse these four contract texts. There are **two distinct triggers**, one per pair, and they need two separate fixes:
 
-## Trigger 1 — the 2026-05-27 pair: `SCVersion` declared with no value
+| Pair | Trigger | Status |
+|---|---|---|
+| 2026-07-31 | Trillium rejects a digit in a method name (`GetIsS3C()`) | Root cause found by Aaron, confirmed against all 25 contracts |
+| 2026-05-27 | `let SCVersion = ` emitted with no value | Still open — **not** covered by the method-name fix |
 
-Both May contracts carry 15 `let` declarations where every working contract has 16. The missing one is `SCVersion`, which is emitted as a bare:
+## Trigger 2 — the 2026-07-31 pair: digit in a method name — CONFIRMED
+
+Aaron identified this: Trillium does not accept a digit in a method name, and the newer contract template emits `GetIsS3C()`.
+
+Checked against all 25 mainnet V2 contracts, and it holds exactly:
+
+- `GetIsS3C` is the **only** method name containing a digit anywhere in the set.
+- It appears in exactly the two contracts that fail from 2026-07-31.
+- The other 23 contracts have no digit-bearing method name, and 21 of them serve fine.
+
+Both July contracts have 15 functions where all working ones have 13; the two extra are `GetIsS3C()` and `GetLinkedContractUID()`. Only the first carries a digit.
+
+This is the trigger that matters going forward: it is a template-version issue, not a one-off, so **every future mint from the newer client hits it** until the fix ships. The two on 2026-07-31 were 8 minutes apart and both failed.
+
+## Trigger 1 — the 2026-05-27 pair: a SEPARATE bug, not fixed by the above
+
+The digit theory does **not** cover the May pair, and this is worth flagging before the Trillium fix is called done:
+
+- Both May contracts have 13 functions, same as every working contract.
+- Neither has any method name containing a digit.
+- Both still return HTTP 500 today.
+
+Their distinguishing feature is a `let` declaration emitted with no value at all:
 
 ```
 let SCVersion = 
 let FileSize = "0"
 ```
 
-Every one of the 21 working contracts has `let SCVersion = 1`. An empty value here is a good candidate for the null deref.
+They carry 15 `let` declarations where every working contract has 16 — `SCVersion` is blank, where all 21 working contracts have `let SCVersion = 1`. That empty value is the remaining candidate for the null deref on those two.
 
-## Trigger 2 — the 2026-07-31 pair: newer contract template
-
-Both of today's contracts have **15 functions where all 21 working ones have 13**. The two extra are:
-
-```
-function GetIsS3C() : string          { var isS3C = "false" }
-function GetLinkedContractUID()       { var linkedContractUID = "" }
-```
-
-No working contract on mainnet has either. This looks like a **version skew**: whatever minted these emits a newer contract template (S3C / linked-contract support) than the deployed node knows how to parse. If so, every new mint from that client will keep failing until the node is upgraded — the two today were 8 minutes apart and both failed.
+**So there are two distinct fixes needed.** Shipping only the method-name fix will leave `672076ec…` and `847c505e…` still unreadable.
 
 ## The four affected contracts
 
