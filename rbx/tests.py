@@ -433,6 +433,69 @@ class UnindexedMintTests(TestCase):
         self.assertFalse(VbtcV2Token.objects.exists())
 
 
+class MedialessMintTests(TestCase):
+    """VBTCDefaultAssetOnly contracts carry no media; the CLI may omit
+    SmartContractAsset entirely or serve it as null. Either way the mint
+    must still index — an unguarded subscript here raises inside the
+    per-transaction savepoint and rolls back the Transaction row itself,
+    so the token silently never appears."""
+
+    def setUp(self):
+        self.block = make_block(height=15)
+        self.tx = make_tx(
+            self.block,
+            "medialess-mint-tx",
+            Transaction.Type.VBTC_V2_MINT,
+            from_address="MINTER",
+            data=[{"Function": "Mint()", "ContractUID": "medialess-sc:1"}],
+        )
+
+    def payload(self, asset="omit"):
+        main = {
+            "Name": "Media-less vBTC",
+            "Description": "",
+            "MinterName": "MINTER",
+            "IsPublished": True,
+            "Features": [
+                {
+                    "FeatureName": 14,
+                    "FeatureFeatures": {
+                        "DepositAddress": "bc1p-medialess",
+                        "FrostGroupPublicKey": "03ab",
+                        "RequiredThreshold": 51,
+                        "ProofBlockHeight": 42,
+                    },
+                }
+            ],
+        }
+        if asset is None:
+            main["SmartContractAsset"] = None
+        return {"SmartContractMain": main}
+
+    def test_mint_with_omitted_asset_still_indexes(self):
+        with patch("rbx.tasks.get_nft", return_value=self.payload()):
+            process_transaction(self.tx)
+
+        nft = Nft.objects.get(identifier="medialess-sc:1")
+        self.assertEqual(nft.primary_asset_name, "")
+        self.assertEqual(nft.primary_asset_size, 0)
+
+        token = VbtcV2Token.objects.get(sc_identifier="medialess-sc:1")
+        self.assertEqual(token.image_base64, "default")
+        self.assertEqual(token.deposit_address, "bc1p-medialess")
+
+    def test_mint_with_null_asset_still_indexes(self):
+        with patch("rbx.tasks.get_nft", return_value=self.payload(asset=None)):
+            process_transaction(self.tx)
+
+        nft = Nft.objects.get(identifier="medialess-sc:1")
+        self.assertEqual(nft.primary_asset_name, "")
+        self.assertEqual(nft.primary_asset_size, 0)
+        self.assertTrue(
+            VbtcV2Token.objects.filter(sc_identifier="medialess-sc:1").exists()
+        )
+
+
 class ChainContractTests(TestCase):
     """A V2 mint carries its whole contract on chain, so the explorer can
     index it even when the CLI refuses to serve the contract."""

@@ -530,8 +530,11 @@ def process_transaction(tx: Transaction):
         description = smart_contract_data["Description"]
         minter_name = smart_contract_data["MinterName"]
         is_published = smart_contract_data["IsPublished"]
-        primary_asset_name = smart_contract_data["SmartContractAsset"]["Name"]
-        primary_asset_size = smart_contract_data["SmartContractAsset"]["FileSize"]
+        # Media-less contracts (vBTC V2 with VBTCDefaultAssetOnly) may omit
+        # SmartContractAsset entirely or carry it as null.
+        primary_asset = smart_contract_data.get("SmartContractAsset") or {}
+        primary_asset_name = primary_asset.get("Name") or ""
+        primary_asset_size = primary_asset.get("FileSize") or 0
 
         try:
             nft = Nft.objects.get(identifier=identifier)
