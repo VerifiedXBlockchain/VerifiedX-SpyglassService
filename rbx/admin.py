@@ -26,6 +26,7 @@ from rbx.models import (
     VbtcTokenAmountTransfer,
     VbtcV2Token,
     VbtcV2TokenTransfer,
+    UnindexedMint,
     VbtcV2WithdrawalRequest,
 )
 from django.contrib.admin.utils import model_ngettext
@@ -465,9 +466,23 @@ class VbtcV2TokenTransferAdmin(RbxModelAdmin):
     autocomplete_fields = ["token", "transaction"]
 
 
+@admin.register(UnindexedMint)
+class UnindexedMintAdmin(RbxModelAdmin):
+    search_fields = ["sc_identifier"]
+    list_display = [
+        "sc_identifier",
+        "status",
+        "attempts",
+        "first_seen_at",
+        "last_attempted_at",
+    ]
+    list_filter = ["status"]
+    autocomplete_fields = ["transaction"]
+
+
 @admin.register(VbtcV2WithdrawalRequest)
 class VbtcV2WithdrawalRequestAdmin(RbxModelAdmin):
     search_fields = ["requestor_address", "btc_address", "btc_transaction_hash"]
-    list_display = ["token", "requestor_address", "amount", "status", "created_at", "completed_at"]
+    list_display = ["token", "requestor_address", "amount", "status", "created_at", "signed_at", "completed_at"]
     list_filter = ["status"]
     autocomplete_fields = ["token", "request_transaction", "completion_transaction"]

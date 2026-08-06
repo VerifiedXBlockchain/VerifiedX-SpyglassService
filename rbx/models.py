@@ -1,8 +1,9 @@
 import base64
 import gzip
+import logging
 from django.db import models
 from django.utils.translation import gettext_lazy as _
-from django.db.models import Count, Sum
+from django.db.models import Count, Max, Sum
 from decimal import Decimal
 from django.conf import settings
 from shop.models import Listing
@@ -21,7 +22,7 @@ from django.contrib.postgres.fields import ArrayField
 class MasterNode(models.Model):
     address = models.CharField(_("Address"), primary_key=True, max_length=255)
     name = models.CharField(_("Name"), max_length=255, blank=True, null=True)
-    is_active = models.BooleanField(_("Active"), default=True)
+    is_active = models.BooleanField(_("Active"), default=True, db_index=True)
     connection_id = models.TextField(_("Connection ID"), blank=True)
     ip_address = models.CharField(
         _("IP Address"), max_length=255, blank=True, null=True
@@ -29,7 +30,7 @@ class MasterNode(models.Model):
     wallet_version = models.CharField(
         _("Wallet Version"), max_length=255, blank=True, null=True
     )
-    date_connected = models.DateTimeField(_("Date Connected"))
+    date_connected = models.DateTimeField(_("Date Connected"), db_index=True)
 
     city = models.CharField(_("City"), max_length=255, blank=True, null=True)
     region = models.CharField(_("Region"), max_length=255, blank=True, null=True)
@@ -127,7 +128,7 @@ class Block(models.Model):
     size = models.IntegerField(_("Size"), default=0)
 
     craft_time = models.IntegerField(_("Craft Time"), default=0)
-    date_crafted = models.DateTimeField(_("Date Crafted"))
+    date_crafted = models.DateTimeField(_("Date Crafted"), db_index=True)
 
     objects = BlockManager()
 
@@ -166,10 +167,29 @@ class Transaction(models.Model):
         TKNZ_MINT = 17
         TKNZ_TX = 18
         TKNZ_BURN = 19
+        TKNZ_WITHDRAWAL_REQUEST = 20
+        TKNZ_WITHDRAWAL_COMPLETE = 21
+        VALIDATOR_REGISTRATION = 22
+        VALIDATOR_HEARTBEAT = 23
+        VALIDATOR_EXIT = 24
         VBTC_V2_MINT = 25
         VBTC_V2_TRANSFER = 26
         VBTC_V2_WITHDRAWAL_REQUEST = 27
         VBTC_V2_WITHDRAWAL_COMPLETE = 28
+        VBTC_V2_WITHDRAWAL_CANCEL = 29
+        VBTC_V2_WITHDRAWAL_VOTE = 30
+        VFX_SHIELD = 31
+        VFX_UNSHIELD = 32
+        VFX_PRIVATE_TRANSFER = 33
+        VBTC_SHIELD = 34
+        VBTC_UNSHIELD = 35
+        VBTC_PRIVATE_TRANSFER = 36
+        VBTC_BRIDGE_LOCK = 37
+        VBTC_BRIDGE_UNLOCK = 38
+        VBTC_BRIDGE_POOL_UNLOCK = 39
+        VBTC_BRIDGE_EXIT_TO_BTC = 40
+        VBTC_BRIDGE_EXIT_TO_BTC_COMPLETE = 41
+        VBTC_BRIDGE_EXIT_TO_BTC_FAIL = 42
 
     hash = models.CharField(_("Hash"), primary_key=True, max_length=255, db_index=True)
     block = models.ForeignKey(
@@ -179,7 +199,7 @@ class Transaction(models.Model):
         on_delete=models.CASCADE,
     )
     height = models.IntegerField(_("Height"))
-    type = models.IntegerField(_("Type"), choices=Type.choices)
+    type = models.IntegerField(_("Type"), choices=Type.choices, db_index=True)
 
     to_address = models.CharField(_("To Address"), max_length=255, db_index=True)
     from_address = models.CharField(_("From Address"), max_length=255, db_index=True)
@@ -196,7 +216,7 @@ class Transaction(models.Model):
         _("Validator Signature"), max_length=255, blank=True, null=True
     )
 
-    date_crafted = models.DateTimeField(_("Date Crafted"))
+    date_crafted = models.DateTimeField(_("Date Crafted"), db_index=True)
     nft = models.ForeignKey("Nft", blank=True, null=True, on_delete=models.SET_NULL)
 
     unlock_time = models.DateTimeField(_("Unlock Time"), blank=True, null=True)
@@ -247,6 +267,12 @@ class Transaction(models.Model):
             return "NFT Sale"
         if self.type == Transaction.Type.ADDRESS:
             return "Address"
+        if self.type == Transaction.Type.DST_REGISTRATION:
+            return "DST Registration"
+        if self.type == Transaction.Type.VOTE_TOPIC:
+            return "Vote Topic"
+        if self.type == Transaction.Type.VOTE:
+            return "Vote"
         if self.type == Transaction.Type.RESERVE:
             return "Reserve"
         if self.type == Transaction.Type.SC_MINT:
@@ -267,6 +293,16 @@ class Transaction(models.Model):
             return "Tokenization Tx"
         if self.type == Transaction.Type.TKNZ_BURN:
             return "Tokenization Burn"
+        if self.type == Transaction.Type.TKNZ_WITHDRAWAL_REQUEST:
+            return "Tokenization Withdrawal Request"
+        if self.type == Transaction.Type.TKNZ_WITHDRAWAL_COMPLETE:
+            return "Tokenization Withdrawal Complete"
+        if self.type == Transaction.Type.VALIDATOR_REGISTRATION:
+            return "Validator Registration"
+        if self.type == Transaction.Type.VALIDATOR_HEARTBEAT:
+            return "Validator Heartbeat"
+        if self.type == Transaction.Type.VALIDATOR_EXIT:
+            return "Validator Exit"
         if self.type == Transaction.Type.VBTC_V2_MINT:
             return "vBTC V2 Mint"
         if self.type == Transaction.Type.VBTC_V2_TRANSFER:
@@ -275,6 +311,34 @@ class Transaction(models.Model):
             return "vBTC V2 Withdrawal Request"
         if self.type == Transaction.Type.VBTC_V2_WITHDRAWAL_COMPLETE:
             return "vBTC V2 Withdrawal Complete"
+        if self.type == Transaction.Type.VBTC_V2_WITHDRAWAL_CANCEL:
+            return "vBTC Withdrawal Cancel"
+        if self.type == Transaction.Type.VBTC_V2_WITHDRAWAL_VOTE:
+            return "vBTC Withdrawal Vote"
+        if self.type == Transaction.Type.VFX_SHIELD:
+            return "VFX Shield"
+        if self.type == Transaction.Type.VFX_UNSHIELD:
+            return "VFX Unshield"
+        if self.type == Transaction.Type.VFX_PRIVATE_TRANSFER:
+            return "VFX Private Transfer"
+        if self.type == Transaction.Type.VBTC_SHIELD:
+            return "vBTC Shield"
+        if self.type == Transaction.Type.VBTC_UNSHIELD:
+            return "vBTC Unshield"
+        if self.type == Transaction.Type.VBTC_PRIVATE_TRANSFER:
+            return "vBTC Private Transfer"
+        if self.type == Transaction.Type.VBTC_BRIDGE_LOCK:
+            return "vBTC Bridge Lock"
+        if self.type == Transaction.Type.VBTC_BRIDGE_UNLOCK:
+            return "vBTC Bridge Unlock"
+        if self.type == Transaction.Type.VBTC_BRIDGE_POOL_UNLOCK:
+            return "vBTC Bridge Pool Unlock"
+        if self.type == Transaction.Type.VBTC_BRIDGE_EXIT_TO_BTC:
+            return "vBTC Bridge Exit to BTC"
+        if self.type == Transaction.Type.VBTC_BRIDGE_EXIT_TO_BTC_COMPLETE:
+            return "vBTC Bridge Exit to BTC Complete"
+        if self.type == Transaction.Type.VBTC_BRIDGE_EXIT_TO_BTC_FAIL:
+            return "vBTC Bridge Exit to BTC Failed"
 
         return f"{self.type}"
 
@@ -289,8 +353,8 @@ class Nft(models.Model):
     name = models.CharField(max_length=255)
     description = models.TextField(blank=True)
 
-    minter_address = models.CharField(max_length=64)
-    owner_address = models.CharField(max_length=64)
+    minter_address = models.CharField(max_length=64, db_index=True)
+    owner_address = models.CharField(max_length=64, db_index=True)
 
     minter_name = models.CharField(max_length=255)
     primary_asset_name = models.CharField(max_length=255)
@@ -787,8 +851,8 @@ class NetworkMetrics(SingletonModel):
 
 
 class Callback(models.Model):
-    to_address = models.CharField(max_length=64)
-    from_address = models.CharField(max_length=64)
+    to_address = models.CharField(max_length=64, db_index=True)
+    from_address = models.CharField(max_length=64, db_index=True)
     amount = models.DecimalField(decimal_places=16, max_digits=32)
     transaction = models.ForeignKey(
         Transaction, related_name="callbacks", on_delete=models.CASCADE
@@ -804,8 +868,8 @@ class Callback(models.Model):
 
 
 class Recovery(models.Model):
-    original_address = models.CharField(max_length=64)
-    new_address = models.CharField(max_length=64)
+    original_address = models.CharField(max_length=64, db_index=True)
+    new_address = models.CharField(max_length=64, db_index=True)
     amount = models.DecimalField(decimal_places=16, max_digits=32, default=0)
     transaction = models.ForeignKey(
         Transaction, related_name="recoveries", on_delete=models.CASCADE
@@ -953,8 +1017,8 @@ class FungibleTokenTx(models.Model):
     sc_identifier = models.CharField(max_length=64)
     token = models.ForeignKey(FungibleToken, on_delete=models.CASCADE)
 
-    receiving_address = models.CharField(max_length=64, blank=True, null=True)
-    sending_address = models.CharField(max_length=64, blank=True, null=True)
+    receiving_address = models.CharField(max_length=64, blank=True, null=True, db_index=True)
+    sending_address = models.CharField(max_length=64, blank=True, null=True, db_index=True)
     amount = models.DecimalField(decimal_places=16, max_digits=32)
 
     def __str__(self):
@@ -1018,11 +1082,11 @@ class TokenVoteTopicVote(models.Model):
 
 
 class VbtcToken(models.Model):
-    sc_identifier = models.CharField(max_length=64)
+    sc_identifier = models.CharField(max_length=64, db_index=True)
     nft = models.ForeignKey(Nft, on_delete=models.CASCADE)
     name = models.CharField(max_length=64, blank=True)
     description = models.TextField(blank=True)
-    owner_address = models.CharField(max_length=64)
+    owner_address = models.CharField(max_length=64, db_index=True)
     image_base64 = models.TextField()
     image_base64_url = models.URLField(blank=True, null=True)
     deposit_address = models.CharField(max_length=64)
@@ -1075,7 +1139,7 @@ class VbtcTokenAmountTransfer(models.Model):
 
     token = models.ForeignKey(VbtcToken, on_delete=models.CASCADE)
     transaction = models.ForeignKey(Transaction, on_delete=models.CASCADE)
-    address = models.CharField(max_length=64)
+    address = models.CharField(max_length=64, db_index=True)
     amount = models.DecimalField(decimal_places=16, max_digits=32)
     is_multi = models.BooleanField(default=False)
     created_at = models.DateTimeField()
@@ -1084,12 +1148,19 @@ class VbtcTokenAmountTransfer(models.Model):
         return f"{self.token.deposit_address} => {self.address} [{self.amount}]"
 
 
+# Mirrors VBTCWithdrawalRequest.EXPIRY_BLOCKS in the CLI. Past this many
+# blocks the chain stops letting an incomplete request block new withdrawals,
+# so the explorer must stop reporting one too or the wallet and the chain
+# disagree about whether a token is free.
+WITHDRAWAL_EXPIRY_BLOCKS = 360
+
+
 class VbtcV2Token(models.Model):
-    sc_identifier = models.CharField(max_length=64)
+    sc_identifier = models.CharField(max_length=64, db_index=True)
     nft = models.ForeignKey(Nft, on_delete=models.CASCADE)
     name = models.CharField(max_length=64, blank=True)
     description = models.TextField(blank=True)
-    owner_address = models.CharField(max_length=64)
+    owner_address = models.CharField(max_length=64, db_index=True)
     image_base64 = models.TextField()
     image_base64_url = models.URLField(blank=True, null=True)
     deposit_address = models.CharField(max_length=128)
@@ -1118,34 +1189,126 @@ class VbtcV2Token(models.Model):
             return "https://vfx-resources.s3.amazonaws.com/defaultvBTC.gif"
         return self.image_base64_url
 
-    @property
-    def addresses(self):
-        owner_address = self.owner_address
+    def recompute_pending_withdrawal(self, current_height=None):
+        """Derive is_pending_withdrawal from open withdrawal requests.
+
+        The flag must stay true while ANY request is still open — REQUESTED or
+        PENDING_BTC, matching the CLI's HasActiveWithdrawal. Setting/clearing
+        it directly in individual tx handlers loses that invariant when a
+        token has multiple in-flight withdrawals.
+
+        A request that never completes stays REQUESTED forever, but the chain
+        stops treating it as blocking after WITHDRAWAL_EXPIRY_BLOCKS. Without
+        the same cutoff here the flag pins a token permanently and the wallet
+        keeps refusing withdrawals the chain would accept.
+
+        An unknown chain height keeps every open request blocking — the same
+        direction the CLI fails toward, since wrongly clearing the flag would
+        invite a duplicate request the chain then rejects.
+        """
+        if current_height is None:
+            current_height = Block.objects.aggregate(v=Max("height"))["v"] or 0
+
+        pending = self.withdrawal_requests.filter(
+            status__in=VbtcV2WithdrawalRequest.ACTIVE_STATUSES,
+            request_transaction__height__gte=current_height
+            - WITHDRAWAL_EXPIRY_BLOCKS,
+        ).exists()
+        if self.is_pending_withdrawal != pending:
+            self.is_pending_withdrawal = pending
+            self.save(update_fields=["is_pending_withdrawal"])
+
+    def ledger_entries(self):
+        """Per-address ledger from transfers and completed withdrawals,
+        WITHOUT the owner anchor (global_balance + withdrawn add-back).
+
+        Settlement rows created at ownership transfer are ordinary
+        VbtcV2TokenTransfer rows, so they flow through here unchanged.
+        """
         transfers = VbtcV2TokenTransfer.objects.filter(token=self).order_by(
             "created_at"
         )
-        entries = {owner_address: self.global_balance}
+        entries = {}
         for t in transfers:
-            if t.to_address in entries:
-                entries[t.to_address] += t.amount
-            else:
-                entries[t.to_address] = t.amount
+            entries[t.to_address] = entries.get(t.to_address, Decimal(0)) + t.amount
+            entries[t.from_address] = entries.get(t.from_address, Decimal(0)) - t.amount
 
-            if t.from_address in entries:
-                entries[t.from_address] -= t.amount
-            else:
-                entries[t.from_address] = -t.amount
+        # Withdrawals reduce the withdrawer's balance (not the owner's).
+        completed_withdrawals = VbtcV2WithdrawalRequest.objects.filter(
+            token=self, status=VbtcV2WithdrawalRequest.Status.COMPLETED
+        )
+        for w in completed_withdrawals:
+            entries[w.requestor_address] = (
+                entries.get(w.requestor_address, Decimal(0)) - w.amount
+            )
 
         return entries
+
+    def settlement_amount_for(self, address):
+        """Signed amount that must move from `address` to the incoming owner
+        at ownership transfer (negative = the incoming owner owes `address`).
+
+        Settling the outgoing owner's ledger entry to zero is what makes the
+        new owner inherit the un-transferred deposits minus the old owner's
+        withdrawals. The old owner keeps exactly enough to cover their
+        still-open withdrawal requests — those will debit them when they
+        complete, and the BTC pays out to their address, not the new owner's.
+        """
+        pending = self.withdrawal_requests.filter(
+            status__in=VbtcV2WithdrawalRequest.ACTIVE_STATUSES,
+            requestor_address=address,
+        ).aggregate(total=Sum("amount"))["total"] or Decimal(0)
+        return self.ledger_entries().get(address, Decimal(0)) - pending
+
+    @property
+    def addresses(self):
+        entries = self.ledger_entries()
+
+        # global_balance already reflects BTC that left the deposit address,
+        # so add total_withdrawn back to the owner to compensate (the
+        # per-requestor debits live in ledger_entries).
+        total_withdrawn = VbtcV2WithdrawalRequest.objects.filter(
+            token=self, status=VbtcV2WithdrawalRequest.Status.COMPLETED
+        ).aggregate(total=Sum("amount"))["total"] or Decimal(0)
+
+        # Owner anchor = global_balance (actual BTC on deposit) + total_withdrawn
+        entries[self.owner_address] = (
+            entries.get(self.owner_address, Decimal(0))
+            + self.global_balance
+            + total_withdrawn
+        )
+
+        # Pre-filter, entries always sum to global_balance. A negative entry
+        # therefore means the displayed total exceeds the BTC backing —
+        # that's ledger corruption, not display noise. Alarm before hiding.
+        negatives = {a: str(b) for a, b in entries.items() if b < 0}
+        if negatives:
+            logging.warning(
+                f"VbtcV2Token {self.sc_identifier}: hiding negative ledger "
+                f"entries {negatives} — displayed claims exceed BTC backing."
+            )
+
+        return {addr: bal for addr, bal in entries.items() if bal > 0}
 
 
 class VbtcV2TokenTransfer(models.Model):
     token = models.ForeignKey(VbtcV2Token, on_delete=models.CASCADE)
     transaction = models.ForeignKey(Transaction, on_delete=models.CASCADE)
-    from_address = models.CharField(max_length=64)
-    to_address = models.CharField(max_length=64)
+    from_address = models.CharField(max_length=64, db_index=True)
+    to_address = models.CharField(max_length=64, db_index=True)
     amount = models.DecimalField(decimal_places=16, max_digits=32)
     created_at = models.DateTimeField()
+
+    class Meta:
+        constraints = [
+            # get_or_create in the tx handlers is race-prone under concurrent
+            # (re)processing; duplicate rows double-count balances. The DB is
+            # the real guard.
+            models.UniqueConstraint(
+                fields=["token", "transaction"],
+                name="uniq_vbtcv2transfer_token_tx",
+            )
+        ]
 
     def __str__(self):
         return f"{self.from_address} => {self.to_address} [{self.amount}]"
@@ -1153,8 +1316,27 @@ class VbtcV2TokenTransfer(models.Model):
 
 class VbtcV2WithdrawalRequest(models.Model):
     class Status(models.TextChoices):
+        # Mirrors VBTCWithdrawalStatus in the CLI
+        # (ReserveBlockCore/Bitcoin/Models/VBTCContractV2.cs). `None` is
+        # omitted: it is the contract-level "no active withdrawal" state and
+        # has no meaning for a row that exists because a request was made.
         REQUESTED = "requested"
+        PENDING_BTC = "pending_btc", "Pending BTC"
         COMPLETED = "completed"
+        CANCELLATION_REQUESTED = "cancellation_requested"
+        CANCELLED = "cancelled"
+
+    # Mirrors VBTCContractV2.HasActiveWithdrawal: both states still commit the
+    # contract's funds, so both must keep blocking new withdrawals and keep
+    # their amount reserved at ownership transfer.
+    ACTIVE_STATUSES = (Status.REQUESTED, Status.PENDING_BTC)
+
+    # Settled on chain. These outrank anything observed off chain and must
+    # never be walked backwards — a completed withdrawal that reverts to an
+    # ACTIVE status would re-reserve funds that have already left and block
+    # the next withdrawal. CANCELLATION_REQUESTED is deliberately absent: the
+    # validator vote has not resolved, so it is not settled either way.
+    TERMINAL_STATUSES = (Status.COMPLETED, Status.CANCELLED)
 
     token = models.ForeignKey(
         VbtcV2Token, on_delete=models.CASCADE, related_name="withdrawal_requests"
@@ -1169,16 +1351,65 @@ class VbtcV2WithdrawalRequest(models.Model):
         null=True,
         related_name="+",
     )
-    requestor_address = models.CharField(max_length=64)
+    cancel_transaction = models.ForeignKey(
+        Transaction,
+        on_delete=models.CASCADE,
+        blank=True,
+        null=True,
+        related_name="+",
+    )
+    requestor_address = models.CharField(max_length=64, db_index=True)
     btc_address = models.CharField(max_length=128)
     amount = models.DecimalField(decimal_places=16, max_digits=32)
     fee_rate = models.DecimalField(decimal_places=8, max_digits=16)
     btc_transaction_hash = models.CharField(max_length=128, blank=True)
+    # btc_transaction_hash only arrives with the Type 28 completion, so on its
+    # own it cannot tell an operator whether Bitcoin has already moved. These
+    # two record the FROST ceremony that produced a signed, broadcastable
+    # Bitcoin transaction — the point after which a retry can pay out twice.
+    signed_btc_tx_hex = models.TextField(blank=True)
+    signed_at = models.DateTimeField(blank=True, null=True)
     status = models.CharField(
-        max_length=16, choices=Status.choices, default=Status.REQUESTED
+        max_length=32, choices=Status.choices, default=Status.REQUESTED
     )
     created_at = models.DateTimeField()
     completed_at = models.DateTimeField(blank=True, null=True)
+    cancelled_at = models.DateTimeField(blank=True, null=True)
 
     def __str__(self):
         return f"{self.token.sc_identifier} withdrawal [{self.status}]"
+
+
+class UnindexedMint(models.Model):
+    """A mint whose smart-contract data the CLI would not hand over.
+
+    Without that payload process_transaction cannot build the Nft or token
+    rows, and the block it came from is already committed, so nothing would
+    ever revisit it. Recording the gap here keeps the mint visible to the
+    recovery job and to operators instead of losing it to a log line.
+    """
+
+    class Status(models.TextChoices):
+        PENDING = "pending", "Pending"
+        RESOLVED = "resolved", "Resolved"
+
+    sc_identifier = models.CharField(max_length=64, db_index=True)
+    transaction = models.ForeignKey(
+        Transaction, on_delete=models.CASCADE, related_name="unindexed_mints"
+    )
+    transaction_type = models.IntegerField()
+    status = models.CharField(
+        max_length=16, choices=Status.choices, default=Status.PENDING, db_index=True
+    )
+    attempts = models.IntegerField(default=0)
+    last_error = models.TextField(blank=True)
+    first_seen_at = models.DateTimeField(auto_now_add=True)
+    last_attempted_at = models.DateTimeField(blank=True, null=True)
+    resolved_at = models.DateTimeField(blank=True, null=True)
+
+    def __str__(self):
+        return f"{self.sc_identifier} [{self.status}, {self.attempts} attempts]"
+
+    class Meta:
+        unique_together = ("sc_identifier", "transaction")
+        ordering = ["-first_seen_at"]

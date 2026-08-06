@@ -13,12 +13,13 @@ from decimal import Decimal
 from typing import Optional
 import pytz
 from django.db import InterfaceError, InternalError, OperationalError
-from django.db.models import Q, Sum, F
+from django.db.models import Q, Sum, F, Max
 from django.db.transaction import atomic as atomic_transaction, on_commit
 from django.utils import timezone
 from api.block.serializers import BlockSerializer
 from project.celery import app
 from project.utils.encoders import DecimalEncoder
+from rbx.chain_contract import smart_contract_from_chain
 from rbx.client import get_master_nodes, get_block, get_nft, get_topics
 from shop.media import scp_down_folder, upload_to_s3
 from rbx.exceptions import RBXException
@@ -43,6 +44,7 @@ from rbx.models import (
     VbtcV2Token,
     VbtcV2TokenTransfer,
     VbtcV2WithdrawalRequest,
+    UnindexedMint,
 )
 from rbx.utils import get_ip_location, network_metrics
 from dateutil import parser
@@ -368,6 +370,117 @@ def _enqueue_on_commit(task, *task_args, **options):
     on_commit(partial(task.apply_async, args=list(task_args), **options))
 
 
+def record_unindexed_mint(tx: Transaction, sc_identifier: str, reason: str) -> None:
+    """Remember a mint we could not index so the recovery job can retry it."""
+
+    marker, _ = UnindexedMint.objects.get_or_create(
+        sc_identifier=sc_identifier,
+        transaction=tx,
+        defaults={"transaction_type": tx.type},
+    )
+
+    if marker.status == UnindexedMint.Status.RESOLVED:
+        return
+
+    marker.attempts = F("attempts") + 1
+    marker.last_error = reason
+    marker.last_attempted_at = timezone.now()
+    marker.save(update_fields=["attempts", "last_error", "last_attempted_at"])
+
+
+def resolve_unindexed_mint(sc_identifier: str) -> None:
+    """Close out any marker for a mint that has now indexed successfully."""
+
+    UnindexedMint.objects.filter(
+        sc_identifier=sc_identifier, status=UnindexedMint.Status.PENDING
+    ).update(status=UnindexedMint.Status.RESOLVED, resolved_at=timezone.now())
+
+
+def retry_unindexed_mints():
+    """Re-run the mints the CLI could not serve when their block was indexed.
+
+    The smart contract usually shows up once the CLI has caught up, so this
+    keeps trying rather than leaving the token invisible to the wallet.
+    """
+
+    pending = UnindexedMint.objects.filter(
+        status=UnindexedMint.Status.PENDING
+    ).select_related("transaction")
+
+    for marker in pending:
+        try:
+            process_transaction(marker.transaction)
+        except Exception as e:
+            logging.error(
+                f"Mint recovery failed for {marker.sc_identifier}: {e}"
+            )
+            marker.attempts = F("attempts") + 1
+            marker.last_error = str(e)
+            marker.last_attempted_at = timezone.now()
+            marker.save(
+                update_fields=["attempts", "last_error", "last_attempted_at"]
+            )
+
+
+def expire_stale_withdrawals():
+    """Clear is_pending_withdrawal on tokens whose request has aged out.
+
+    recompute_pending_withdrawal only runs when a withdrawal transaction is
+    processed, but a request that never completes produces no further
+    transactions — so nothing revisits the token and the flag stays set long
+    after the chain stopped honouring it. This sweeps the flagged tokens as
+    the chain advances.
+    """
+
+    current_height = Block.objects.aggregate(v=Max("height"))["v"] or 0
+
+    if not current_height:
+        logging.warning("Skipping withdrawal expiry sweep: no blocks synced")
+        return
+
+    for token in VbtcV2Token.objects.filter(is_pending_withdrawal=True):
+        was_pending = token.is_pending_withdrawal
+        token.recompute_pending_withdrawal(current_height=current_height)
+        if was_pending and not token.is_pending_withdrawal:
+            logging.info(
+                f"Cleared expired withdrawal flag on {token.sc_identifier}"
+            )
+
+
+# Types that reach process_transaction with nothing for it to index: plain
+# value transfers, validator lifecycle, topic voting, standard (non-tokenized)
+# smart contracts, the shielded-transaction family, and legacy V1 tokenization
+# burns and withdrawals.
+#
+# Anything neither matched by a branch below nor listed here is a type nobody
+# wired up, and until now it looked exactly like a type nobody needed to —
+# which is how every Base-bridge transaction (37-42) has been passing through
+# the indexer unnoticed.
+UNINDEXED_TX_TYPES = frozenset(
+    {
+        Transaction.Type.TX,
+        Transaction.Type.NODE,
+        Transaction.Type.VOTE_TOPIC,
+        Transaction.Type.VOTE,
+        Transaction.Type.SC_MINT,
+        Transaction.Type.SC_TX,
+        Transaction.Type.SC_BURN,
+        Transaction.Type.TKNZ_BURN,
+        Transaction.Type.TKNZ_WITHDRAWAL_REQUEST,
+        Transaction.Type.TKNZ_WITHDRAWAL_COMPLETE,
+        Transaction.Type.VALIDATOR_REGISTRATION,
+        Transaction.Type.VALIDATOR_HEARTBEAT,
+        Transaction.Type.VALIDATOR_EXIT,
+        Transaction.Type.VFX_SHIELD,
+        Transaction.Type.VFX_UNSHIELD,
+        Transaction.Type.VFX_PRIVATE_TRANSFER,
+        Transaction.Type.VBTC_SHIELD,
+        Transaction.Type.VBTC_UNSHIELD,
+        Transaction.Type.VBTC_PRIVATE_TRANSFER,
+    }
+)
+
+
 def process_transaction(tx: Transaction):
     if tx.type in [Transaction.Type.NFT_MINT, Transaction.Type.TKNZ_MINT, Transaction.Type.VBTC_V2_MINT]:
         logging.info(f"NFT Mint: {tx.hash}")
@@ -382,8 +495,20 @@ def process_transaction(tx: Transaction):
         data = get_nft(identifier)
 
         if not data:
-            # handle_unavailable_nft(tx, parsed)
-            logging.error("No SC data found.")
+            # The CLI can refuse a contract indefinitely, but a V2 mint carries
+            # the whole contract on chain, so rebuild it from the transaction
+            # rather than losing the token.
+            data = smart_contract_from_chain(tx)
+
+            if data:
+                logging.warning(
+                    f"CLI would not serve {identifier}; rebuilt the contract "
+                    f"from mint tx {tx.hash}."
+                )
+
+        if not data:
+            logging.error(f"No SC data found for {identifier} (tx {tx.hash}).")
+            record_unindexed_mint(tx, identifier, "CLI returned no smart contract data")
             return
 
         smart_contract_data = data
@@ -512,7 +637,9 @@ def process_transaction(tx: Transaction):
                         v2_token.deposit_address = v2_info["DepositAddress"]
                         v2_token.frost_group_public_key = v2_info.get("FrostGroupPublicKey", "")
                         v2_token.dkg_proof = v2_info.get("DKGProof", "")
-                        v2_token.validator_snapshot = v2_info.get("ValidatorSnapshot")
+                        v2_token.validator_snapshot = v2_info.get(
+                            "ValidatorAddressesSnapshot"
+                        )
                         v2_token.required_threshold = v2_info.get("RequiredThreshold", 0)
                         v2_token.proof_block_height = v2_info.get("ProofBlockHeight", 0)
                         v2_token.global_balance = Decimal(0)
@@ -523,6 +650,8 @@ def process_transaction(tx: Transaction):
                         nft.save()
 
                         _enqueue_on_commit(handle_vbtc_v2_icon_upload, identifier)
+
+        resolve_unindexed_mint(identifier)
 
         return
 
@@ -853,7 +982,8 @@ def process_transaction(tx: Transaction):
     elif tx.type == Transaction.Type.TKNZ_TX:
 
         parsed = json.loads(tx.data)
-
+        if isinstance(parsed, str):
+            parsed = json.loads(parsed)
         if isinstance(parsed, list):
             parsed = parsed[0]
 
@@ -879,14 +1009,65 @@ def process_transaction(tx: Transaction):
 
         elif func == "Transfer()":
             sc_identifier = parsed["ContractUID"]
+            # Try V1 token first
             try:
                 token = VbtcToken.objects.get(sc_identifier=sc_identifier)
-            except VbtcToken.DoesNotExist:
-                print(f"VbtcToken with sc id of{sc_identifier} not found.")
+                token.owner_address = tx.to_address
+                token.save()
                 return
+            except VbtcToken.DoesNotExist:
+                pass
 
-            token.owner_address = tx.to_address
-            token.save()
+            # Try V2 token
+            try:
+                v2_token = VbtcV2Token.objects.get(sc_identifier=sc_identifier)
+                # tx.from_address is the chain-authoritative outgoing owner
+                # (the local owner_address could be stale on reprocess).
+                old_owner = tx.from_address
+                new_owner = tx.to_address
+
+                if old_owner and old_owner != new_owner:
+                    # Settle the outgoing owner's ledger so the new owner
+                    # inherits the un-transferred deposits minus the old
+                    # owner's withdrawals (less what the old owner must keep
+                    # for still-open withdrawal requests). Without this row,
+                    # the owner anchor in `addresses` re-attributes the whole
+                    # deposit history to the new owner and the old owner's
+                    # debits go negative — claims then exceed BTC backing.
+                    residual = v2_token.settlement_amount_for(old_owner)
+                    if residual:
+                        from_addr, to_addr = (
+                            (old_owner, new_owner)
+                            if residual > 0
+                            else (new_owner, old_owner)
+                        )
+                        VbtcV2TokenTransfer.objects.get_or_create(
+                            token=v2_token,
+                            transaction=tx,
+                            defaults={
+                                "from_address": from_addr,
+                                "to_address": to_addr,
+                                "amount": abs(residual),
+                                "created_at": tx.date_crafted,
+                            },
+                        )
+
+                v2_token.owner_address = new_owner
+                v2_token.save(update_fields=["owner_address"])
+                # Also update the NFT owner
+                try:
+                    nft = v2_token.nft
+                    nft.owner_address = tx.to_address
+                    nft.save(update_fields=["owner_address"])
+                except Exception:
+                    logging.exception(
+                        f"Failed to update NFT owner for V2 ownership "
+                        f"transfer {tx.hash} ({sc_identifier})"
+                    )
+                return
+            except VbtcV2Token.DoesNotExist:
+                print(f"No VbtcToken or VbtcV2Token with sc id of {sc_identifier} found.")
+                return
 
         elif func == "TransferCoinMulti()":
             inputs = parsed["Inputs"]
@@ -921,6 +1102,8 @@ def process_transaction(tx: Transaction):
 
     elif tx.type == Transaction.Type.VBTC_V2_TRANSFER:
         parsed = json.loads(tx.data)
+        if isinstance(parsed, str):
+            parsed = json.loads(parsed)
         if isinstance(parsed, list):
             parsed = parsed[0]
 
@@ -938,17 +1121,21 @@ def process_transaction(tx: Transaction):
                 logging.error(f"VbtcV2Token with sc id of {sc_identifier} not found.")
                 return
 
-            VbtcV2TokenTransfer.objects.create(
+            VbtcV2TokenTransfer.objects.get_or_create(
                 token=token,
                 transaction=tx,
-                from_address=from_address,
-                to_address=to_address,
-                amount=amount,
-                created_at=tx.date_crafted,
+                defaults={
+                    "from_address": from_address,
+                    "to_address": to_address,
+                    "amount": amount,
+                    "created_at": tx.date_crafted,
+                },
             )
 
     elif tx.type == Transaction.Type.VBTC_V2_WITHDRAWAL_REQUEST:
         parsed = json.loads(tx.data)
+        if isinstance(parsed, str):
+            parsed = json.loads(parsed)
         if isinstance(parsed, list):
             parsed = parsed[0]
 
@@ -963,22 +1150,25 @@ def process_transaction(tx: Transaction):
                 logging.error(f"VbtcV2Token with sc id of {sc_identifier} not found.")
                 return
 
-            VbtcV2WithdrawalRequest.objects.create(
+            VbtcV2WithdrawalRequest.objects.get_or_create(
                 token=token,
                 request_transaction=tx,
-                requestor_address=parsed["RequestorAddress"],
-                btc_address=parsed["BTCAddress"],
-                amount=Decimal(parsed["Amount"]),
-                fee_rate=Decimal(parsed["FeeRate"]),
-                status=VbtcV2WithdrawalRequest.Status.REQUESTED,
-                created_at=tx.date_crafted,
+                defaults={
+                    "requestor_address": parsed["RequestorAddress"],
+                    "btc_address": parsed["BTCAddress"],
+                    "amount": Decimal(parsed["Amount"]),
+                    "fee_rate": Decimal(parsed["FeeRate"]),
+                    "status": VbtcV2WithdrawalRequest.Status.REQUESTED,
+                    "created_at": tx.date_crafted,
+                },
             )
 
-            token.is_pending_withdrawal = True
-            token.save()
+            token.recompute_pending_withdrawal()
 
     elif tx.type == Transaction.Type.VBTC_V2_WITHDRAWAL_COMPLETE:
         parsed = json.loads(tx.data)
+        if isinstance(parsed, str):
+            parsed = json.loads(parsed)
         if isinstance(parsed, list):
             parsed = parsed[0]
 
@@ -1004,16 +1194,102 @@ def process_transaction(tx: Transaction):
                 )
                 return
 
+            if withdrawal.status == VbtcV2WithdrawalRequest.Status.CANCELLED:
+                # The chain is authoritative: if a completion landed on-chain,
+                # the BTC moved — but a completion after a cancel means the
+                # CLI's state machine broke, so make noise about it.
+                logging.error(
+                    f"VBTCWithdrawalComplete for cancelled withdrawal {withdrawal.pk} "
+                    f"(request hash {withdrawal_request_hash}) — completing anyway."
+                )
+
             withdrawal.completion_transaction = tx
             withdrawal.btc_transaction_hash = parsed["BTCTransactionHash"]
             withdrawal.status = VbtcV2WithdrawalRequest.Status.COMPLETED
             withdrawal.completed_at = tx.date_crafted
-            withdrawal.save()
+            # update_fields, not a bare save: this instance was loaded earlier
+            # in this function, and the FROST path writes signed_at and
+            # signed_btc_tx_hex from the web process. A bare save writes every
+            # column from this instance and would erase whatever landed in
+            # between — the record of the signature this completion is for.
+            withdrawal.save(
+                update_fields=[
+                    "completion_transaction",
+                    "btc_transaction_hash",
+                    "status",
+                    "completed_at",
+                ]
+            )
 
-            token.global_balance -= Decimal(parsed["Amount"])
-            token.total_sent += Decimal(parsed["Amount"])
-            token.is_pending_withdrawal = False
-            token.save()
+            # Balance fields (global_balance, total_sent) are updated by the
+            # periodic BTC chain sync (update_vbtc_balances), not here.
+            token.recompute_pending_withdrawal()
+
+    elif tx.type == Transaction.Type.VBTC_V2_WITHDRAWAL_CANCEL:
+        parsed = json.loads(tx.data)
+        if isinstance(parsed, str):
+            parsed = json.loads(parsed)
+        if isinstance(parsed, list):
+            parsed = parsed[0]
+
+        # The exact Function string for type 29 is not yet confirmed (no
+        # on-chain examples exist), so key off the payload instead.
+        withdrawal_request_hash = parsed.get("WithdrawalRequestHash")
+        if not withdrawal_request_hash:
+            logging.error(
+                f"VBTC_V2_WITHDRAWAL_CANCEL tx {tx.hash}: no WithdrawalRequestHash "
+                f"in payload (function={parsed.get('Function')})"
+            )
+            return
+
+        try:
+            withdrawal = VbtcV2WithdrawalRequest.objects.get(
+                request_transaction__hash=withdrawal_request_hash
+            )
+        except VbtcV2WithdrawalRequest.DoesNotExist:
+            logging.error(
+                f"Withdrawal request with hash {withdrawal_request_hash} not found "
+                f"for cancel tx {tx.hash}."
+            )
+            return
+
+        if withdrawal.status == VbtcV2WithdrawalRequest.Status.COMPLETED:
+            # Never un-complete: the BTC already moved.
+            logging.error(
+                f"VBTC_V2_WITHDRAWAL_CANCEL for completed withdrawal {withdrawal.pk} "
+                f"(request hash {withdrawal_request_hash}) — ignoring."
+            )
+            return
+
+        if withdrawal.signed_at:
+            # A signed Bitcoin transaction for this withdrawal already exists
+            # and may be on the network. The chain is authoritative, so the
+            # cancel still applies — but the BTC can still confirm afterwards,
+            # so this must not pass unnoticed.
+            logging.error(
+                f"VBTC_V2_WITHDRAWAL_CANCEL for withdrawal {withdrawal.pk} "
+                f"(request hash {withdrawal_request_hash}) whose BTC transaction "
+                f"was already FROST-signed at {withdrawal.signed_at} — the "
+                f"signed transaction may still confirm."
+            )
+
+        withdrawal.cancel_transaction = tx
+        withdrawal.status = VbtcV2WithdrawalRequest.Status.CANCELLED
+        withdrawal.cancelled_at = tx.date_crafted
+        # Same reason as the completion handler: a bare save from this
+        # instance would erase signing metadata written after it was loaded.
+        withdrawal.save(
+            update_fields=["cancel_transaction", "status", "cancelled_at"]
+        )
+
+        withdrawal.token.recompute_pending_withdrawal()
+
+    elif tx.type not in UNINDEXED_TX_TYPES:
+        logging.warning(
+            f"No handler for transaction type {tx.type} ({tx.type_label}) on "
+            f"tx {tx.hash} — recorded but not indexed. Either add a handler or "
+            f"add the type to UNINDEXED_TX_TYPES."
+        )
 
 
 # def handle_unavailable_nft(tx: Transaction, data: dict):
@@ -1215,7 +1491,7 @@ def sync_circulation():
     active_master_nodes = MasterNode.objects.filter(is_active=True).count()
     total_master_nodes = MasterNode.objects.all().count()
 
-    stake = active_master_nodes * 50000
+    stake = active_master_nodes * 5000
     total_addresses = Address.objects.all().count()
 
     total_burned = fees + adnr_burned_sum + dst_burned_sum + vault_burned_sum

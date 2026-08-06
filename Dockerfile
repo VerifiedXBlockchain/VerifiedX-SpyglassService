@@ -25,6 +25,8 @@ RUN pip install --upgrade pip && pip install -r requirements.txt
 # Copy project files
 COPY . .
 
+# Collect static files for whitenoise (uses minimal build settings, no env vars needed)
+RUN python manage.py collectstatic --noinput --settings=project.build_settings
 
 # For ensuring postgres is ready
 COPY ./docker/wait-for-it.sh /wait-for-it.sh

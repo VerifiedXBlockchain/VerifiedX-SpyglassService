@@ -30,7 +30,14 @@ def setup_periodic_tasks(sender, **kwargs):
     sender.add_periodic_task(5 * 60, update_cmc_prices.s(), name="Update CMC Prices")
     sender.add_periodic_task(10 * 60, sync_master_nodes.s(), name="Sync Master Nodes")
     sender.add_periodic_task(
-        2.5 * 60 * 60, update_vbtc_balances.s(), name="Update VBTC Balances"
+        10 * 60, update_vbtc_balances.s(), name="Update VBTC Balances"
+    )
+
+    sender.add_periodic_task(
+        15 * 60, retry_unindexed_mints.s(), name="Retry Unindexed Mints"
+    )
+    sender.add_periodic_task(
+        10 * 60, expire_stale_withdrawals.s(), name="Expire Stale Withdrawals"
     )
 
     if settings.HEALTH_CHECK_ENABLED:
@@ -56,7 +63,7 @@ def sync_the_blocks():
     management.call_command("sync_blocks")
 
 
-@app.task
+@app.task(soft_time_limit=60, time_limit=90)
 def health_check():
     from django.core import management
 
@@ -99,6 +106,20 @@ def update_cmc_prices():
     from django.core import management
 
     management.call_command("fetch_cmc_prices")
+
+
+@app.task
+def retry_unindexed_mints():
+    from django.core import management
+
+    management.call_command("retry_unindexed_mints")
+
+
+@app.task
+def expire_stale_withdrawals():
+    from django.core import management
+
+    management.call_command("expire_stale_withdrawals")
 
 
 @app.task(queue="vbtc_queue")

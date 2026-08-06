@@ -27,9 +27,11 @@ SHOP_CRAWLER_BASE_URL = settings.RBX_SHOP_CRAWLER_ADDRESS
 
 _thread_local = threading.local()
 
-# (connect, read) timeout for CLI calls on the sync path. The read timeout is
-# generous because the CLI can take ~30s to answer while its validator
-# registry loads after a restart.
+# (connect, read) timeout for CLI calls on the sync path. These run inline on
+# the concurrency-1 blocks worker, so an unbounded call there stops block sync
+# for as long as the CLI holds the socket open. The read half is generous
+# because the CLI can take ~30s to answer while its validator registry loads
+# after a restart.
 CLI_TIMEOUT = (5, 30)
 
 
@@ -503,9 +505,26 @@ def get_nft(id: str, attempt=0) -> Tuple[dict, int]:
         # This runs inside sync_block's per-block DB transaction — the
         # timeout bounds how long a hung CLI can hold that transaction open.
         response = requests.get(url, timeout=CLI_TIMEOUT)
-        return response.json()
     except Exception as e:
         logger.error(f"NFT get data exception: {e}")
+        time.sleep(5)
+        return get_nft(id, attempt)
+
+    if response.status_code != 200:
+        # The CLI answered and refused. Sleeping through five more attempts
+        # would stall the single-slot blocks worker for 25s on a verdict that
+        # will not change within the block; process_transaction records the
+        # gap and the mint-recovery job retries it later.
+        logger.error(
+            f"NFT get data for {id} returned HTTP {response.status_code} "
+            f"({len(response.content)} bytes)"
+        )
+        return None
+
+    try:
+        return response.json()
+    except ValueError as e:
+        logger.error(f"NFT get data could not parse response for {id}: {e}")
         time.sleep(5)
         return get_nft(id, attempt)
 
@@ -1087,3 +1106,199 @@ def withdraw_btc(payload: dict):
     data = response.json()
     logger.info(f"RESPONSE: {json.dumps(data)}")
     return data
+
+
+# region vBTC V2
+
+
+def _vbtc_v2_request(method, path, payload=None, timeout=30):
+    """Shared helper for vBTC V2 CLI requests."""
+    logger = logging.getLogger(__name__)
+    url = join_url(BASE_URL, path)
+    logger.info(f"VBTC_V2: {method.upper()} {url}")
+    try:
+        if method == "get":
+            response = requests.get(url, timeout=timeout)
+        else:
+            response = requests.post(url, json=payload, timeout=timeout)
+        result = response.json()
+    except Exception as e:
+        logger.error(f"Error in vBTC V2 request {path}: {e}")
+        return {"Success": False, "Message": str(e)}
+
+    # The CLI reports a refusal in the body with HTTP 200, and logs nothing of
+    # its own on several of these paths. Unless the reason is recorded here it
+    # reaches the caller once and is then gone, which leaves a failed
+    # withdrawal with no account of why it failed.
+    if isinstance(result, dict) and not result.get("Success", True):
+        logger.error(
+            f"vBTC V2 request {path} refused: {result.get('Message')}"
+        )
+
+    return result
+
+
+# MPC Ceremony (DKG)
+
+def prepare_vbtc_v2_ceremony(owner_address: str):
+    return _vbtc_v2_request(
+        "post",
+        "vbtcapi/vbtc/PrepareMPCCeremonyRaw",
+        {"OwnerAddress": owner_address},
+    )
+
+
+def execute_vbtc_v2_ceremony(payload: dict):
+    return _vbtc_v2_request(
+        "post",
+        "vbtcapi/vbtc/ExecuteMPCCeremonyRaw",
+        payload,
+    )
+
+
+def get_vbtc_v2_ceremony_status(ceremony_id: str):
+    return _vbtc_v2_request(
+        "get",
+        f"vbtcapi/vbtc/GetCeremonyStatus/{ceremony_id}",
+        timeout=10,
+    )
+
+
+# Contract Creation
+
+def get_raw_create_contract_tx(payload: dict):
+    return _vbtc_v2_request(
+        "post",
+        "vbtcapi/vbtc/GetRawCreateContractTxData",
+        payload,
+        timeout=60,
+    )
+
+
+def send_raw_create_contract_tx(payload: dict):
+    return _vbtc_v2_request(
+        "post",
+        "vbtcapi/vbtc/SendRawCreateContractTx",
+        payload,
+    )
+
+
+# Transfer
+
+def get_raw_transfer_vbtc_tx(payload: dict):
+    return _vbtc_v2_request(
+        "post",
+        "vbtcapi/vbtc/GetRawTransferVBTCData",
+        payload,
+    )
+
+
+def send_raw_transfer_vbtc_tx(payload: dict):
+    return _vbtc_v2_request(
+        "post",
+        "vbtcapi/vbtc/SendRawTransferVBTCTx",
+        payload,
+    )
+
+
+# Withdrawal Request
+
+def get_raw_request_withdrawal_tx(payload: dict):
+    return _vbtc_v2_request(
+        "post",
+        "vbtcapi/vbtc/GetRawRequestWithdrawalTxData",
+        payload,
+    )
+
+
+def send_raw_request_withdrawal_tx(payload: dict):
+    return _vbtc_v2_request(
+        "post",
+        "vbtcapi/vbtc/SendRawRequestWithdrawalTx",
+        payload,
+    )
+
+
+# Withdrawal Complete (FROST)
+
+def prepare_complete_withdrawal(payload: dict):
+    return _vbtc_v2_request(
+        "post",
+        "vbtcapi/vbtc/PrepareCompleteWithdrawalRaw",
+        payload,
+    )
+
+
+def execute_complete_withdrawal(payload: dict):
+    return _vbtc_v2_request(
+        "post",
+        "vbtcapi/vbtc/ExecuteCompleteWithdrawalRaw",
+        payload,
+        timeout=180,
+    )
+
+
+# Withdrawal Complete TX (Type 28 — after BTC broadcast)
+
+def get_raw_complete_withdrawal_tx(payload: dict):
+    return _vbtc_v2_request(
+        "post",
+        "vbtcapi/vbtc/GetRawCompleteWithdrawalTxData",
+        payload,
+    )
+
+
+def send_raw_complete_withdrawal_tx(payload: dict):
+    return _vbtc_v2_request(
+        "post",
+        "vbtcapi/vbtc/SendRawCompleteWithdrawalTx",
+        payload,
+    )
+
+
+# Withdrawal Cancel
+
+def get_raw_cancel_withdrawal_tx(payload: dict):
+    return _vbtc_v2_request(
+        "post",
+        "vbtcapi/vbtc/GetRawCancelWithdrawalTxData",
+        payload,
+    )
+
+
+def send_raw_cancel_withdrawal_tx(payload: dict):
+    return _vbtc_v2_request(
+        "post",
+        "vbtcapi/vbtc/SendRawCancelWithdrawalTx",
+        payload,
+    )
+
+
+# Ownership Transfer
+
+def vbtc_v2_beacon_upload(sc_uid: str, to_address: str, signature: str):
+    """Beacon upload via the V2 CLI (BASE_URL), not the shop CLI."""
+    logger = logging.getLogger(__name__)
+    url = join_url(
+        BASE_URL,
+        f"txapi/txV1/CreateBeaconUploadRequest/{sc_uid}/{to_address}/{signature}",
+    )
+    try:
+        response = requests.get(url, timeout=15)
+        data = response.json()
+        if data.get("Success"):
+            return {"success": True, "locator": data.get("Locator")}
+        return {"success": False, "message": data.get("Message", "Beacon upload failed")}
+    except Exception as e:
+        logger.error(f"V2 beacon upload failed: {e}")
+        return {"success": False, "message": str(e)}
+
+
+def get_vbtc_v2_ownership_transfer_data(sc_uid: str, to_address: str, locator: str):
+    return _vbtc_v2_request(
+        "get",
+        f"vbtcapi/vbtc/GetVBTCOwnershipTransferData/{sc_uid}/{to_address}/{locator}",
+    )
+
+
+# endregion

@@ -1,0 +1,22 @@
+{
+  "mcpServers": {
+    "postgres-mainnet": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@henkey/postgres-mcp-server",
+        "--connection-string",
+        "${VFX_EXPLORER_MAINNET_DB_URL}"
+      ]
+    },
+    "postgres-testnet": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@henkey/postgres-mcp-server",
+        "--connection-string",
+        "${VFX_EXPLORER_TESTNET_DB_URL}"
+      ]
+    }
+  }
+}
