@@ -1101,7 +1101,7 @@ def withdraw_btc(payload: dict):
     url = join_url(BASE_URL, f"btcapi/btcv2/WithdrawalCoinRawTX")
     logger.info(f"URL: {url}")
 
-    response = requests.post(url, json=payload)
+    response = requests.post(url, json=payload, timeout=30)
 
     data = response.json()
     logger.info(f"RESPONSE: {json.dumps(data)}")
