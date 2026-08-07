@@ -621,6 +621,29 @@ class VbtcV2WithdrawCompleteExecuteView(GenericAPIView):
             "FeeRate": request.data.get("fee_rate", 0),
         }
 
+        # Multi-input ceremonies: one signature per StartMessages[k] for
+        # k >= 1. Input 0 stays in the top-level start_signature — the CLI
+        # requires it there and ignores index-0 entries in this array.
+        # Omitted entirely for single-input withdrawals.
+        start_signatures = request.data.get("start_signatures") or []
+        if start_signatures:
+            try:
+                payload["StartSignatures"] = [
+                    {
+                        "InputIndex": int(entry["input_index"]),
+                        "Signature": entry["signature"],
+                    }
+                    for entry in start_signatures
+                ]
+            except (TypeError, KeyError, ValueError):
+                return Response(
+                    {
+                        "success": False,
+                        "message": "each start_signatures entry needs input_index and signature",
+                    },
+                    status=400,
+                )
+
         job_id = str(uuid.uuid4())
         _cache.set(f"{FROST_JOB_PREFIX}{job_id}", _json.dumps({"status": "pending"}), FROST_JOB_TTL)
 
@@ -643,11 +666,17 @@ class VbtcV2WithdrawCompleteExecuteView(GenericAPIView):
                     logging.error(
                         f"FROST job {job_id} failed for "
                         f"{payload['SmartContractUID']} "
-                        f"(request {payload['WithdrawalRequestHash']}): {message}"
+                        f"(request {payload['WithdrawalRequestHash']}): {message} "
+                        f"[failure_code={result.get('FailureCode')} "
+                        f"session_id={result.get('SessionId')} "
+                        f"retryable={result.get('Retryable')}]"
                     )
+                    # The whole result is kept so the status view can serve the
+                    # CLI's structured diagnostics (FailureCode, Retryable,
+                    # ValidatorFailures, ...) — null on pre-ceremony failures.
                     _cache.set(
                         f"{FROST_JOB_PREFIX}{job_id}",
-                        _json.dumps({"status": "failed", "message": message}),
+                        _json.dumps({"status": "failed", "message": message, "result": result}),
                         FROST_JOB_FAILED_TTL,
                     )
             except Exception as e:
@@ -707,8 +736,31 @@ class VbtcV2WithdrawCompleteStatusView(GenericAPIView):
             })
 
         # failed
+        result = job.get("result") or {}
         return Response(
-            {"success": False, "status": "failed", "message": job.get("message", "FROST signing failed")},
+            {
+                "success": False,
+                "status": "failed",
+                "message": job.get("message", "FROST signing failed"),
+                # Structured diagnostics from the CLI. Only genuine FROST
+                # ceremony failures carry them — pre-ceremony failures
+                # (contract not found, balance, validation) serve nulls, so
+                # clients must fall back to message. retryable == True means
+                # transient: wait ~60s (validator-side cooldown), then run a
+                # full fresh Prepare → sign → Execute cycle.
+                "failure_code": result.get("FailureCode"),
+                "retryable": result.get("Retryable"),
+                "session_id": result.get("SessionId"),
+                "input_index": result.get("InputIndex"),
+                "validator_failures": [
+                    {
+                        "validator_address": failure.get("ValidatorAddress"),
+                        "http_status": failure.get("HttpStatus"),
+                        "message": failure.get("Message"),
+                    }
+                    for failure in (result.get("ValidatorFailures") or [])
+                ],
+            },
             status=500,
         )
 

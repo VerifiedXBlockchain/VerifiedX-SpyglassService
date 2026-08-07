@@ -23,6 +23,7 @@ from access.models import User
 from api.btc.serializers import VbtcV2WithdrawalRequestSerializer
 from api.btc.views import (
     VbtcV2WithdrawCompleteExecuteView,
+    VbtcV2WithdrawCompleteStatusView,
     _mark_withdrawal_signed,
 )
 from rbx.chain_contract import smart_contract_from_chain
@@ -1080,6 +1081,156 @@ class WithdrawCompleteExecuteRequiredFieldsTests(TestCase):
 
         self.assertEqual(response.status_code, 400)
         self.assertIn("amount", response.data["message"])
+
+
+class _InlineThread:
+    """Stand-in for threading.Thread that runs the target on start().
+
+    The execute view does its FROST work on a background thread; running it
+    inline makes the job cache deterministic to assert against.
+    """
+
+    def __init__(self, target=None, daemon=None):
+        self._target = target
+
+    def start(self):
+        self._target()
+
+
+class WithdrawCompleteExecuteMultiInputTests(TestCase):
+    """Multi-input withdrawals sign one StartMessage per vault UTXO. Input 0
+    travels in the legacy top-level start_signature; inputs >= 1 travel in
+    start_signatures[] and must reach the CLI as StartSignatures with
+    PascalCase keys — the proxy rebuilds every payload, so anything not
+    forwarded here is silently dropped."""
+
+    URL = "/api/btc/vbtc-v2/withdraw/complete/execute/"
+
+    def payload(self, **overrides):
+        data = {
+            "sc_identifier": "sc:1",
+            "withdrawal_request_hash": "w-req",
+            "owner_address": "OWNER",
+            "session_id": "session-1",
+            "start_signature": "sig-start",
+            "start_timestamp": 1,
+            "share_distribution_signature": "sig-share",
+            "share_distribution_timestamp": 1,
+            "amount": "0.0001",
+            "btc_destination": "bc1p-payout",
+        }
+        data.update(overrides)
+        return {k: v for k, v in data.items() if v is not None}
+
+    def post(self, data):
+        user = User.objects.create_user(email="multi@example.com", password="x")
+        request = APIRequestFactory().post(self.URL, data, format="json")
+        force_authenticate(request, user=user)
+        return VbtcV2WithdrawCompleteExecuteView.as_view()(request)
+
+    def poll(self, job_id):
+        user = User.objects.create_user(email="poll@example.com", password="x")
+        request = APIRequestFactory().get(f"{self.URL}status/{job_id}/")
+        force_authenticate(request, user=user)
+        return VbtcV2WithdrawCompleteStatusView.as_view()(request, job_id=job_id)
+
+    def execute_capturing_payload(self, data, result):
+        # The job runs inline (no real thread), so close_old_connections must
+        # be a no-op — on the test's own thread it would close the connection
+        # the test transaction lives on. Every result here is a failure, so
+        # the job always logs one ERROR line.
+        captured = {}
+
+        def fake_execute(payload):
+            captured.update(payload)
+            return result
+
+        with self.assertLogs(level="ERROR"):
+            with patch("api.btc.views.threading.Thread", _InlineThread):
+                with patch("api.btc.views.close_old_connections"):
+                    with patch("api.btc.views.execute_complete_withdrawal", fake_execute):
+                        response = self.post(data)
+
+        return response, captured
+
+    def test_start_signatures_reach_the_cli_in_pascal_case(self):
+        response, captured = self.execute_capturing_payload(
+            self.payload(start_signatures=[
+                {"input_index": 1, "signature": "sig-i1"},
+                {"input_index": 2, "signature": "sig-i2"},
+            ]),
+            {"Success": False, "Message": "InputCountMismatch probe"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(captured["StartSignatures"], [
+            {"InputIndex": 1, "Signature": "sig-i1"},
+            {"InputIndex": 2, "Signature": "sig-i2"},
+        ])
+
+    def test_single_input_omits_the_array_entirely(self):
+        # The CLI treats the field as optional; omitting it keeps the payload
+        # byte-compatible with the pre-multi-input node.
+        response, captured = self.execute_capturing_payload(
+            self.payload(),
+            {"Success": False, "Message": "probe"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn("StartSignatures", captured)
+
+    def test_malformed_start_signature_entry_is_rejected(self):
+        response = self.post(
+            self.payload(start_signatures=[{"signature": "sig-without-index"}])
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("start_signatures", response.data["message"])
+
+    def test_failed_job_serves_the_cli_diagnostics(self):
+        response, _ = self.execute_capturing_payload(
+            self.payload(),
+            {
+                "Success": False,
+                "Message": "FROST signing ceremony failed",
+                "FailureCode": "Round2InsufficientShares",
+                "SessionId": "session-1",
+                "InputIndex": 0,
+                "Retryable": True,
+                "ValidatorFailures": [
+                    {"ValidatorAddress": "VAL1", "HttpStatus": 409, "Message": "dup"},
+                ],
+            },
+        )
+        job_id = response.data["job_id"]
+
+        status = self.poll(job_id)
+
+        self.assertEqual(status.status_code, 500)
+        self.assertEqual(status.data["failure_code"], "Round2InsufficientShares")
+        self.assertIs(status.data["retryable"], True)
+        self.assertEqual(status.data["session_id"], "session-1")
+        self.assertEqual(status.data["input_index"], 0)
+        self.assertEqual(status.data["validator_failures"], [
+            {"validator_address": "VAL1", "http_status": 409, "message": "dup"},
+        ])
+
+    def test_pre_ceremony_failure_serves_nulls_with_the_message(self):
+        # Most CLI failure paths attach no ceremony — the diagnostics must
+        # come back null, not crash the status view or invent values.
+        response, _ = self.execute_capturing_payload(
+            self.payload(),
+            {"Success": False, "Message": "Withdrawal request not found"},
+        )
+        job_id = response.data["job_id"]
+
+        status = self.poll(job_id)
+
+        self.assertEqual(status.status_code, 500)
+        self.assertEqual(status.data["message"], "Withdrawal request not found")
+        self.assertIsNone(status.data["failure_code"])
+        self.assertIsNone(status.data["retryable"])
+        self.assertEqual(status.data["validator_failures"], [])
 
 
 class WithdrawalStatusRaceTests(TestCase):
