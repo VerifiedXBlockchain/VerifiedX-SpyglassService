@@ -187,24 +187,51 @@ class BtcClient:
             return data.get("transactions", [])
 
     def broadcast_transaction(self, raw_tx_hex: str):
-        """Broadcast a signed transaction to the Bitcoin network."""
-        try:
-            if self.is_blockchain_info:
-                url = "https://blockstream.info/api/tx"
-            else:
-                url = "https://blockstream.info/testnet/api/tx"
+        """Broadcast a signed transaction to the Bitcoin network.
 
-            response = requests.post(
-                url,
-                data=raw_tx_hex,
-                headers={"Content-Type": "text/plain"},
-                timeout=(5, 30),
-            )
+        Testnet is TESTNET4 — blockstream.info has no testnet4 Esplora, and its
+        /testnet endpoint is testnet3, where testnet4 UTXOs don't exist. Every
+        broadcast sent there fails `bad-txns-inputs-missingorspent` (2026-08-13:
+        this dead-ended every web-wallet withdrawal at the broadcast step).
+        Providers are tried in order; any success wins.
+        """
+        if self.is_testnet:
+            providers = [
+                ("https://mempool.space/testnet4/api/tx", "esplora"),
+                ("https://blockbook.tbtc-1.zelcore.io/api/v2/sendtx/", "blockbook"),
+            ]
+        else:
+            providers = [
+                ("https://mempool.space/api/tx", "esplora"),
+                ("https://blockstream.info/api/tx", "esplora"),
+            ]
 
-            if response.status_code == 200:
-                return {"success": True, "txid": response.text.strip()}
+        last_message = "BTC broadcast failed"
+        for url, kind in providers:
+            try:
+                response = requests.post(
+                    url,
+                    data=raw_tx_hex,
+                    headers={"Content-Type": "text/plain"},
+                    timeout=(5, 30),
+                )
 
-            return {"success": False, "message": response.text.strip()}
-        except Exception as e:
-            logger.error(f"Error broadcasting BTC transaction: {e}")
-            return {"success": False, "message": str(e)}
+                if response.status_code == 200:
+                    if kind == "blockbook":
+                        # Blockbook wraps the txid: {"result": "<txid>"}
+                        txid = response.json().get("result", "")
+                    else:
+                        txid = response.text.strip()
+                    if txid:
+                        return {"success": True, "txid": txid}
+                    last_message = "broadcast accepted but no txid returned"
+                else:
+                    last_message = response.text.strip()
+                    logger.error(
+                        f"BTC broadcast via {url} failed ({response.status_code}): {last_message}"
+                    )
+            except Exception as e:
+                last_message = str(e)
+                logger.error(f"Error broadcasting BTC transaction via {url}: {e}")
+
+        return {"success": False, "message": last_message}
