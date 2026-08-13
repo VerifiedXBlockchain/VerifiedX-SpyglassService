@@ -513,12 +513,21 @@ import uuid
 from django.core.cache import cache as _cache
 
 FROST_JOB_PREFIX = "frost_job:"
-FROST_JOB_TTL = 300  # 5 minutes
-# A failed ceremony's message is the only account of why a withdrawal did not
-# go through — the CLI does not log its own refusals on this path. Outliving
-# the polling client by a wide margin is what makes the failure diagnosable
-# after the user reports it rather than only while they are still waiting.
-FROST_JOB_FAILED_TTL = 24 * 60 * 60
+# Pending: must outlive the LONGEST possible ceremony, not the average one —
+# slow ElectrumX pushed real ceremonies past 4 minutes (2026-08-13), and a
+# pending entry that expires mid-run reports "Job not found" for a job that is
+# still working.
+FROST_JOB_TTL = 60 * 60
+# Terminal results — success AND failure — must outlive the polling client by
+# a wide margin. A failure's message is the only account of why a withdrawal
+# did not go through. A SUCCESS result is more critical still: its
+# signed_btc_tx_hex is the only recovery artifact for a signed Bitcoin
+# transaction the client failed to broadcast — at the original 300s TTL a
+# wallet timeout turned a fully signed withdrawal into "contact support"
+# (2026-08-13, Issue #3).
+FROST_JOB_RESULT_TTL = 24 * 60 * 60
+# Backwards-compat alias (old name, same terminal semantics).
+FROST_JOB_FAILED_TTL = FROST_JOB_RESULT_TTL
 
 
 def _mark_withdrawal_signed(withdrawal_request_hash, signed_btc_tx_hex):
@@ -659,7 +668,7 @@ class VbtcV2WithdrawCompleteExecuteView(GenericAPIView):
                     _cache.set(
                         f"{FROST_JOB_PREFIX}{job_id}",
                         _json.dumps({"status": "complete", "result": result}),
-                        FROST_JOB_TTL,
+                        FROST_JOB_RESULT_TTL,
                     )
                 else:
                     message = result.get("Message", "FROST signing failed")
