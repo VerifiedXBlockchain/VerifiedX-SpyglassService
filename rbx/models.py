@@ -1297,6 +1297,10 @@ class VbtcV2TokenTransfer(models.Model):
     from_address = models.CharField(max_length=64, db_index=True)
     to_address = models.CharField(max_length=64, db_index=True)
     amount = models.DecimalField(decimal_places=16, max_digits=32)
+    # One TransferVBTCMultiV2() transaction debits several contracts at once;
+    # each input becomes its own row here, all sharing the transaction. The
+    # flag lets feeds label those rows without re-parsing the payload.
+    is_multi = models.BooleanField(default=False)
     created_at = models.DateTimeField()
 
     class Meta:

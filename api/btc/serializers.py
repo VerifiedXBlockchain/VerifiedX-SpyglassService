@@ -68,6 +68,7 @@ class VbtcV2TokenTransferSerializer(serializers.ModelSerializer):
             "from_address",
             "to_address",
             "amount",
+            "is_multi",
             "transaction_hash",
             "created_at",
         )
