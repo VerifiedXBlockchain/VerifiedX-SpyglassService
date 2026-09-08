@@ -1290,6 +1290,46 @@ class VbtcV2Token(models.Model):
 
         return {addr: bal for addr, bal in entries.items() if bal > 0}
 
+    def available_balances(self, current_height=None):
+        """`addresses` minus each address's open withdrawal requests.
+
+        A withdrawal request writes no ledger row until it completes, and
+        the node's transfer check reads the raw ledger, so a send that
+        spends a pending withdrawal is accepted on chain and the later
+        completion burn overdraws the address. The desktop wallet guards
+        this locally by subtracting incomplete requests
+        (VBTCWithdrawalRequest.GetIncompleteWithdrawalAmount); a wallet
+        picking multi-transfer inputs from the explorer needs the same view.
+
+        Mirror the CLI's window too: a request stops reserving once it ages
+        past WITHDRAWAL_EXPIRY_BLOCKS, otherwise a stalled ceremony would
+        lock its requestor out here forever. An unknown chain height keeps
+        every open request reserved, the same fail-safe direction as
+        recompute_pending_withdrawal.
+
+        Entries floor at zero rather than disappearing so a fully reserved
+        holding still shows as held.
+        """
+        balances = self.addresses
+        if current_height is None:
+            current_height = Block.objects.aggregate(v=Max("height"))["v"] or 0
+
+        reserved = (
+            self.withdrawal_requests.filter(
+                status__in=VbtcV2WithdrawalRequest.ACTIVE_STATUSES,
+                request_transaction__height__gte=current_height
+                - WITHDRAWAL_EXPIRY_BLOCKS,
+            )
+            .values("requestor_address")
+            .annotate(total=Sum("amount"))
+        )
+        for row in reserved:
+            address = row["requestor_address"]
+            if address in balances:
+                balances[address] = max(balances[address] - row["total"], Decimal(0))
+
+        return balances
+
 
 class VbtcV2TokenTransfer(models.Model):
     token = models.ForeignKey(VbtcV2Token, on_delete=models.CASCADE)

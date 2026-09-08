@@ -9,6 +9,7 @@ from django.utils import timezone
 from unittest.mock import patch
 
 from rbx.models import (
+    WITHDRAWAL_EXPIRY_BLOCKS,
     Block,
     Nft,
     Transaction,
@@ -323,6 +324,121 @@ class MultiTransferTests(TestCase):
         (row,) = response.data["results"]
         self.assertEqual(row["transaction_hash"], "m1")
         self.assertTrue(row["is_multi"])
+
+
+class AvailableBalancesTests(TestCase):
+    """available_balances nets open withdrawal requests out of `addresses`,
+    mirroring the desktop wallet's GetIncompleteWithdrawalAmount guard,
+    window included.
+    """
+
+    def setUp(self):
+        self.block = make_block(height=1000)
+        self.token = make_token(owner="O", global_balance="0.01")
+        t1 = make_tx(self.block, "t1", Transaction.Type.VBTC_V2_TRANSFER)
+        add_transfer(self.token, t1, "O", "U", "0.004")
+
+    def request(self, tx_hash, requestor, amount, status, height=1000):
+        block = self.block if height == 1000 else make_block(height=height)
+        tx = make_tx(block, tx_hash, Transaction.Type.VBTC_V2_WITHDRAWAL_REQUEST)
+        return add_withdrawal(self.token, tx, requestor, amount, status)
+
+    def test_open_request_is_reserved(self):
+        self.request("w1", "U", "0.001", VbtcV2WithdrawalRequest.Status.REQUESTED)
+
+        available = self.token.available_balances(current_height=1000)
+
+        self.assertEqual(available["U"], Decimal("0.003"))
+        self.assertEqual(available["O"], Decimal("0.006"))
+        # The gross ledger is untouched.
+        self.assertEqual(self.token.addresses["U"], Decimal("0.004"))
+
+    def test_pending_btc_is_still_reserved(self):
+        self.request("w1", "U", "0.001", VbtcV2WithdrawalRequest.Status.PENDING_BTC)
+
+        self.assertEqual(
+            self.token.available_balances(current_height=1000)["U"], Decimal("0.003")
+        )
+
+    def test_settled_requests_are_not_reserved(self):
+        # Completed already debited the ledger; cancelled never will.
+        self.request("w1", "U", "0.001", VbtcV2WithdrawalRequest.Status.COMPLETED)
+        self.request("w2", "U", "0.001", VbtcV2WithdrawalRequest.Status.CANCELLED)
+
+        available = self.token.available_balances(current_height=1000)
+
+        self.assertEqual(available["U"], Decimal("0.003"))
+        self.assertEqual(available["U"], self.token.addresses["U"])
+
+    def test_multiple_open_requests_add_up(self):
+        self.request("w1", "U", "0.001", VbtcV2WithdrawalRequest.Status.REQUESTED)
+        self.request("w2", "U", "0.002", VbtcV2WithdrawalRequest.Status.PENDING_BTC)
+
+        self.assertEqual(
+            self.token.available_balances(current_height=1000)["U"], Decimal("0.001")
+        )
+
+    def test_floors_at_zero_and_keeps_the_entry(self):
+        self.request("w1", "U", "0.009", VbtcV2WithdrawalRequest.Status.REQUESTED)
+
+        available = self.token.available_balances(current_height=1000)
+
+        self.assertEqual(available["U"], Decimal("0"))
+        self.assertIn("U", available)
+
+    def test_owner_request_reserves_against_the_owner_anchor(self):
+        self.request("w1", "O", "0.002", VbtcV2WithdrawalRequest.Status.REQUESTED)
+
+        available = self.token.available_balances(current_height=1000)
+
+        self.assertEqual(available["O"], Decimal("0.004"))
+        self.assertEqual(available["U"], Decimal("0.004"))
+
+    def test_expired_request_stops_reserving(self):
+        self.request("w1", "U", "0.001", VbtcV2WithdrawalRequest.Status.REQUESTED)
+
+        self.assertEqual(
+            self.token.available_balances(
+                current_height=1000 + WITHDRAWAL_EXPIRY_BLOCKS + 1
+            )["U"],
+            Decimal("0.004"),
+        )
+
+    def test_boundary_block_still_reserves(self):
+        self.request("w1", "U", "0.001", VbtcV2WithdrawalRequest.Status.REQUESTED)
+
+        self.assertEqual(
+            self.token.available_balances(
+                current_height=1000 + WITHDRAWAL_EXPIRY_BLOCKS
+            )["U"],
+            Decimal("0.003"),
+        )
+
+    def test_unknown_height_keeps_reserving(self):
+        # Same fail-safe direction as recompute_pending_withdrawal.
+        self.request("w1", "U", "0.001", VbtcV2WithdrawalRequest.Status.REQUESTED)
+
+        self.assertEqual(
+            self.token.available_balances(current_height=0)["U"], Decimal("0.003")
+        )
+
+    def test_defaults_to_the_synced_chain_tip(self):
+        self.request("w1", "U", "0.001", VbtcV2WithdrawalRequest.Status.REQUESTED)
+        make_block(height=1000 + WITHDRAWAL_EXPIRY_BLOCKS + 1)
+
+        self.assertEqual(self.token.available_balances()["U"], Decimal("0.004"))
+
+    def test_api_exposes_both_maps(self):
+        self.request("w1", "U", "0.001", VbtcV2WithdrawalRequest.Status.REQUESTED)
+
+        request = APIRequestFactory().get("/api/btc/vbtc-v2/U/")
+        force_authenticate(request, user=User.objects.create_user(email="u@example.com", password="x"))
+        response = VbtcV2ListView.as_view()(request, vfx_address="U")
+
+        (token,) = response.data["results"]
+        self.assertEqual(token["addresses"]["U"], Decimal("0.004"))
+        self.assertEqual(token["available_balances"]["U"], Decimal("0.003"))
+        self.assertEqual(token["available_balances"]["O"], Decimal("0.006"))
 
 
 class OwnershipTransferSettlementTests(TestCase):
