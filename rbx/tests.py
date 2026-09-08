@@ -22,6 +22,8 @@ from rest_framework.test import APIRequestFactory, force_authenticate
 from access.models import User
 from api.btc.serializers import VbtcV2WithdrawalRequestSerializer
 from api.btc.views import (
+    VbtcV2ListView,
+    VbtcV2TransfersView,
     VbtcV2WithdrawCompleteExecuteView,
     VbtcV2WithdrawCompleteStatusView,
     _mark_withdrawal_signed,
@@ -156,6 +158,171 @@ class AddressesTests(TestCase):
 
         self.assertNotIn("U", addresses)
         self.assertTrue(any("hiding negative" in m for m in logs.output))
+
+
+class MultiTransferTests(TestCase):
+    """TransferVBTCMultiV2(): one type-26 transaction debiting the sender on
+    several contracts. The node applies one ledger pair per input, all from
+    the transaction's sender to its recipient; the indexer must do the same.
+    """
+
+    def setUp(self):
+        self.block = make_block()
+        self.a = make_token(owner="O", global_balance="0.01", sc_identifier="sc:a")
+        self.b = make_token(owner="O", global_balance="0.02", sc_identifier="sc:b")
+        self.c = make_token(owner="O", global_balance="0.03", sc_identifier="sc:c")
+
+    def multi_tx(self, tx_hash, inputs, sender="O", recipient="R", extra=None):
+        # Amounts are floats on purpose: that is what json.loads hands the
+        # indexer for a payload the node serialised from decimals.
+        data = {
+            "Function": "TransferVBTCMultiV2()",
+            "FromAddress": sender,
+            "ToAddress": recipient,
+            "TotalAmount": float(sum(Decimal(str(a)) for _, a in inputs)),
+            "Inputs": [{"SCUID": sc, "Amount": amt} for sc, amt in inputs],
+        }
+        data.update(extra or {})
+        return make_tx(
+            self.block,
+            tx_hash,
+            Transaction.Type.VBTC_V2_TRANSFER,
+            from_address=sender,
+            to_address=recipient,
+            data=data,
+        )
+
+    def test_one_row_per_input(self):
+        tx = self.multi_tx("m1", [("sc:a", 0.001), ("sc:b", 0.002), ("sc:c", 0.003)])
+
+        process_transaction(tx)
+
+        rows = {
+            r.token.sc_identifier: r
+            for r in VbtcV2TokenTransfer.objects.filter(transaction=tx)
+        }
+        self.assertEqual(set(rows), {"sc:a", "sc:b", "sc:c"})
+        self.assertEqual(rows["sc:a"].amount, Decimal("0.001"))
+        self.assertEqual(rows["sc:b"].amount, Decimal("0.002"))
+        self.assertEqual(rows["sc:c"].amount, Decimal("0.003"))
+        for row in rows.values():
+            self.assertEqual(row.from_address, "O")
+            self.assertEqual(row.to_address, "R")
+            self.assertTrue(row.is_multi)
+            self.assertEqual(row.created_at, tx.date_crafted)
+
+    def test_unknown_contract_is_skipped_and_the_rest_still_index(self):
+        tx = self.multi_tx(
+            "m1", [("sc:a", 0.001), ("sc:missing", 0.002), ("sc:c", 0.003)]
+        )
+
+        with self.assertLogs(level="ERROR") as logs:
+            process_transaction(tx)
+
+        indexed = set(
+            VbtcV2TokenTransfer.objects.filter(transaction=tx).values_list(
+                "token__sc_identifier", flat=True
+            )
+        )
+        self.assertEqual(indexed, {"sc:a", "sc:c"})
+        self.assertTrue(any("sc:missing" in m for m in logs.output))
+
+    def test_reprocessing_creates_no_duplicates(self):
+        tx = self.multi_tx("m1", [("sc:a", 0.001), ("sc:b", 0.002), ("sc:c", 0.003)])
+
+        process_transaction(tx)
+        process_transaction(tx)
+
+        self.assertEqual(VbtcV2TokenTransfer.objects.filter(transaction=tx).count(), 3)
+
+    def test_addresses_move_on_every_input_contract(self):
+        tx = self.multi_tx("m1", [("sc:a", 0.001), ("sc:b", 0.002), ("sc:c", 0.003)])
+
+        process_transaction(tx)
+
+        for token, amount in ((self.a, "0.001"), (self.b, "0.002"), (self.c, "0.003")):
+            addresses = token.addresses
+            self.assertEqual(addresses["R"], Decimal(amount), token.sc_identifier)
+            self.assertEqual(
+                addresses["O"], token.global_balance - Decimal(amount), token.sc_identifier
+            )
+            # Claims on each contract still sum to its BTC backing.
+            self.assertEqual(sum(addresses.values()), token.global_balance)
+
+    def test_non_owner_sender_is_debited_per_contract(self):
+        # O hands U balance on two contracts; U then sends part of each on.
+        for token, h in ((self.a, "s1"), (self.b, "s2")):
+            add_transfer(token, make_tx(self.block, h, Transaction.Type.VBTC_V2_TRANSFER), "O", "U", "0.005")
+        tx = self.multi_tx("m1", [("sc:a", 0.004), ("sc:b", 0.001)], sender="U", recipient="R")
+
+        process_transaction(tx)
+
+        self.assertEqual(self.a.addresses["U"], Decimal("0.001"))
+        self.assertEqual(self.a.addresses["R"], Decimal("0.004"))
+        self.assertEqual(self.b.addresses["U"], Decimal("0.004"))
+        self.assertEqual(self.b.addresses["R"], Decimal("0.001"))
+        # A contract not in the inputs is untouched.
+        self.assertNotIn("R", self.c.addresses)
+
+    def test_single_shape_still_indexes_as_before(self):
+        tx = make_tx(
+            self.block,
+            "s1",
+            Transaction.Type.VBTC_V2_TRANSFER,
+            from_address="O",
+            to_address="R",
+            data={
+                "Function": "TransferVBTCV2()",
+                "ContractUID": "sc:a",
+                "FromAddress": "O",
+                "ToAddress": "R",
+                "Amount": 0.001,
+            },
+        )
+
+        process_transaction(tx)
+
+        row = VbtcV2TokenTransfer.objects.get(transaction=tx)
+        self.assertEqual(row.token, self.a)
+        self.assertEqual(row.amount, Decimal("0.001"))
+        self.assertFalse(row.is_multi)
+
+    def test_hybrid_payload_is_not_indexed_as_multi(self):
+        # A multi Function that also carries the single-shape ContractUID is
+        # applied as a single transfer by every node (and rejected outright
+        # once multi is active). Never fan it out as if it were multi.
+        tx = self.multi_tx(
+            "h1", [("sc:a", 0.001), ("sc:b", 0.002)], extra={"ContractUID": "sc:a", "Amount": 0.001}
+        )
+
+        with self.assertLogs(level="WARNING") as logs:
+            process_transaction(tx)
+
+        self.assertFalse(VbtcV2TokenTransfer.objects.filter(transaction=tx).exists())
+        self.assertTrue(any("Unrecognised VBTC_V2_TRANSFER" in m for m in logs.output))
+
+    def test_recipient_lists_every_input_contract(self):
+        tx = self.multi_tx("m1", [("sc:a", 0.001), ("sc:c", 0.003)])
+        process_transaction(tx)
+
+        request = APIRequestFactory().get("/api/btc/vbtc-v2/R/")
+        force_authenticate(request, user=User.objects.create_user(email="u@example.com", password="x"))
+        response = VbtcV2ListView.as_view()(request, vfx_address="R")
+
+        listed = {t["sc_identifier"] for t in response.data["results"]}
+        self.assertEqual(listed, {"sc:a", "sc:c"})
+
+    def test_transfers_feed_labels_multi_rows(self):
+        tx = self.multi_tx("m1", [("sc:a", 0.001), ("sc:b", 0.002)])
+        process_transaction(tx)
+
+        request = APIRequestFactory().get("/api/btc/vbtc-v2/transfers/sc:a/")
+        force_authenticate(request, user=User.objects.create_user(email="u@example.com", password="x"))
+        response = VbtcV2TransfersView.as_view()(request, sc_identifier="sc:a")
+
+        (row,) = response.data["results"]
+        self.assertEqual(row["transaction_hash"], "m1")
+        self.assertTrue(row["is_multi"])
 
 
 class OwnershipTransferSettlementTests(TestCase):

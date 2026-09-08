@@ -1135,6 +1135,52 @@ def process_transaction(tx: Transaction):
                 },
             )
 
+        elif func == "TransferVBTCMultiV2()" and "ContractUID" not in parsed:
+            # One transaction debiting the sender on several contracts. The
+            # node applies it as one ledger pair per input, all from the
+            # transaction's sender to its recipient, and consensus guarantees
+            # distinct SCUIDs, so one row per (token, transaction) holds.
+            # The ContractUID guard mirrors the node's own dispatch rule
+            # (VBTCService.GetVbtcV2TransferOutflows): a payload that also
+            # carries the single-shape fields is applied as a single transfer.
+            from_address = parsed["FromAddress"]
+            to_address = parsed["ToAddress"]
+
+            for entry in parsed["Inputs"]:
+                sc_identifier = entry["SCUID"]
+                amount = Decimal(str(entry["Amount"]))
+
+                try:
+                    token = VbtcV2Token.objects.get(sc_identifier=sc_identifier)
+                except VbtcV2Token.DoesNotExist:
+                    # Skip rather than return: the other inputs are
+                    # independent contracts and must still be indexed.
+                    logging.error(
+                        f"VbtcV2Token with sc id of {sc_identifier} not found "
+                        f"(multi transfer {tx.hash})."
+                    )
+                    continue
+
+                VbtcV2TokenTransfer.objects.get_or_create(
+                    token=token,
+                    transaction=tx,
+                    defaults={
+                        "from_address": from_address,
+                        "to_address": to_address,
+                        "amount": amount,
+                        "is_multi": True,
+                        "created_at": tx.date_crafted,
+                    },
+                )
+
+        else:
+            # Multi transfers passed through here silently for a week before
+            # anyone noticed. Anything else that lands is worth a line.
+            logging.warning(
+                f"Unrecognised VBTC_V2_TRANSFER payload on {tx.hash}: "
+                f"function={func!r}, has_contract_uid={'ContractUID' in parsed}"
+            )
+
     elif tx.type == Transaction.Type.VBTC_V2_WITHDRAWAL_REQUEST:
         parsed = json.loads(tx.data)
         if isinstance(parsed, str):
