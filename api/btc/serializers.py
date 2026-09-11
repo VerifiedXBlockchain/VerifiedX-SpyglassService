@@ -1,7 +1,14 @@
+from django.db.models import Max
 from rest_framework import serializers
 
 from api.nft.serializers import NftSerializer
-from rbx.models import VbtcToken, VbtcV2Token, VbtcV2TokenTransfer, VbtcV2WithdrawalRequest
+from rbx.models import (
+    Block,
+    VbtcToken,
+    VbtcV2Token,
+    VbtcV2TokenTransfer,
+    VbtcV2WithdrawalRequest,
+)
 
 
 class VbtcTokenSerializer(serializers.ModelSerializer):
@@ -68,6 +75,7 @@ class VbtcV2TokenTransferSerializer(serializers.ModelSerializer):
             "from_address",
             "to_address",
             "amount",
+            "is_multi",
             "transaction_hash",
             "created_at",
         )
@@ -77,6 +85,15 @@ class VbtcV2TokenSerializer(serializers.ModelSerializer):
     image_url = serializers.CharField(source="image_base64_url_with_fallback")
     nft = NftSerializer()
     withdrawal_requests = VbtcV2WithdrawalRequestSerializer(many=True, read_only=True)
+    # `addresses` is the gross ledger; this nets out each address's open
+    # withdrawal requests and is what a wallet should size sends from.
+    available_balances = serializers.SerializerMethodField()
+
+    def get_available_balances(self, token):
+        # One chain-tip lookup per serialisation, not one per token.
+        if not hasattr(self, "_chain_tip"):
+            self._chain_tip = Block.objects.aggregate(v=Max("height"))["v"] or 0
+        return token.available_balances(current_height=self._chain_tip)
 
     class Meta:
         model = VbtcV2Token
@@ -96,6 +113,7 @@ class VbtcV2TokenSerializer(serializers.ModelSerializer):
             "tx_count",
             "is_pending_withdrawal",
             "addresses",
+            "available_balances",
             "nft",
             "withdrawal_requests",
             "created_at",

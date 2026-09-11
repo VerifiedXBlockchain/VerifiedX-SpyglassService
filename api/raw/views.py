@@ -195,6 +195,6 @@ class WithdrawVbtcView(GenericAPIView):
             )
 
         return Response(
-            {"success": False, result: None},
+            {"success": False, "result": None},
             status=status.HTTP_500_INTERNAL_SERVER_ERROR,
         )

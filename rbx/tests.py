@@ -9,6 +9,7 @@ from django.utils import timezone
 from unittest.mock import patch
 
 from rbx.models import (
+    WITHDRAWAL_EXPIRY_BLOCKS,
     Block,
     Nft,
     Transaction,
@@ -22,7 +23,10 @@ from rest_framework.test import APIRequestFactory, force_authenticate
 from access.models import User
 from api.btc.serializers import VbtcV2WithdrawalRequestSerializer
 from api.btc.views import (
+    VbtcV2ListView,
+    VbtcV2TransfersView,
     VbtcV2WithdrawCompleteExecuteView,
+    VbtcV2WithdrawCompleteStatusView,
     _mark_withdrawal_signed,
 )
 from rbx.chain_contract import smart_contract_from_chain
@@ -155,6 +159,286 @@ class AddressesTests(TestCase):
 
         self.assertNotIn("U", addresses)
         self.assertTrue(any("hiding negative" in m for m in logs.output))
+
+
+class MultiTransferTests(TestCase):
+    """TransferVBTCMultiV2(): one type-26 transaction debiting the sender on
+    several contracts. The node applies one ledger pair per input, all from
+    the transaction's sender to its recipient; the indexer must do the same.
+    """
+
+    def setUp(self):
+        self.block = make_block()
+        self.a = make_token(owner="O", global_balance="0.01", sc_identifier="sc:a")
+        self.b = make_token(owner="O", global_balance="0.02", sc_identifier="sc:b")
+        self.c = make_token(owner="O", global_balance="0.03", sc_identifier="sc:c")
+
+    def multi_tx(self, tx_hash, inputs, sender="O", recipient="R", extra=None):
+        # Amounts are floats on purpose: that is what json.loads hands the
+        # indexer for a payload the node serialised from decimals.
+        data = {
+            "Function": "TransferVBTCMultiV2()",
+            "FromAddress": sender,
+            "ToAddress": recipient,
+            "TotalAmount": float(sum(Decimal(str(a)) for _, a in inputs)),
+            "Inputs": [{"SCUID": sc, "Amount": amt} for sc, amt in inputs],
+        }
+        data.update(extra or {})
+        return make_tx(
+            self.block,
+            tx_hash,
+            Transaction.Type.VBTC_V2_TRANSFER,
+            from_address=sender,
+            to_address=recipient,
+            data=data,
+        )
+
+    def test_one_row_per_input(self):
+        tx = self.multi_tx("m1", [("sc:a", 0.001), ("sc:b", 0.002), ("sc:c", 0.003)])
+
+        process_transaction(tx)
+
+        rows = {
+            r.token.sc_identifier: r
+            for r in VbtcV2TokenTransfer.objects.filter(transaction=tx)
+        }
+        self.assertEqual(set(rows), {"sc:a", "sc:b", "sc:c"})
+        self.assertEqual(rows["sc:a"].amount, Decimal("0.001"))
+        self.assertEqual(rows["sc:b"].amount, Decimal("0.002"))
+        self.assertEqual(rows["sc:c"].amount, Decimal("0.003"))
+        for row in rows.values():
+            self.assertEqual(row.from_address, "O")
+            self.assertEqual(row.to_address, "R")
+            self.assertTrue(row.is_multi)
+            self.assertEqual(row.created_at, tx.date_crafted)
+
+    def test_unknown_contract_is_skipped_and_the_rest_still_index(self):
+        tx = self.multi_tx(
+            "m1", [("sc:a", 0.001), ("sc:missing", 0.002), ("sc:c", 0.003)]
+        )
+
+        with self.assertLogs(level="ERROR") as logs:
+            process_transaction(tx)
+
+        indexed = set(
+            VbtcV2TokenTransfer.objects.filter(transaction=tx).values_list(
+                "token__sc_identifier", flat=True
+            )
+        )
+        self.assertEqual(indexed, {"sc:a", "sc:c"})
+        self.assertTrue(any("sc:missing" in m for m in logs.output))
+
+    def test_reprocessing_creates_no_duplicates(self):
+        tx = self.multi_tx("m1", [("sc:a", 0.001), ("sc:b", 0.002), ("sc:c", 0.003)])
+
+        process_transaction(tx)
+        process_transaction(tx)
+
+        self.assertEqual(VbtcV2TokenTransfer.objects.filter(transaction=tx).count(), 3)
+
+    def test_addresses_move_on_every_input_contract(self):
+        tx = self.multi_tx("m1", [("sc:a", 0.001), ("sc:b", 0.002), ("sc:c", 0.003)])
+
+        process_transaction(tx)
+
+        for token, amount in ((self.a, "0.001"), (self.b, "0.002"), (self.c, "0.003")):
+            addresses = token.addresses
+            self.assertEqual(addresses["R"], Decimal(amount), token.sc_identifier)
+            self.assertEqual(
+                addresses["O"], token.global_balance - Decimal(amount), token.sc_identifier
+            )
+            # Claims on each contract still sum to its BTC backing.
+            self.assertEqual(sum(addresses.values()), token.global_balance)
+
+    def test_non_owner_sender_is_debited_per_contract(self):
+        # O hands U balance on two contracts; U then sends part of each on.
+        for token, h in ((self.a, "s1"), (self.b, "s2")):
+            add_transfer(token, make_tx(self.block, h, Transaction.Type.VBTC_V2_TRANSFER), "O", "U", "0.005")
+        tx = self.multi_tx("m1", [("sc:a", 0.004), ("sc:b", 0.001)], sender="U", recipient="R")
+
+        process_transaction(tx)
+
+        self.assertEqual(self.a.addresses["U"], Decimal("0.001"))
+        self.assertEqual(self.a.addresses["R"], Decimal("0.004"))
+        self.assertEqual(self.b.addresses["U"], Decimal("0.004"))
+        self.assertEqual(self.b.addresses["R"], Decimal("0.001"))
+        # A contract not in the inputs is untouched.
+        self.assertNotIn("R", self.c.addresses)
+
+    def test_single_shape_still_indexes_as_before(self):
+        tx = make_tx(
+            self.block,
+            "s1",
+            Transaction.Type.VBTC_V2_TRANSFER,
+            from_address="O",
+            to_address="R",
+            data={
+                "Function": "TransferVBTCV2()",
+                "ContractUID": "sc:a",
+                "FromAddress": "O",
+                "ToAddress": "R",
+                "Amount": 0.001,
+            },
+        )
+
+        process_transaction(tx)
+
+        row = VbtcV2TokenTransfer.objects.get(transaction=tx)
+        self.assertEqual(row.token, self.a)
+        self.assertEqual(row.amount, Decimal("0.001"))
+        self.assertFalse(row.is_multi)
+
+    def test_hybrid_payload_is_not_indexed_as_multi(self):
+        # A multi Function that also carries the single-shape ContractUID is
+        # applied as a single transfer by every node (and rejected outright
+        # once multi is active). Never fan it out as if it were multi.
+        tx = self.multi_tx(
+            "h1", [("sc:a", 0.001), ("sc:b", 0.002)], extra={"ContractUID": "sc:a", "Amount": 0.001}
+        )
+
+        with self.assertLogs(level="WARNING") as logs:
+            process_transaction(tx)
+
+        self.assertFalse(VbtcV2TokenTransfer.objects.filter(transaction=tx).exists())
+        self.assertTrue(any("Unrecognised VBTC_V2_TRANSFER" in m for m in logs.output))
+
+    def test_recipient_lists_every_input_contract(self):
+        tx = self.multi_tx("m1", [("sc:a", 0.001), ("sc:c", 0.003)])
+        process_transaction(tx)
+
+        request = APIRequestFactory().get("/api/btc/vbtc-v2/R/")
+        force_authenticate(request, user=User.objects.create_user(email="u@example.com", password="x"))
+        response = VbtcV2ListView.as_view()(request, vfx_address="R")
+
+        listed = {t["sc_identifier"] for t in response.data["results"]}
+        self.assertEqual(listed, {"sc:a", "sc:c"})
+
+    def test_transfers_feed_labels_multi_rows(self):
+        tx = self.multi_tx("m1", [("sc:a", 0.001), ("sc:b", 0.002)])
+        process_transaction(tx)
+
+        request = APIRequestFactory().get("/api/btc/vbtc-v2/transfers/sc:a/")
+        force_authenticate(request, user=User.objects.create_user(email="u@example.com", password="x"))
+        response = VbtcV2TransfersView.as_view()(request, sc_identifier="sc:a")
+
+        (row,) = response.data["results"]
+        self.assertEqual(row["transaction_hash"], "m1")
+        self.assertTrue(row["is_multi"])
+
+
+class AvailableBalancesTests(TestCase):
+    """available_balances nets open withdrawal requests out of `addresses`,
+    mirroring the desktop wallet's GetIncompleteWithdrawalAmount guard,
+    window included.
+    """
+
+    def setUp(self):
+        self.block = make_block(height=1000)
+        self.token = make_token(owner="O", global_balance="0.01")
+        t1 = make_tx(self.block, "t1", Transaction.Type.VBTC_V2_TRANSFER)
+        add_transfer(self.token, t1, "O", "U", "0.004")
+
+    def request(self, tx_hash, requestor, amount, status, height=1000):
+        block = self.block if height == 1000 else make_block(height=height)
+        tx = make_tx(block, tx_hash, Transaction.Type.VBTC_V2_WITHDRAWAL_REQUEST)
+        return add_withdrawal(self.token, tx, requestor, amount, status)
+
+    def test_open_request_is_reserved(self):
+        self.request("w1", "U", "0.001", VbtcV2WithdrawalRequest.Status.REQUESTED)
+
+        available = self.token.available_balances(current_height=1000)
+
+        self.assertEqual(available["U"], Decimal("0.003"))
+        self.assertEqual(available["O"], Decimal("0.006"))
+        # The gross ledger is untouched.
+        self.assertEqual(self.token.addresses["U"], Decimal("0.004"))
+
+    def test_pending_btc_is_still_reserved(self):
+        self.request("w1", "U", "0.001", VbtcV2WithdrawalRequest.Status.PENDING_BTC)
+
+        self.assertEqual(
+            self.token.available_balances(current_height=1000)["U"], Decimal("0.003")
+        )
+
+    def test_settled_requests_are_not_reserved(self):
+        # Completed already debited the ledger; cancelled never will.
+        self.request("w1", "U", "0.001", VbtcV2WithdrawalRequest.Status.COMPLETED)
+        self.request("w2", "U", "0.001", VbtcV2WithdrawalRequest.Status.CANCELLED)
+
+        available = self.token.available_balances(current_height=1000)
+
+        self.assertEqual(available["U"], Decimal("0.003"))
+        self.assertEqual(available["U"], self.token.addresses["U"])
+
+    def test_multiple_open_requests_add_up(self):
+        self.request("w1", "U", "0.001", VbtcV2WithdrawalRequest.Status.REQUESTED)
+        self.request("w2", "U", "0.002", VbtcV2WithdrawalRequest.Status.PENDING_BTC)
+
+        self.assertEqual(
+            self.token.available_balances(current_height=1000)["U"], Decimal("0.001")
+        )
+
+    def test_floors_at_zero_and_keeps_the_entry(self):
+        self.request("w1", "U", "0.009", VbtcV2WithdrawalRequest.Status.REQUESTED)
+
+        available = self.token.available_balances(current_height=1000)
+
+        self.assertEqual(available["U"], Decimal("0"))
+        self.assertIn("U", available)
+
+    def test_owner_request_reserves_against_the_owner_anchor(self):
+        self.request("w1", "O", "0.002", VbtcV2WithdrawalRequest.Status.REQUESTED)
+
+        available = self.token.available_balances(current_height=1000)
+
+        self.assertEqual(available["O"], Decimal("0.004"))
+        self.assertEqual(available["U"], Decimal("0.004"))
+
+    def test_expired_request_stops_reserving(self):
+        self.request("w1", "U", "0.001", VbtcV2WithdrawalRequest.Status.REQUESTED)
+
+        self.assertEqual(
+            self.token.available_balances(
+                current_height=1000 + WITHDRAWAL_EXPIRY_BLOCKS + 1
+            )["U"],
+            Decimal("0.004"),
+        )
+
+    def test_boundary_block_still_reserves(self):
+        self.request("w1", "U", "0.001", VbtcV2WithdrawalRequest.Status.REQUESTED)
+
+        self.assertEqual(
+            self.token.available_balances(
+                current_height=1000 + WITHDRAWAL_EXPIRY_BLOCKS
+            )["U"],
+            Decimal("0.003"),
+        )
+
+    def test_unknown_height_keeps_reserving(self):
+        # Same fail-safe direction as recompute_pending_withdrawal.
+        self.request("w1", "U", "0.001", VbtcV2WithdrawalRequest.Status.REQUESTED)
+
+        self.assertEqual(
+            self.token.available_balances(current_height=0)["U"], Decimal("0.003")
+        )
+
+    def test_defaults_to_the_synced_chain_tip(self):
+        self.request("w1", "U", "0.001", VbtcV2WithdrawalRequest.Status.REQUESTED)
+        make_block(height=1000 + WITHDRAWAL_EXPIRY_BLOCKS + 1)
+
+        self.assertEqual(self.token.available_balances()["U"], Decimal("0.004"))
+
+    def test_api_exposes_both_maps(self):
+        self.request("w1", "U", "0.001", VbtcV2WithdrawalRequest.Status.REQUESTED)
+
+        request = APIRequestFactory().get("/api/btc/vbtc-v2/U/")
+        force_authenticate(request, user=User.objects.create_user(email="u@example.com", password="x"))
+        response = VbtcV2ListView.as_view()(request, vfx_address="U")
+
+        (token,) = response.data["results"]
+        self.assertEqual(token["addresses"]["U"], Decimal("0.004"))
+        self.assertEqual(token["available_balances"]["U"], Decimal("0.003"))
+        self.assertEqual(token["available_balances"]["O"], Decimal("0.006"))
 
 
 class OwnershipTransferSettlementTests(TestCase):
@@ -431,6 +715,69 @@ class UnindexedMintTests(TestCase):
         self.assertEqual(marker.status, UnindexedMint.Status.PENDING)
         self.assertEqual(marker.attempts, 2)
         self.assertFalse(VbtcV2Token.objects.exists())
+
+
+class MedialessMintTests(TestCase):
+    """VBTCDefaultAssetOnly contracts carry no media; the CLI may omit
+    SmartContractAsset entirely or serve it as null. Either way the mint
+    must still index — an unguarded subscript here raises inside the
+    per-transaction savepoint and rolls back the Transaction row itself,
+    so the token silently never appears."""
+
+    def setUp(self):
+        self.block = make_block(height=15)
+        self.tx = make_tx(
+            self.block,
+            "medialess-mint-tx",
+            Transaction.Type.VBTC_V2_MINT,
+            from_address="MINTER",
+            data=[{"Function": "Mint()", "ContractUID": "medialess-sc:1"}],
+        )
+
+    def payload(self, asset="omit"):
+        main = {
+            "Name": "Media-less vBTC",
+            "Description": "",
+            "MinterName": "MINTER",
+            "IsPublished": True,
+            "Features": [
+                {
+                    "FeatureName": 14,
+                    "FeatureFeatures": {
+                        "DepositAddress": "bc1p-medialess",
+                        "FrostGroupPublicKey": "03ab",
+                        "RequiredThreshold": 51,
+                        "ProofBlockHeight": 42,
+                    },
+                }
+            ],
+        }
+        if asset is None:
+            main["SmartContractAsset"] = None
+        return {"SmartContractMain": main}
+
+    def test_mint_with_omitted_asset_still_indexes(self):
+        with patch("rbx.tasks.get_nft", return_value=self.payload()):
+            process_transaction(self.tx)
+
+        nft = Nft.objects.get(identifier="medialess-sc:1")
+        self.assertEqual(nft.primary_asset_name, "")
+        self.assertEqual(nft.primary_asset_size, 0)
+
+        token = VbtcV2Token.objects.get(sc_identifier="medialess-sc:1")
+        self.assertEqual(token.image_base64, "default")
+        self.assertEqual(token.deposit_address, "bc1p-medialess")
+
+    def test_mint_with_null_asset_still_indexes(self):
+        with patch("rbx.tasks.get_nft", return_value=self.payload(asset=None)):
+            process_transaction(self.tx)
+
+        nft = Nft.objects.get(identifier="medialess-sc:1")
+        self.assertEqual(nft.primary_asset_name, "")
+        self.assertEqual(nft.primary_asset_size, 0)
+        self.assertTrue(
+            VbtcV2Token.objects.filter(sc_identifier="medialess-sc:1").exists()
+        )
 
 
 class ChainContractTests(TestCase):
@@ -1017,6 +1364,156 @@ class WithdrawCompleteExecuteRequiredFieldsTests(TestCase):
 
         self.assertEqual(response.status_code, 400)
         self.assertIn("amount", response.data["message"])
+
+
+class _InlineThread:
+    """Stand-in for threading.Thread that runs the target on start().
+
+    The execute view does its FROST work on a background thread; running it
+    inline makes the job cache deterministic to assert against.
+    """
+
+    def __init__(self, target=None, daemon=None):
+        self._target = target
+
+    def start(self):
+        self._target()
+
+
+class WithdrawCompleteExecuteMultiInputTests(TestCase):
+    """Multi-input withdrawals sign one StartMessage per vault UTXO. Input 0
+    travels in the legacy top-level start_signature; inputs >= 1 travel in
+    start_signatures[] and must reach the CLI as StartSignatures with
+    PascalCase keys — the proxy rebuilds every payload, so anything not
+    forwarded here is silently dropped."""
+
+    URL = "/api/btc/vbtc-v2/withdraw/complete/execute/"
+
+    def payload(self, **overrides):
+        data = {
+            "sc_identifier": "sc:1",
+            "withdrawal_request_hash": "w-req",
+            "owner_address": "OWNER",
+            "session_id": "session-1",
+            "start_signature": "sig-start",
+            "start_timestamp": 1,
+            "share_distribution_signature": "sig-share",
+            "share_distribution_timestamp": 1,
+            "amount": "0.0001",
+            "btc_destination": "bc1p-payout",
+        }
+        data.update(overrides)
+        return {k: v for k, v in data.items() if v is not None}
+
+    def post(self, data):
+        user = User.objects.create_user(email="multi@example.com", password="x")
+        request = APIRequestFactory().post(self.URL, data, format="json")
+        force_authenticate(request, user=user)
+        return VbtcV2WithdrawCompleteExecuteView.as_view()(request)
+
+    def poll(self, job_id):
+        user = User.objects.create_user(email="poll@example.com", password="x")
+        request = APIRequestFactory().get(f"{self.URL}status/{job_id}/")
+        force_authenticate(request, user=user)
+        return VbtcV2WithdrawCompleteStatusView.as_view()(request, job_id=job_id)
+
+    def execute_capturing_payload(self, data, result):
+        # The job runs inline (no real thread), so close_old_connections must
+        # be a no-op — on the test's own thread it would close the connection
+        # the test transaction lives on. Every result here is a failure, so
+        # the job always logs one ERROR line.
+        captured = {}
+
+        def fake_execute(payload):
+            captured.update(payload)
+            return result
+
+        with self.assertLogs(level="ERROR"):
+            with patch("api.btc.views.threading.Thread", _InlineThread):
+                with patch("api.btc.views.close_old_connections"):
+                    with patch("api.btc.views.execute_complete_withdrawal", fake_execute):
+                        response = self.post(data)
+
+        return response, captured
+
+    def test_start_signatures_reach_the_cli_in_pascal_case(self):
+        response, captured = self.execute_capturing_payload(
+            self.payload(start_signatures=[
+                {"input_index": 1, "signature": "sig-i1"},
+                {"input_index": 2, "signature": "sig-i2"},
+            ]),
+            {"Success": False, "Message": "InputCountMismatch probe"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(captured["StartSignatures"], [
+            {"InputIndex": 1, "Signature": "sig-i1"},
+            {"InputIndex": 2, "Signature": "sig-i2"},
+        ])
+
+    def test_single_input_omits_the_array_entirely(self):
+        # The CLI treats the field as optional; omitting it keeps the payload
+        # byte-compatible with the pre-multi-input node.
+        response, captured = self.execute_capturing_payload(
+            self.payload(),
+            {"Success": False, "Message": "probe"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn("StartSignatures", captured)
+
+    def test_malformed_start_signature_entry_is_rejected(self):
+        response = self.post(
+            self.payload(start_signatures=[{"signature": "sig-without-index"}])
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("start_signatures", response.data["message"])
+
+    def test_failed_job_serves_the_cli_diagnostics(self):
+        response, _ = self.execute_capturing_payload(
+            self.payload(),
+            {
+                "Success": False,
+                "Message": "FROST signing ceremony failed",
+                "FailureCode": "Round2InsufficientShares",
+                "SessionId": "session-1",
+                "InputIndex": 0,
+                "Retryable": True,
+                "ValidatorFailures": [
+                    {"ValidatorAddress": "VAL1", "HttpStatus": 409, "Message": "dup"},
+                ],
+            },
+        )
+        job_id = response.data["job_id"]
+
+        status = self.poll(job_id)
+
+        self.assertEqual(status.status_code, 500)
+        self.assertEqual(status.data["failure_code"], "Round2InsufficientShares")
+        self.assertIs(status.data["retryable"], True)
+        self.assertEqual(status.data["session_id"], "session-1")
+        self.assertEqual(status.data["input_index"], 0)
+        self.assertEqual(status.data["validator_failures"], [
+            {"validator_address": "VAL1", "http_status": 409, "message": "dup"},
+        ])
+
+    def test_pre_ceremony_failure_serves_nulls_with_the_message(self):
+        # Most CLI failure paths attach no ceremony — the diagnostics must
+        # come back null, not crash the status view or invent values.
+        response, _ = self.execute_capturing_payload(
+            self.payload(),
+            {"Success": False, "Message": "Withdrawal request not found"},
+        )
+        job_id = response.data["job_id"]
+
+        status = self.poll(job_id)
+
+        self.assertEqual(status.status_code, 500)
+        self.assertEqual(status.data["message"], "Withdrawal request not found")
+        self.assertIsNone(status.data["failure_code"])
+        self.assertIsNone(status.data["retryable"])
+        self.assertEqual(status.data["validator_failures"], [])
 
 
 class WithdrawalStatusRaceTests(TestCase):

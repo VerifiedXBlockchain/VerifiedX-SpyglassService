@@ -1,10 +1,13 @@
 import json
 import string
+import threading
 import time
 from decimal import Decimal
 from typing import List, Optional, Tuple
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from django.conf import settings
 from django.utils import timezone
 
@@ -22,11 +25,30 @@ BASE_URL = settings.RBX_WALLET_ADDRESS
 SHOP_BASE_URL = settings.RBX_SHOP_WALLET_ADDRESS
 SHOP_CRAWLER_BASE_URL = settings.RBX_SHOP_CRAWLER_ADDRESS
 
-# (connect, read) timeout for the smart-contract fetch. This runs inline on the
-# concurrency-1 blocks worker, so an unbounded call there stops block sync for
-# as long as the CLI holds the socket open. The read half is generous because
-# the CLI can take ~30s to answer while its validator registry loads.
-NFT_TIMEOUT = (5, 30)
+_thread_local = threading.local()
+
+# (connect, read) timeout for CLI calls on the sync path. These run inline on
+# the concurrency-1 blocks worker, so an unbounded call there stops block sync
+# for as long as the CLI holds the socket open. The read half is generous
+# because the CLI can take ~30s to answer while its validator registry loads
+# after a restart.
+CLI_TIMEOUT = (5, 30)
+
+
+def _get_session() -> requests.Session:
+    # One Session per thread: connections get reused across requests without
+    # sharing a Session between the block-prefetch threads. The retry adapter
+    # absorbs transient connection errors (e.g. a keep-alive socket the CLI
+    # closed between calls) without retrying non-200 responses, which keep
+    # raising RBXException as before.
+    session = getattr(_thread_local, "session", None)
+    if session is None:
+        session = requests.Session()
+        adapter = HTTPAdapter(max_retries=Retry(total=2, backoff_factor=0.5))
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+        _thread_local.session = session
+    return session
 
 
 def _fix_amount(amount):
@@ -48,7 +70,7 @@ def get_status() -> str:
 
 def get_info() -> Optional[dict]:
     url = join_url(BASE_URL, "api/V1/GetWalletInfo")
-    response = requests.get(url, timeout=15)
+    response = _get_session().get(url, timeout=CLI_TIMEOUT)
 
     if response.status_code != 200:
         raise RBXException
@@ -74,7 +96,7 @@ def get_master_nodes() -> List[dict]:
 
 def get_block(height: int) -> Optional[dict]:
     url = join_url(BASE_URL, f"api/V1/SendBlock/{height}")
-    response = requests.get(url, timeout=15)
+    response = _get_session().get(url, timeout=CLI_TIMEOUT)
 
     if response.status_code != 200:
         raise RBXException
@@ -480,7 +502,9 @@ def get_nft(id: str, attempt=0) -> Tuple[dict, int]:
     url = join_url(BASE_URL, f"/scapi/scv1/GetSmartContractData/{id}/")
 
     try:
-        response = requests.get(url, timeout=NFT_TIMEOUT)
+        # This runs inside sync_block's per-block DB transaction — the
+        # timeout bounds how long a hung CLI can hold that transaction open.
+        response = requests.get(url, timeout=CLI_TIMEOUT)
     except Exception as e:
         logger.error(f"NFT get data exception: {e}")
         time.sleep(5)
@@ -1042,8 +1066,10 @@ def get_default_vbtc_base64_image_data():
 def send_testnet_funds(from_address: str, to_address: str, amount: Decimal):
 
     if settings.FAUCET_ENABLED:
-        # Strip trailing zeros from amount (e.g., 1.0 -> "1", 1.10000 -> "1.1")
-        amount_str = str(amount.normalize())
+        # Strip trailing zeros (1.0 -> "1", 1.10000 -> "1.1") without the
+        # scientific notation str(normalize()) produces for round numbers
+        # (10 -> "1E+1"), which the CLI can't parse.
+        amount_str = format(amount.normalize(), "f")
         url = join_url(
             BASE_URL, f"api/V1/SendTransaction/{from_address}/{to_address}/{amount_str}"
         )
@@ -1075,7 +1101,7 @@ def withdraw_btc(payload: dict):
     url = join_url(BASE_URL, f"btcapi/btcv2/WithdrawalCoinRawTX")
     logger.info(f"URL: {url}")
 
-    response = requests.post(url, json=payload)
+    response = requests.post(url, json=payload, timeout=30)
 
     data = response.json()
     logger.info(f"RESPONSE: {json.dumps(data)}")
