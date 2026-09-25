@@ -101,6 +101,18 @@ def _fix_amount(amount):
     return amount * 1.0
 
 
+def _fix_decimals(transaction: dict) -> dict:
+    """Write Amount and Fee as floats so a whole number keeps a decimal point.
+
+    The wallet's JSON arrives through DRF, which keeps 1 as an integer, and
+    the CLI refuses a non-zero Fee written without decimal places (NEW-23).
+    """
+    transaction["Amount"] = _fix_amount(transaction["Amount"])
+    if "Fee" in transaction:
+        transaction["Fee"] = _fix_amount(transaction["Fee"])
+    return transaction
+
+
 def get_status() -> str:
     url = join_url(BASE_URL, "api/V1/CheckStatus")
     response = _http.get(url)
@@ -165,8 +177,7 @@ def tx_get_fee(transaction: dict, *args) -> Tuple[dict, int]:
 
 def tx_get_hash(transaction: dict) -> Tuple[dict, int]:
     url = join_url(BASE_URL, "txapi/txV1/GetTxHash")
-    data = transaction
-    data["Amount"] = _fix_amount(data["Amount"])
+    data = _fix_decimals(transaction)
 
     response = _http.post(url, json=data)
     if response.status_code != 200:
@@ -181,8 +192,7 @@ def tx_get_hash(transaction: dict) -> Tuple[dict, int]:
 def tx_verify(transaction: dict) -> Tuple[dict, int]:
     url = join_url(BASE_URL, "txapi/txV1/VerifyRawTransaction")
 
-    data = transaction
-    data["Amount"] = _fix_amount(data["Amount"])
+    data = _fix_decimals(transaction)
 
     response = _http.post(url, json=data)
     if response.status_code != 200:
@@ -197,8 +207,7 @@ def tx_verify(transaction: dict) -> Tuple[dict, int]:
 def tx_send(transaction: dict) -> Tuple[dict, int]:
     url = join_url(BASE_URL, "txapi/txV1/SendRawTransaction")
 
-    data = transaction
-    data["Amount"] = _fix_amount(data["Amount"])
+    data = _fix_decimals(transaction)
 
     response = _http.post(url, json=data)
 
