@@ -103,6 +103,12 @@ class AuctionSaleCompleteRelayTests(TestCase):
         )
         make_tx(make_block(), "start-hash", 0, data={"BidSignature": "sig-1"})
 
+    def test_missing_start_transaction_returns_false(self):
+        from shop.tasks import handle_auction_sale_complete_tx
+
+        with self.assertLogs(level="ERROR"):
+            self.assertFalse(handle_auction_sale_complete_tx("no-such-hash"))
+
     def test_refusal_is_logged_with_listing_and_node_message(self):
         from shop.tasks import handle_auction_sale_complete_tx
 

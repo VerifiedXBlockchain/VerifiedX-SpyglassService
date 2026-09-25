@@ -498,8 +498,8 @@ def handle_auction_sale_complete_tx(tx_hash: str, dryrun: bool = False):
     try:
         tx = Transaction.objects.get(hash=tx_hash)
     except Transaction.DoesNotExist:
-        print(f"Tx not found with hash of {tx_hash}")
-        pass
+        logging.error(f"Auction sale start transaction {tx_hash} is not indexed.")
+        return False
 
     parsed = json.loads(tx.data)
     bid_signature = parsed["BidSignature"] if "BidSignature" in parsed else None
