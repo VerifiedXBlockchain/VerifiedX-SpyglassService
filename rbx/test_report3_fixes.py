@@ -177,3 +177,71 @@ class RawBidHandshakeTests(TestCase):
                 self.assertLogs(level="ERROR"):
             client.send_raw_bid(self.bid)
         post.assert_not_called()
+
+
+class AssetFileNameValidationTests(TestCase):
+    """Asset names must be plain file names before minting (VX-04, NEW-03)."""
+
+    def _post(self, payload):
+        from rest_framework.test import APIRequestFactory
+
+        from api.raw.views import SmartContractDataView
+
+        request = APIRequestFactory().post("/raw/smart-contract-data/", payload, format="json")
+        return SmartContractDataView.as_view()(request)
+
+    def _payload(self, primary="image.png", multi=("extra.png",), phase="evolve.png"):
+        return {
+            "SmartContractAsset": {"Name": primary, "Location": "default"},
+            "Features": [
+                {
+                    "FeatureName": 2,
+                    "FeatureFeatures": [
+                        {"FileName": name, "Location": "default"} for name in multi
+                    ],
+                },
+                {
+                    "FeatureName": 0,
+                    "FeatureFeatures": [
+                        {"SmartContractAsset": {"Name": phase, "Location": "default"}}
+                    ],
+                },
+            ],
+        }
+
+    def test_node_rule(self):
+        for name in ("image.png", "my file (1).jpeg", "a.b.c", "日本.png"):
+            with self.subTest(name=name):
+                self.assertTrue(client.is_safe_asset_file_name(name))
+        for name in (
+            "dir/image.png", "dir\\image.png", "C:image.png", "..png", "a..b",
+            "bad\x00.png", "tab\t.png", "del\x7f.png", "image.png ", "image.",
+        ):
+            with self.subTest(name=name):
+                self.assertFalse(client.is_safe_asset_file_name(name))
+
+    def test_each_asset_slot_is_checked_and_named_in_a_400(self):
+        cases = (
+            self._payload(primary="../image.png"),
+            self._payload(multi=("ok.png", "sub/extra.png")),
+            self._payload(phase="evolve.png."),
+        )
+        bad_names = ("../image.png", "sub/extra.png", "evolve.png.")
+        for payload, bad_name in zip(cases, bad_names):
+            with self.subTest(bad_name=bad_name), \
+                    patch.object(client._http, "post") as post, \
+                    patch.object(client, "scp_up_url") as scp:
+                response = self._post(payload)
+            self.assertEqual(response.status_code, 400)
+            self.assertEqual(response.data["file_name"], bad_name)
+            self.assertIn(bad_name, response.data["error"])
+            post.assert_not_called()
+            scp.assert_not_called()
+
+    def test_plain_names_reach_the_node(self):
+        node_response = MagicMock(status_code=200, text="[]")
+        node_response.json.return_value = [{"ContractUID": "sc:new"}]
+        with patch.object(client._http, "post", return_value=node_response) as post:
+            response = self._post(self._payload())
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("txapi/txv1/GetSCMintDeployData", post.call_args.args[0])

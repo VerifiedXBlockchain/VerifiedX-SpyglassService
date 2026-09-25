@@ -2,6 +2,7 @@ import json
 import string
 import threading
 import time
+import unicodedata
 from decimal import Decimal
 from typing import List, Optional, Tuple
 
@@ -12,7 +13,7 @@ from django.conf import settings
 from django.utils import timezone
 
 from project.utils.url import join_url
-from rbx.exceptions import RBXException
+from rbx.exceptions import RBXException, UnsafeAssetFileName
 from rbx.models import Nft
 from shop.models import Bid
 import logging
@@ -233,9 +234,47 @@ def get_smart_contract(identifier: str) -> Optional[dict]:
         return None
 
 
+def is_safe_asset_file_name(file_name: str) -> bool:
+    """The CLI's plain file name rule for NFT assets (VX-04, NEW-03).
+
+    Mirrors NFTAssetFileUtility.IsSafeAssetFileName plus the HTTP beacon's
+    refusal of a trailing space or dot.
+    """
+    if "/" in file_name or "\\" in file_name or ":" in file_name or ".." in file_name:
+        return False
+    if any(unicodedata.category(char) == "Cc" for char in file_name):
+        return False
+    return not file_name.endswith((" ", "."))
+
+
+def _asset_file_names(payload: dict) -> List[str]:
+    """Every asset name nft_data forwards to GetSCMintDeployData."""
+    names = []
+    primary = payload.get("SmartContractAsset")
+    if primary:
+        names.append(primary.get("Name"))
+    for feature in payload.get("Features") or []:
+        if feature.get("FeatureName") == 2:
+            names.extend(asset.get("FileName") for asset in feature.get("FeatureFeatures") or [])
+        if feature.get("FeatureName") == 0:
+            for phase in feature.get("FeatureFeatures") or []:
+                if phase.get("SmartContractAsset"):
+                    names.append(phase["SmartContractAsset"].get("Name"))
+    return [name for name in names if isinstance(name, str) and name]
+
+
 def nft_data(payload: dict, *args) -> Optional[dict]:
+    """Mint deploy data for the wallet's contract.
+
+    Raises UnsafeAssetFileName before any upload when an asset name would
+    mint but later fail beacon uploads and shop thumbnails.
+    """
     logger = logging.getLogger(__name__)
     url = join_url(SHOP_BASE_URL, f"txapi/txv1/GetSCMintDeployData/")
+
+    for file_name in _asset_file_names(payload):
+        if not is_safe_asset_file_name(file_name):
+            raise UnsafeAssetFileName(file_name)
 
     asset_urls = {}
 
