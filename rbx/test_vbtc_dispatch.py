@@ -582,3 +582,41 @@ class ReprocessCommandTests(TestCase):
         self.assertNotIn("e2", text)
         self.assertIn("v1", text)
         self.assertIn("1 envelope transaction(s) included", text)
+
+
+@TESTNET
+class MintReprocessTests(TestCase):
+    """Reprocessing a mint must not reset what the token has learned since:
+    the BTC on deposit and the current owner."""
+
+    MINT_DATA = [{
+        "Function": "Mint()",
+        "ContractUID": "sc:mint",
+    }]
+
+    def test_reprocessing_a_mint_keeps_balance_and_owner(self):
+        from unittest.mock import patch
+        block = make_block()
+        tx = make_tx(block, "mint1", Transaction.Type.VBTC_V2_MINT, from_address="O", data=self.MINT_DATA)
+        payload = {
+            "SmartContractMain": {
+                "Name": "t", "Description": "", "MinterName": "m", "IsPublished": True,
+                "SmartContractAsset": {"Name": "a", "FileSize": 0},
+                "Features": [{"FeatureName": 14, "FeatureFeatures": {"DepositAddress": "bc1p", "ValidatorAddressesSnapshot": ["V1"]}}],
+            }
+        }
+        with patch("rbx.tasks.get_nft", return_value=payload):
+            process_transaction(tx)
+            from rbx.models import VbtcV2Token
+            token = VbtcV2Token.objects.get(sc_identifier="sc:mint")
+            token.global_balance = Decimal("0.01")
+            token.owner_address = "P"
+            token.save(update_fields=["global_balance", "owner_address"])
+
+            process_transaction(tx)
+
+        token.refresh_from_db()
+        self.assertEqual(token.global_balance, Decimal("0.01"))
+        self.assertEqual(token.owner_address, "P")
+        self.assertEqual(token.validator_snapshot, ["V1"])
+

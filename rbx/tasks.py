@@ -635,13 +635,14 @@ def process_transaction(tx: Transaction):
 
                         try:
                             v2_token = VbtcV2Token.objects.get(sc_identifier=identifier)
+                            is_new_v2_token = False
                         except VbtcV2Token.DoesNotExist:
                             v2_token = VbtcV2Token(sc_identifier=identifier)
+                            is_new_v2_token = True
 
                         v2_token.nft = nft
                         v2_token.name = nft.name
                         v2_token.description = nft.description
-                        v2_token.owner_address = nft.owner_address
                         v2_token.image_base64 = v2_info.get("ImageBase", "default")
                         v2_token.deposit_address = v2_info["DepositAddress"]
                         v2_token.frost_group_public_key = v2_info.get("FrostGroupPublicKey", "")
@@ -651,8 +652,16 @@ def process_transaction(tx: Transaction):
                         )
                         v2_token.required_threshold = v2_info.get("RequiredThreshold", 0)
                         v2_token.proof_block_height = v2_info.get("ProofBlockHeight", 0)
-                        v2_token.global_balance = Decimal(0)
-                        v2_token.created_at = tx.date_crafted
+                        if is_new_v2_token:
+                            # Only a first index starts the token empty. On a
+                            # reprocess the owner may have changed hands since
+                            # the mint, and global_balance is the BTC on
+                            # deposit as of the last chain sync: resetting it
+                            # to zero drops every owner anchor until the next
+                            # sync runs (seen on the 2026-09-25 backfill).
+                            v2_token.owner_address = nft.owner_address
+                            v2_token.global_balance = Decimal(0)
+                            v2_token.created_at = tx.date_crafted
                         v2_token.save()
 
                         nft.is_vbtc = True
