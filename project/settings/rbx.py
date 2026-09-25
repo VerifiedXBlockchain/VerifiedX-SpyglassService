@@ -44,3 +44,14 @@ RBX_WEB_BASE_URL = ENV.str("RBX_WEB_BASE_URL")
 
 with open(RBX_WALLET_SSH_KEY_PATH, "w+") as file:
     file.write(base64.b64decode(ENV.str("RBX_WALLET_SSH_KEY_B64")).decode("utf-8"))
+
+# vBTC V2 activation heights. The node gates several consensus rules on block
+# height and Spyglass must apply each rule at the same height (rbx/vbtc_gates.py).
+# VBTC_NETWORK selects the mainnet or testnet table; each height can also be
+# pinned explicitly, for a devnet or a test.
+VBTC_NETWORK = ENV.str("VBTC_NETWORK", default="mainnet")
+VBTC_WITHDRAWAL_ESCROW_HEIGHT = ENV.int("VBTC_WITHDRAWAL_ESCROW_HEIGHT", default=None)
+VBTC_V2_TRANSFER_MULTI_HEIGHT = ENV.int("VBTC_V2_TRANSFER_MULTI_HEIGHT", default=None)
+VBTC_V2_WITHDRAWAL_OWNER_ADDBACK_FIX_HEIGHT = ENV.int(
+    "VBTC_V2_WITHDRAWAL_OWNER_ADDBACK_FIX_HEIGHT", default=None
+)
