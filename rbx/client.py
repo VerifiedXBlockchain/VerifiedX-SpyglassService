@@ -29,17 +29,22 @@ _thread_local = threading.local()
 
 
 def _node_headers(url: str) -> dict:
-    """The apitoken header for a call to our own node, else nothing.
+    """The apitoken header for a call to one of the team's nodes, else nothing.
 
     CLI 8.0 (security audit VX-03) keeps an "openapi" node on loopback unless
     it has an API token, and once it has one every route outside the CLI's
-    short approved list demands the header. Only our node's hosts get the
-    token — SHOP_BASE_URL is somebody else's wallet.
+    short approved list demands the header. The wallet and crawler hosts
+    share RBX_WALLET_API_TOKEN. The shop wallet node (SHOP_BASE_URL) is also
+    a team node, upgraded with the others, and has its own token in
+    RBX_SHOP_WALLET_API_TOKEN. Any other URL gets no header.
     """
-    token = settings.RBX_WALLET_API_TOKEN
-    if token and url.startswith((BASE_URL, SHOP_CRAWLER_BASE_URL)):
-        return {"apitoken": token}
-    return {}
+    if url.startswith((BASE_URL, SHOP_CRAWLER_BASE_URL)):
+        token = settings.RBX_WALLET_API_TOKEN
+    elif url.startswith(SHOP_BASE_URL):
+        token = settings.RBX_SHOP_WALLET_API_TOKEN
+    else:
+        return {}
+    return {"apitoken": token} if token else {}
 
 
 class _NodeHttp:
