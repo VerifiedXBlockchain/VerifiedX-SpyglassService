@@ -70,3 +70,62 @@ class RawTransactionFeeDecimalsTests(TestCase):
     def test_transaction_without_a_fee_is_left_alone(self):
         body = self._posted_body(client.tx_verify, {"Amount": 2})
         self.assertEqual(json.loads(body), {"Amount": 2.0})
+
+
+class AuctionSaleCompleteRelayTests(TestCase):
+    """A stored completion the node refuses must be logged, not dropped."""
+
+    def setUp(self):
+        from decimal import Decimal
+
+        from django.utils import timezone
+
+        from rbx.tests import make_block, make_tx
+        from shop.models import Bid, Collection, Listing, Shop
+
+        shop = Shop.objects.create(
+            shop_id=1, unique_id="u1", name="Shop", url="vfx://shop",
+            description="", owner_address="SELLER",
+        )
+        collection = Collection.objects.create(
+            shop=shop, collection_id=1, name="C", description=""
+        )
+        self.listing = Listing.objects.create(
+            collection=collection, listing_id=7, smart_contract_uid="sc:auction",
+            owner_address="SELLER", floor_price=Decimal("1"),
+            start_date=timezone.now(), end_date=timezone.now(),
+            is_visible_before_start_date=True, is_visible_after_end_date=True,
+        )
+        Bid.objects.create(
+            bid_id="bid-1", listing=self.listing, address="BUYER", signature="sig-1",
+            amount=Decimal("5"), send_time=0,
+            pre_signed_sale_complete_tx=json.dumps({"Amount": 5, "Fee": 1}),
+        )
+        make_tx(make_block(), "start-hash", 0, data={"BidSignature": "sig-1"})
+
+    def test_refusal_is_logged_with_listing_and_node_message(self):
+        from shop.tasks import handle_auction_sale_complete_tx
+
+        refusal = {"Result": "Fail", "Message": "Transaction was not verified."}
+        with patch("rbx.client.tx_send", return_value=refusal), \
+                self.assertLogs(level="ERROR") as logs:
+            self.assertFalse(handle_auction_sale_complete_tx("start-hash"))
+        self.assertIn(f"listing {self.listing.pk}", logs.output[0])
+        self.assertIn("sc:auction", logs.output[0])
+        self.assertIn("Transaction was not verified.", logs.output[0])
+
+    def test_missing_response_is_logged(self):
+        from shop.tasks import handle_auction_sale_complete_tx
+
+        with patch("rbx.client.tx_send", return_value=None), \
+                self.assertLogs(level="ERROR") as logs:
+            self.assertFalse(handle_auction_sale_complete_tx("start-hash"))
+        self.assertIn("sc:auction", logs.output[0])
+
+    def test_success_is_not_logged_as_an_error(self):
+        from shop.tasks import handle_auction_sale_complete_tx
+
+        success = {"Result": "Success", "Message": "Transaction has been broadcasted."}
+        with patch("rbx.client.tx_send", return_value=success), \
+                self.assertNoLogs(level="ERROR"):
+            self.assertTrue(handle_auction_sale_complete_tx("start-hash"))
