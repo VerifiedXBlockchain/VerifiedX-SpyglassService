@@ -5,6 +5,7 @@ review finding it pins (reviews/vbtc-non-core-followups-2026-09-24.md).
 from datetime import timedelta
 from decimal import Decimal
 
+from django.core.management import call_command
 from django.test import TestCase, override_settings
 from django.utils import timezone
 
@@ -319,6 +320,14 @@ class MultiWithdrawalIndexingTests(TestCase):
         self.assertEqual(statuses["sc:a"], VbtcV2WithdrawalRequest.Status.REQUESTED)
         self.assertEqual(statuses["sc:b"], VbtcV2WithdrawalRequest.Status.CANCELLATION_REQUESTED)
 
+    def test_signing_marks_only_the_named_contract(self):
+        request = self.multi_request()
+        process_transaction(request)
+        _mark_withdrawal_signed("mr1", "0200hex", "sc:b")
+        statuses = {r.token.sc_identifier: r.status for r in VbtcV2WithdrawalRequest.objects.filter(request_transaction=request)}
+        self.assertEqual(statuses["sc:a"], VbtcV2WithdrawalRequest.Status.REQUESTED)
+        self.assertEqual(statuses["sc:b"], VbtcV2WithdrawalRequest.Status.PENDING_BTC)
+
     def test_unparsable_input_applies_nothing(self):
         tx = make_tx(
             self.block, "mr1", Transaction.Type.VBTC_V2_WITHDRAWAL_REQUEST, from_address="H",
@@ -536,3 +545,24 @@ class ReserveTransferTests(TestCase):
         redirect_reserve_transfer(self.tx, "Recovered", timezone.now() - timedelta(seconds=1))
         self.assertEqual(self.token.addresses["Recovered"], Decimal("0.002"))
         self.assertNotIn("R", self.token.addresses)
+
+
+@TESTNET
+class ReprocessCommandTests(TestCase):
+    def test_dry_run_lists_envelope_transactions(self):
+        block = make_block()
+        make_token(owner="O", global_balance="0.01", sc_identifier="sc:a")
+        make_tx(block, "e1", Transaction.Type.TKNZ_TX, from_address="O", to_address="R",
+                data={"Function": "TransferVBTCV2()", "ContractUID": "sc:a", "Amount": 0.001})
+        make_tx(block, "e2", Transaction.Type.TKNZ_TX, from_address="O", to_address="R",
+                data={"Function": "TransferCoin()", "ContractUID": "sc:a", "Amount": 0.001})
+        make_tx(block, "v1", Transaction.Type.VBTC_V2_WITHDRAWAL_VOTE, from_address="V1",
+                data={"CancellationUID": "CANCEL_x", "Approve": True})
+        from io import StringIO
+        out = StringIO()
+        call_command("reprocess_vbtc_v2", "--dry-run", stdout=out)
+        text = out.getvalue()
+        self.assertIn("e1", text)
+        self.assertNotIn("e2", text)
+        self.assertIn("v1", text)
+        self.assertIn("1 envelope transaction(s) included", text)

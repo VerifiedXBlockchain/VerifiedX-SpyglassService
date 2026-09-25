@@ -530,7 +530,7 @@ FROST_JOB_RESULT_TTL = 24 * 60 * 60
 FROST_JOB_FAILED_TTL = FROST_JOB_RESULT_TTL
 
 
-def _mark_withdrawal_signed(withdrawal_request_hash, signed_btc_tx_hex):
+def _mark_withdrawal_signed(withdrawal_request_hash, signed_btc_tx_hex, sc_identifier=None):
     """Record that a FROST ceremony produced a signed Bitcoin transaction.
 
     Nothing else records this. btc_transaction_hash is only written when the
@@ -541,9 +541,14 @@ def _mark_withdrawal_signed(withdrawal_request_hash, signed_btc_tx_hex):
     the network, paying the destination twice.
     """
 
+    # Scoped to the contract when the caller names one: a multi-contract
+    # request has one row per contract under the same request hash, and the
+    # ceremony signs exactly one of them.
     rows = VbtcV2WithdrawalRequest.objects.filter(
         request_transaction__hash=withdrawal_request_hash
     )
+    if sc_identifier:
+        rows = rows.filter(token__sc_identifier=sc_identifier)
 
     try:
         # One statement, evaluated against whatever is committed at the time
@@ -563,7 +568,8 @@ def _mark_withdrawal_signed(withdrawal_request_hash, signed_btc_tx_hex):
             signed_at=timezone.now(),
             status=Case(
                 When(
-                    status__in=VbtcV2WithdrawalRequest.TERMINAL_STATUSES,
+                    status__in=VbtcV2WithdrawalRequest.TERMINAL_STATUSES
+                    + (VbtcV2WithdrawalRequest.Status.CANCELLATION_REQUESTED,),
                     then=F("status"),
                 ),
                 default=Value(VbtcV2WithdrawalRequest.Status.PENDING_BTC),
@@ -664,6 +670,7 @@ class VbtcV2WithdrawCompleteExecuteView(GenericAPIView):
                     _mark_withdrawal_signed(
                         payload["WithdrawalRequestHash"],
                         result.get("SignedBTCTxHex") or "",
+                        payload.get("SmartContractUID"),
                     )
                     _cache.set(
                         f"{FROST_JOB_PREFIX}{job_id}",
