@@ -27,6 +27,43 @@ SHOP_CRAWLER_BASE_URL = settings.RBX_SHOP_CRAWLER_ADDRESS
 
 _thread_local = threading.local()
 
+
+def _node_headers(url: str) -> dict:
+    """The apitoken header for a call to our own node, else nothing.
+
+    CLI 8.0 (security audit VX-03) keeps an "openapi" node on loopback unless
+    it has an API token, and once it has one every route outside the CLI's
+    short approved list demands the header. Only our node's hosts get the
+    token — SHOP_BASE_URL is somebody else's wallet.
+    """
+    token = settings.RBX_WALLET_API_TOKEN
+    if token and url.startswith((BASE_URL, SHOP_CRAWLER_BASE_URL)):
+        return {"apitoken": token}
+    return {}
+
+
+class _NodeHttp:
+    """requests.get/post that attach the node token (see _node_headers).
+
+    Explicit headers passed by a caller win over the token entry.
+    """
+
+    @staticmethod
+    def _kwargs(url: str, kwargs: dict) -> dict:
+        token_headers = _node_headers(url)
+        if token_headers:
+            kwargs["headers"] = {**token_headers, **(kwargs.get("headers") or {})}
+        return kwargs
+
+    def get(self, url: str, **kwargs):
+        return requests.get(url, **self._kwargs(url, kwargs))
+
+    def post(self, url: str, **kwargs):
+        return requests.post(url, **self._kwargs(url, kwargs))
+
+
+_http = _NodeHttp()
+
 # (connect, read) timeout for CLI calls on the sync path. These run inline on
 # the concurrency-1 blocks worker, so an unbounded call there stops block sync
 # for as long as the CLI holds the socket open. The read half is generous
@@ -44,6 +81,7 @@ def _get_session() -> requests.Session:
     session = getattr(_thread_local, "session", None)
     if session is None:
         session = requests.Session()
+        session.headers.update(_node_headers(BASE_URL))
         adapter = HTTPAdapter(max_retries=Retry(total=2, backoff_factor=0.5))
         session.mount("http://", adapter)
         session.mount("https://", adapter)
@@ -60,7 +98,7 @@ def _fix_amount(amount):
 
 def get_status() -> str:
     url = join_url(BASE_URL, "api/V1/CheckStatus")
-    response = requests.get(url)
+    response = _http.get(url)
 
     if response.status_code != 200:
         raise RBXException
@@ -83,7 +121,7 @@ def get_info() -> Optional[dict]:
 
 def get_master_nodes() -> List[dict]:
     url = join_url(BASE_URL, "api/V1/GetMasternodesSent")
-    response = requests.get(url)
+    response = _http.get(url)
 
     if response.status_code != 200:
         raise RBXException
@@ -110,7 +148,7 @@ def get_block(height: int) -> Optional[dict]:
 def tx_get_fee(transaction: dict, *args) -> Tuple[dict, int]:
     url = join_url(BASE_URL, "txapi/txV1/GetRawTxFee")
 
-    response = requests.post(url, json=transaction)
+    response = _http.post(url, json=transaction)
     if response.status_code != 200:
         raise RBXException
 
@@ -125,7 +163,7 @@ def tx_get_hash(transaction: dict) -> Tuple[dict, int]:
     data = transaction
     data["Amount"] = _fix_amount(data["Amount"])
 
-    response = requests.post(url, json=data)
+    response = _http.post(url, json=data)
     if response.status_code != 200:
         raise RBXException
 
@@ -141,7 +179,7 @@ def tx_verify(transaction: dict) -> Tuple[dict, int]:
     data = transaction
     data["Amount"] = _fix_amount(data["Amount"])
 
-    response = requests.post(url, json=data)
+    response = _http.post(url, json=data)
     if response.status_code != 200:
         raise RBXException
 
@@ -157,7 +195,7 @@ def tx_send(transaction: dict) -> Tuple[dict, int]:
     data = transaction
     data["Amount"] = _fix_amount(data["Amount"])
 
-    response = requests.post(url, json=data)
+    response = _http.post(url, json=data)
 
     if response.status_code != 200:
         raise RBXException
@@ -170,7 +208,7 @@ def tx_send(transaction: dict) -> Tuple[dict, int]:
 
 def get_smart_contract(identifier: str) -> Optional[dict]:
     url = join_url(SHOP_BASE_URL, f"/scapi/scv1/GetSmartContractData/{identifier}")
-    response = requests.get(url)
+    response = _http.get(url)
 
     if response.status_code != 200:
         raise RBXException
@@ -229,7 +267,7 @@ def nft_data(payload: dict, *args) -> Optional[dict]:
 
             feature_i += 1
 
-    response = requests.post(url, json=payload)
+    response = _http.post(url, json=payload)
 
     logger.debug(f"NFT data response: {response.text}")
 
@@ -264,7 +302,7 @@ def nft_data(payload: dict, *args) -> Optional[dict]:
 def compile_smart_contract(payload: dict) -> Optional[dict]:
 
     url = join_url(SHOP_BASE_URL, "scapi/scv1/CreateSmartContract")
-    response = requests.post(url, json=payload)
+    response = _http.post(url, json=payload)
     if response.status_code != 200:
         raise RBXException
     try:
@@ -275,7 +313,7 @@ def compile_smart_contract(payload: dict) -> Optional[dict]:
 
 def mint_smart_contract(id: str, *args) -> Tuple[dict, int]:
     url = join_url(SHOP_BASE_URL, f"scapi/scv1/MintSmartContract/{id}")
-    response = requests.post(url)
+    response = _http.post(url)
     if response.status_code != 200:
         raise RBXException
     try:
@@ -291,7 +329,7 @@ def nft_transfer_data(id: str, address: str, locator: str, *args):
         f"txapi/txV1/GetNftTransferData/{id}/{address}/{locator}",
     )
 
-    response = requests.get(url)
+    response = _http.get(url)
 
     if response.status_code != 200:
         raise RBXException
@@ -308,7 +346,7 @@ def nft_evolve_data(id: str, address: str, next_state: str, *args):
         f"txapi/txV1/GetNFTEvolveData/{id}/{address}/{next_state}",
     )
 
-    response = requests.get(url)
+    response = _http.get(url)
 
     if response.status_code != 200:
         raise RBXException
@@ -321,7 +359,7 @@ def nft_evolve_data(id: str, address: str, next_state: str, *args):
 def nft_burn_data(id: str, address: str, *args) -> Tuple[dict, int]:
 
     url = join_url(SHOP_BASE_URL, f"txapi/txV1/GetNFTBurnData/{id}/{address}/")
-    response = requests.get(url)
+    response = _http.get(url)
 
     if response.status_code != 200:
         raise RBXException
@@ -333,7 +371,7 @@ def nft_burn_data(id: str, address: str, *args) -> Tuple[dict, int]:
 
 def get_locators(id: str, *args) -> Tuple[dict, int]:
     url = join_url(SHOP_BASE_URL, f"scapi/scV1/GetLastKnownLocators/{id}")
-    response = requests.get(url)
+    response = _http.get(url)
 
     if response.status_code != 200:
         raise RBXException
@@ -353,7 +391,7 @@ def get_beacon_assets(
     )
     logger.debug(f"Beacon assets URL: {url}")
 
-    response = requests.get(url)
+    response = _http.get(url)
 
     logger.debug(f"Beacon assets response: {response.text}")
 
@@ -373,7 +411,7 @@ def beacon_upload_request(
     )
 
     try:
-        response = requests.get(url)
+        response = _http.get(url)
     except requests.RequestException as e:
         logger.error(f"Beacon upload request failed: {e}")
         return None
@@ -399,7 +437,7 @@ def beacon_upload_request(
 
 def get_timestamp() -> Optional[int]:
     url = join_url(BASE_URL, "/txapi/txV1/GetTimestamp")
-    response = requests.get(url)
+    response = _http.get(url)
 
     if response.status_code != 200:
         raise RBXException
@@ -414,7 +452,7 @@ def get_timestamp() -> Optional[int]:
 def get_address_nonce(address: str) -> Optional[Decimal]:
     logger = logging.getLogger(__name__)
     url = join_url(BASE_URL, f"/txapi/txV1/GetAddressNonce/{address}")
-    response = requests.get(url)
+    response = _http.get(url)
 
     logger.debug(f"Address nonce response: {response.json()}")
 
@@ -430,7 +468,7 @@ def get_address_nonce(address: str) -> Optional[Decimal]:
 
 def get_raw_tx_fee(tx: dict) -> Optional[Decimal]:
     url = join_url(BASE_URL, "/txapi/txV1/GetRawTxFee")
-    response = requests.post(url, data=tx)
+    response = _http.post(url, data=tx)
 
     if response.status_code != 200:
         raise RBXException
@@ -444,7 +482,7 @@ def get_raw_tx_fee(tx: dict) -> Optional[Decimal]:
 
 def get_tx_hash(tx: dict) -> Optional[str]:
     url = join_url(BASE_URL, "/txapi/txV1/GetTxHash")
-    response = requests.post(url, data=tx)
+    response = _http.post(url, data=tx)
 
     if response.status_code != 200:
         raise RBXException
@@ -460,7 +498,7 @@ def validate_signature(message: str, address: str, signature: str) -> bool:
     url = join_url(
         BASE_URL, f"/txapi/txV1/ValidateSignature/{message}/{address}/{signature}/"
     )
-    response = requests.get(url)
+    response = _http.get(url)
 
     if response.status_code != 200:
         raise RBXException
@@ -475,7 +513,7 @@ def validate_signature(message: str, address: str, signature: str) -> bool:
 def handle_raw_transaction(tx: dict, execute: bool = False) -> bool:
     path = "SendRawTransaction" if execute else "VerifyRawTransaction"
     url = join_url(BASE_URL, f"/txapi/txV1/{path}")
-    response = requests.post(url, data=tx)
+    response = _http.post(url, data=tx)
 
     if response.status_code != 200:
         raise RBXException
@@ -504,7 +542,7 @@ def get_nft(id: str, attempt=0) -> Tuple[dict, int]:
     try:
         # This runs inside sync_block's per-block DB transaction — the
         # timeout bounds how long a hung CLI can hold that transaction open.
-        response = requests.get(url, timeout=CLI_TIMEOUT)
+        response = _http.get(url, timeout=CLI_TIMEOUT)
     except Exception as e:
         logger.error(f"NFT get data exception: {e}")
         time.sleep(5)
@@ -533,7 +571,7 @@ def verify_nft_ownership(sig: str) -> bool:
     logger = logging.getLogger(__name__)
     url = join_url(SHOP_BASE_URL, f"/scapi/scv1/VerifyOwnership/{sig}")
 
-    response = requests.get(url)
+    response = _http.get(url)
 
     logger.debug(f"Verify NFT ownership URL: {url}")
     logger.debug(f"Verify NFT ownership response: {response.text}")
@@ -553,7 +591,7 @@ def verify_nft_ownership(sig: str) -> bool:
 # region Voting
 def get_topics() -> Optional[dict]:
     url = join_url(BASE_URL, f"voapi/VOV1/GetAllTopics")
-    response = requests.get(url)
+    response = _http.get(url)
 
     if response.status_code != 200:
         raise RBXException
@@ -566,7 +604,7 @@ def get_topics() -> Optional[dict]:
 
 def get_network_metrics() -> Optional[dict]:
     url = join_url(BASE_URL, "api/V1/NetworkMetrics")
-    response = requests.get(url)
+    response = _http.get(url)
 
     if response.status_code != 200:
         raise RBXException
@@ -586,7 +624,7 @@ def validate_signature(message, address, signature):
     url = join_url(
         BASE_URL, f"txapi/TXV1/ValidateSignature/{message}/{address}/{signature}"
     )
-    response = requests.get(url)
+    response = _http.get(url)
 
     if response.status_code != 200:
         raise RBXException
@@ -606,7 +644,7 @@ def validate_signature(message, address, signature):
 def get_all_shops() -> Optional[list[dict]]:
 
     url = join_url(SHOP_CRAWLER_BASE_URL, "dstapi/DSTV1/GetDecShopStateTreiList")
-    response = requests.get(url)
+    response = _http.get(url)
 
     if response.status_code != 200:
         raise RBXException
@@ -624,7 +662,7 @@ def get_shop(shop_url: str) -> Optional[dict]:
     url = join_url(
         SHOP_CRAWLER_BASE_URL, f"dstapi/DSTV1/GetNetworkDecShopInfo/{shop_url}"
     )
-    response = requests.get(url)
+    response = _http.get(url)
 
     if response.status_code != 200:
         raise RBXException
@@ -637,7 +675,7 @@ def get_shop(shop_url: str) -> Optional[dict]:
 
 def get_active_connections() -> list[dict]:
     url = join_url(SHOP_CRAWLER_BASE_URL, f"wsapi/WebShopV1/GetConnections")
-    response = requests.get(url)
+    response = _http.get(url)
 
     if response.status_code != 200:
         return False
@@ -667,7 +705,7 @@ def is_already_connected_to_shop(shop_url: str) -> bool:
 
 def clear_pings():
     url = join_url(SHOP_CRAWLER_BASE_URL, f"wsapi/WebShopV1/ClearPingRequest")
-    requests.get(url)
+    _http.get(url)
 
 
 def ping_check(shop_url: str, ping_id: str = None, attempt: int = 1) -> bool:
@@ -678,7 +716,7 @@ def ping_check(shop_url: str, ping_id: str = None, attempt: int = 1) -> bool:
     url = join_url(
         SHOP_CRAWLER_BASE_URL, f"wsapi/WebShopV1/PingShop/{ping_id}/{shop_url}"
     )
-    response = requests.get(url)
+    response = _http.get(url)
 
     data = response.json()
 
@@ -694,7 +732,7 @@ def ping_check(shop_url: str, ping_id: str = None, attempt: int = 1) -> bool:
     check_url = join_url(
         SHOP_CRAWLER_BASE_URL, f"wsapi/WebShopV1/CheckPingShop/{ping_id}"
     )
-    check_response = requests.get(check_url)
+    check_response = _http.get(check_url)
 
     check_data = check_response.json()
     if "Success" not in check_data or check_data["Success"] != True:
@@ -737,7 +775,7 @@ def connect_to_shop(
     url = join_url(
         SHOP_CRAWLER_BASE_URL, f"wsapi/WebShopV1/ConnectToDecShop/{address}/{shop_url}"
     )
-    response = requests.get(url)
+    response = _http.get(url)
 
     if response.text == "true":
         success = ping_check(shop_url)
@@ -781,7 +819,7 @@ def connect_to_shop(
 def _request_auction_data(listing_id: int, shop_url: str):
     logging.info(f"Requesting auction data for listing {listing_id}")
 
-    requests.get(
+    _http.get(
         join_url(
             SHOP_CRAWLER_BASE_URL,
             f"wsapi/WebShopV1/GetShopSpecificAuction/{listing_id}/{settings.RBX_SHOP_CRAWLER_KEYPAIR_ADDRESS}/{shop_url}",
@@ -789,7 +827,7 @@ def _request_auction_data(listing_id: int, shop_url: str):
     )
 
     time.sleep(0.25)
-    requests.get(
+    _http.get(
         join_url(
             SHOP_CRAWLER_BASE_URL,
             f"wsapi/WebShopV1/GetShopListingBids/{listing_id}/{settings.RBX_SHOP_CRAWLER_KEYPAIR_ADDRESS}/{shop_url}",
@@ -820,7 +858,7 @@ def get_shop_data(shop_url: str) -> Optional[dict]:
 
 def _finalize_data(shop_url: str, attempt=1):
     logging.info("Getting data")
-    response = requests.get(
+    response = _http.get(
         join_url(SHOP_CRAWLER_BASE_URL, f"wsapi/WebShopV1/GetDecShopData")
     )
 
@@ -861,7 +899,7 @@ def _finalize_data(shop_url: str, attempt=1):
         time.sleep(1)
 
         try:
-            updated_response = requests.get(
+            updated_response = _http.get(
                 join_url(SHOP_CRAWLER_BASE_URL, f"wsapi/WebShopV1/GetDecShopData")
             )
             data = updated_response.json()
@@ -945,7 +983,7 @@ def send_raw_bid(bid: Bid) -> bool:
 
     logging.info(f"Posting bid payload to {url}")
 
-    response = requests.post(
+    response = _http.post(
         url,
         headers=headers,
         json=json_payload,
@@ -986,7 +1024,7 @@ def _check_if_bid_is_received(bid: Bid, attempt: int = 0):
 
     logging.info(f"Checking status of bid {bid.bid_id}")
 
-    response = requests.get(url)
+    response = _http.get(url)
     try:
         data = response.json()
         success = data["Success"] == True
@@ -1035,7 +1073,7 @@ def _check_if_bid_is_received(bid: Bid, attempt: int = 0):
 def get_vbtc_compile_data(rbx_address: str):
 
     url = join_url(BASE_URL, f"btcapi/BTCV2/GetTokenizationDetails/{rbx_address}")
-    response = requests.get(url)
+    response = _http.get(url)
     data = response.json()
     if "Success" in data and data["Success"] == True:
         return {
@@ -1049,7 +1087,7 @@ def get_vbtc_compile_data(rbx_address: str):
 
 def get_default_vbtc_base64_image_data():
     url = join_url(BASE_URL, f"btcapi/BTCV2/GetDefaultImageBase")
-    response = requests.get(url)
+    response = _http.get(url)
     data = response.json()
     if "Success" in data and data["Success"] == True:
         return data["ImageBase"]
@@ -1073,7 +1111,7 @@ def send_testnet_funds(from_address: str, to_address: str, amount: Decimal):
         url = join_url(
             BASE_URL, f"api/V1/SendTransaction/{from_address}/{to_address}/{amount_str}"
         )
-        response = requests.get(url)
+        response = _http.get(url)
 
         text = response.text
 
@@ -1101,7 +1139,7 @@ def withdraw_btc(payload: dict):
     url = join_url(BASE_URL, f"btcapi/btcv2/WithdrawalCoinRawTX")
     logger.info(f"URL: {url}")
 
-    response = requests.post(url, json=payload, timeout=30)
+    response = _http.post(url, json=payload, timeout=30)
 
     data = response.json()
     logger.info(f"RESPONSE: {json.dumps(data)}")
@@ -1118,9 +1156,9 @@ def _vbtc_v2_request(method, path, payload=None, timeout=30):
     logger.info(f"VBTC_V2: {method.upper()} {url}")
     try:
         if method == "get":
-            response = requests.get(url, timeout=timeout)
+            response = _http.get(url, timeout=timeout)
         else:
-            response = requests.post(url, json=payload, timeout=timeout)
+            response = _http.post(url, json=payload, timeout=timeout)
         result = response.json()
     except Exception as e:
         logger.error(f"Error in vBTC V2 request {path}: {e}")
@@ -1284,7 +1322,7 @@ def vbtc_v2_beacon_upload(sc_uid: str, to_address: str, signature: str):
         f"txapi/txV1/CreateBeaconUploadRequest/{sc_uid}/{to_address}/{signature}",
     )
     try:
-        response = requests.get(url, timeout=15)
+        response = _http.get(url, timeout=15)
         data = response.json()
         if data.get("Success"):
             return {"success": True, "locator": data.get("Locator")}
