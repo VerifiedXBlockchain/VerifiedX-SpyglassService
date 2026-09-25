@@ -1695,3 +1695,43 @@ class WithdrawalStatusRaceTests(TestCase):
         self.assertIsNotNone(self.withdrawal.signed_at)
         self.token.refresh_from_db()
         self.assertFalse(self.token.is_pending_withdrawal)
+
+
+class NodeApiTokenTests(TestCase):
+    """CLI 8.0 (security audit VX-03) wants the apitoken header on every call
+    to our node; nothing else on the wire changes."""
+
+    @override_settings(RBX_WALLET_API_TOKEN="secret")
+    def test_token_goes_to_our_node_only(self):
+        from rbx import client
+        from project.utils.url import join_url
+
+        self.assertEqual(
+            client._node_headers(join_url(client.BASE_URL, "api/V1/SendBlock/1")),
+            {"apitoken": "secret"},
+        )
+        self.assertEqual(
+            client._node_headers(join_url(client.SHOP_CRAWLER_BASE_URL, "wsapi/WebShopV1/GetDecShopData")),
+            {"apitoken": "secret"},
+        )
+        self.assertEqual(client._node_headers("http://203.0.113.9:17292/api/V1/CheckStatus"), {})
+
+    @override_settings(RBX_WALLET_API_TOKEN="secret")
+    def test_explicit_headers_are_kept_alongside_the_token(self):
+        from rbx import client
+
+        url = client.BASE_URL + "/wsapi/WebShopV1/SendBid/x/y"
+        with patch.object(client.requests, "post") as post:
+            client._http.post(url, json={"a": 1}, headers={"Content-Type": "application/json"})
+        post.assert_called_once_with(
+            url, json={"a": 1}, headers={"apitoken": "secret", "Content-Type": "application/json"}
+        )
+
+    @override_settings(RBX_WALLET_API_TOKEN="")
+    def test_no_token_means_the_request_is_unchanged(self):
+        from rbx import client
+
+        url = client.BASE_URL + "/api/V1/GetWalletInfo"
+        with patch.object(client.requests, "get") as get:
+            client._http.get(url, timeout=(5, 30))
+        get.assert_called_once_with(url, timeout=(5, 30))
