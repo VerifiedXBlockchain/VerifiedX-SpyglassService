@@ -954,14 +954,17 @@ def send_raw_bid(bid: Bid) -> bool:
         logging.error(f"Shop is third party.")
         return
 
-    if not is_already_connected_to_shop(shop.url):
-        connected, _ = connect_to_shop(shop.url)
+    # A shop only accepts a bid from a crawler that completed its "helo"
+    # handshake since the shop last started (VX-10), and it keeps answering
+    # pings without one, so an existing connection proves nothing. Each bid
+    # therefore starts with a fresh handshake.
+    connected, _ = connect_to_shop(shop.url, force_new_connection=True)
 
-        if not connected:
-            logging.error("Could not connect to shop")
-            return
+    if not connected:
+        logging.error("Could not connect to shop")
+        return
 
-        time.sleep(2)
+    time.sleep(2)
 
     time.sleep(1)
 

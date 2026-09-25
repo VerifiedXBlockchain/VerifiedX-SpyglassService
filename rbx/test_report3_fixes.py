@@ -129,3 +129,51 @@ class AuctionSaleCompleteRelayTests(TestCase):
         with patch("rbx.client.tx_send", return_value=success), \
                 self.assertNoLogs(level="ERROR"):
             self.assertTrue(handle_auction_sale_complete_tx("start-hash"))
+
+
+class RawBidHandshakeTests(TestCase):
+    """A bid after a shop restart needs a fresh 'helo' (VX-10, NEW-21)."""
+
+    def setUp(self):
+        from decimal import Decimal
+
+        from django.utils import timezone
+
+        from shop.models import Bid, Collection, Listing, Shop
+
+        shop = Shop.objects.create(
+            shop_id=1, unique_id="u1", name="Shop", url="vfx://shop",
+            description="", owner_address="SELLER",
+        )
+        collection = Collection.objects.create(
+            shop=shop, collection_id=1, name="C", description=""
+        )
+        listing = Listing.objects.create(
+            collection=collection, listing_id=7, smart_contract_uid="sc:auction",
+            owner_address="SELLER", floor_price=Decimal("1"),
+            start_date=timezone.now(), end_date=timezone.now(),
+            is_visible_before_start_date=True, is_visible_after_end_date=True,
+        )
+        self.bid = Bid.objects.create(
+            bid_id="bid-1", listing=listing, address="BUYER", signature="sig-1",
+            amount=Decimal("5"), send_time=0,
+        )
+
+    def test_bid_forces_a_new_handshake_even_when_the_shop_answers_pings(self):
+        refused = MagicMock(status_code=200)
+        refused.json.return_value = {"Success": False, "Message": "refused"}
+        with patch.object(client, "is_already_connected_to_shop", return_value=True), \
+                patch.object(client, "connect_to_shop", return_value=(True, True)) as connect, \
+                patch.object(client._http, "post", return_value=refused) as post, \
+                patch.object(client.time, "sleep"):
+            client.send_raw_bid(self.bid)
+        connect.assert_called_once_with("vfx://shop", force_new_connection=True)
+        self.assertIn("wsapi/WebShopV1/SendBid/BUYER/vfx://shop", post.call_args.args[0])
+
+    def test_failed_handshake_sends_no_bid(self):
+        with patch.object(client, "connect_to_shop", return_value=(False, True)), \
+                patch.object(client._http, "post") as post, \
+                patch.object(client.time, "sleep"), \
+                self.assertLogs(level="ERROR"):
+            client.send_raw_bid(self.bid)
+        post.assert_not_called()
