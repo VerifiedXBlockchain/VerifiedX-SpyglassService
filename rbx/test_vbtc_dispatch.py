@@ -364,6 +364,22 @@ class NonRequesterCompleteTests(TestCase):
         self.assertEqual(row.status, VbtcV2WithdrawalRequest.Status.COMPLETED)
         self.assertEqual(row.btc_transaction_hash, "btc-c1")
 
+    def test_reprocessing_the_same_complete_is_quiet(self):
+        complete = complete_tx(self.block, "c1", "H", "sc:a", "r1")
+        process_transaction(complete)
+        with self.assertNoLogs(level="ERROR"):
+            process_transaction(complete)
+        row = VbtcV2WithdrawalRequest.objects.get(request_transaction__hash="r1")
+        self.assertEqual(row.status, VbtcV2WithdrawalRequest.Status.COMPLETED)
+
+    def test_reprocessing_the_same_cancel_is_quiet(self):
+        cancel = cancel_tx(self.block, "x1", "H", "sc:a", "r1")
+        process_transaction(cancel)
+        with self.assertNoLogs(level="ERROR"):
+            process_transaction(cancel)
+        row = VbtcV2WithdrawalRequest.objects.get(request_transaction__hash="r1")
+        self.assertEqual(row.status, VbtcV2WithdrawalRequest.Status.CANCELLATION_REQUESTED)
+
     def test_complete_on_the_wrong_contract_is_ignored(self):
         make_token(owner="O", global_balance="0.01", sc_identifier="sc:b")
         with self.assertLogs(level="ERROR"):

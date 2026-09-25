@@ -434,6 +434,9 @@ def apply_complete(tx):
             f"{withdrawal.requestor_address}; the node ignores it."
         )
         return
+    if withdrawal.completion_transaction_id == tx.hash:
+        # A reprocess of the completion that already closed this row.
+        return
     if withdrawal.status in VbtcV2WithdrawalRequest.TERMINAL_STATUSES:
         logging.error(
             f"{what} {tx.hash}: request {request_hash} on {sc_uid} is already "
@@ -485,6 +488,9 @@ def apply_cancel(tx):
             f"{what} {tx.hash}: request {request_hash} on {sc_uid} is already "
             f"{withdrawal.status}; the node ignores it."
         )
+        return
+    if withdrawal.cancel_transaction_id == tx.hash:
+        # A reprocess of the cancellation request already recorded here.
         return
     if withdrawal.cancel_transaction_id is not None:
         logging.error(
