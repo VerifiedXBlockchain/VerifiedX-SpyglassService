@@ -12,9 +12,10 @@ height or its ledger diverges from the chain's. The values are per network:
     V2TransferMultiHeight            1          7,281,000
     V2WithdrawalOwnerAddBackFixHeight 1         7,281,000
 
-Which network this deployment indexes comes from settings.VBTC_NETWORK; each
+Which network this deployment indexes comes from settings.VBTC_NETWORK, which
+defaults from the deployment's ENVIRONMENT (testnet) or IS_DEVNET flag; each
 height can also be pinned explicitly (VBTC_WITHDRAWAL_ESCROW_HEIGHT and
-friends) for a devnet or a test.
+friends) for a test.
 """
 from decimal import Context, Decimal, InvalidOperation, ROUND_HALF_EVEN
 import json

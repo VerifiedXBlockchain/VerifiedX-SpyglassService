@@ -1,6 +1,6 @@
 import os
 import base64
-from project.settings.environment import ENV
+from project.settings.environment import ENV, ENVIRONMENT, IS_DEVNET
 
 RBX_TEMP_PATH = ENV.str("RBX_TEMP_PATH", default="/tmp/network.rbx")
 
@@ -47,9 +47,14 @@ with open(RBX_WALLET_SSH_KEY_PATH, "w+") as file:
 
 # vBTC V2 activation heights. The node gates several consensus rules on block
 # height and Spyglass must apply each rule at the same height (rbx/vbtc_gates.py).
-# VBTC_NETWORK selects the mainnet or testnet table; each height can also be
-# pinned explicitly, for a devnet or a test.
-VBTC_NETWORK = ENV.str("VBTC_NETWORK", default="mainnet")
+# VBTC_NETWORK selects the mainnet or testnet table. The deployments already
+# say which chain they index (ENVIRONMENT=testnet on the testnet app, IS_DEVNET
+# on a devnet, whose fresh chain has every gate at height 1 like testnet), so
+# the default follows that; each height can also be pinned explicitly.
+VBTC_NETWORK = ENV.str(
+    "VBTC_NETWORK",
+    default="testnet" if (ENVIRONMENT == "testnet" or IS_DEVNET) else "mainnet",
+)
 VBTC_WITHDRAWAL_ESCROW_HEIGHT = ENV.int("VBTC_WITHDRAWAL_ESCROW_HEIGHT", default=None)
 VBTC_V2_TRANSFER_MULTI_HEIGHT = ENV.int("VBTC_V2_TRANSFER_MULTI_HEIGHT", default=None)
 VBTC_V2_WITHDRAWAL_OWNER_ADDBACK_FIX_HEIGHT = ENV.int(
