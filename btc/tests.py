@@ -43,14 +43,18 @@ class TxidFromRawHexTests(SimpleTestCase):
 @override_settings(ENVIRONMENT="testnet")
 class BroadcastTransactionTests(SimpleTestCase):
     BLOCKBOOK = "https://blockbook.tbtc-1.zelcore.io/api/v2/sendtx/"
-    ESPLORA = "https://mempool.space/testnet4/api/tx"
+    ESPLORA = "https://mempool.emzy.de/testnet4/api/tx"
+    THIRD = "https://mempool.ninja/testnet4/api/tx"
 
-    def test_testnet_tries_blockbook_before_mempool_space(self):
-        with patch("btc.btc_client.requests.post") as post:
-            post.return_value = _response(200, json_body={"result": SEGWIT_TXID})
-            result = BtcClient().broadcast_transaction(SEGWIT_HEX)
-        self.assertEqual(result, {"success": True, "txid": SEGWIT_TXID})
-        self.assertEqual(post.call_args_list[0].args[0], self.BLOCKBOOK)
+    def test_testnet_tries_blockbook_first_and_never_submits_to_mempool_space(self):
+        with patch("btc.btc_client.requests.post") as post, \
+                patch("btc.btc_client.requests.get") as get:
+            post.side_effect = requests.Timeout("read timed out")
+            get.return_value = _response(404)
+            BtcClient().broadcast_transaction(SEGWIT_HEX)
+        urls = [call.args[0] for call in post.call_args_list]
+        self.assertEqual(urls, [self.BLOCKBOOK, self.ESPLORA, self.THIRD])
+        self.assertFalse(any("mempool.space" in u for u in urls))
 
     def test_every_provider_call_fits_the_worker_budget(self):
         with patch("btc.btc_client.requests.post") as post, \
@@ -73,6 +77,24 @@ class BroadcastTransactionTests(SimpleTestCase):
             result = BtcClient().broadcast_transaction(SEGWIT_HEX)
         self.assertEqual(result, {"success": True, "txid": SEGWIT_TXID})
         self.assertEqual(post.call_args_list[1].args[0], self.ESPLORA)
+
+    def test_third_provider_is_reached(self):
+        with patch("btc.btc_client.requests.post") as post:
+            post.side_effect = [
+                requests.Timeout("read timed out"),
+                requests.ConnectionError("reset"),
+                _response(200, text=SEGWIT_TXID),
+            ]
+            result = BtcClient().broadcast_transaction(SEGWIT_HEX)
+        self.assertEqual(result, {"success": True, "txid": SEGWIT_TXID})
+        self.assertEqual(post.call_args_list[2].args[0], self.THIRD)
+
+    def test_utxo_set_duplicate_counts_as_sent(self):
+        # Blockbook's wording once the transaction has confirmed.
+        with patch("btc.btc_client.requests.post") as post:
+            post.return_value = _response(400, text='{"error":"-27: Transaction outputs already in utxo set"}')
+            result = BtcClient().broadcast_transaction(SEGWIT_HEX)
+        self.assertEqual(result, {"success": True, "txid": SEGWIT_TXID, "already_known": True})
 
     def test_duplicate_rejection_counts_as_sent(self):
         already = 'sendrawtransaction RPC error: {"code":-27,"message":"Transaction already in block chain"}'

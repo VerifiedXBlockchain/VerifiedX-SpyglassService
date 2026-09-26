@@ -255,8 +255,8 @@ class BtcClient:
     # open past 30s from the cluster (it answered the same hex from outside in
     # 80ms), gunicorn killed the worker mid-request, and the wallet got a 503
     # for a transaction it could not tell had been sent.
-    BROADCAST_TIMEOUT = (3, 7)
-    LOOKUP_TIMEOUT = (3, 5)
+    BROADCAST_TIMEOUT = (2, 5)
+    LOOKUP_TIMEOUT = (2, 3)
 
     def broadcast_transaction(self, raw_tx_hex: str):
         """Broadcast a signed transaction to the Bitcoin network.
@@ -265,8 +265,8 @@ class BtcClient:
         /testnet endpoint is testnet3, where testnet4 UTXOs don't exist. Every
         broadcast sent there fails `bad-txns-inputs-missingorspent` (2026-08-13:
         this dead-ended every web-wallet withdrawal at the broadcast step).
-        Providers are tried in order; any success wins. Blockbook goes first on
-        testnet because it is the provider the cluster is known to reach.
+        Providers are tried in order; any success wins. Three providers plus the
+        lookup fit inside gunicorn's 30s worker budget at these timeouts.
 
         A transaction the network already holds counts as sent: a provider
         that rejects the re-submission as a duplicate, or a lookup that finds
@@ -275,16 +275,24 @@ class BtcClient:
         accepted but not answered in time (or by a retry from elsewhere)
         reads as a failure forever, and a retry can only ever re-sign.
         """
+        # Submissions from the cluster to mempool.space never get an answer
+        # (2026-09-26: a real testnet4 hex sat 35s and died with a connection
+        # error while GETs and malformed POSTs to the same host returned in
+        # 40ms), so it is not a testnet submission provider here; it is still
+        # the lookup. mempool.emzy.de and mempool.ninja are independent
+        # Esplora-compatible instances that serve testnet4.
         if self.is_testnet:
             providers = [
                 ("https://blockbook.tbtc-1.zelcore.io/api/v2/sendtx/", "blockbook"),
-                ("https://mempool.space/testnet4/api/tx", "esplora"),
+                ("https://mempool.emzy.de/testnet4/api/tx", "esplora"),
+                ("https://mempool.ninja/testnet4/api/tx", "esplora"),
             ]
             lookup_url = "https://mempool.space/testnet4/api/tx/{txid}"
         else:
             providers = [
                 ("https://mempool.space/api/tx", "esplora"),
                 ("https://blockstream.info/api/tx", "esplora"),
+                ("https://mempool.emzy.de/api/tx", "esplora"),
             ]
             lookup_url = "https://mempool.space/api/tx/{txid}"
 
