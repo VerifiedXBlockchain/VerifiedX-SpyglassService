@@ -23,6 +23,7 @@ from rbx.chain_contract import smart_contract_from_chain
 from rbx.client import get_master_nodes, get_block, get_nft, get_topics
 from shop.media import scp_down_folder, upload_to_s3
 from rbx.exceptions import RBXException
+from rbx import vbtc_dispatch
 from rbx.models import (
     FungibleToken,
     FungibleTokenTx,
@@ -482,6 +483,11 @@ UNINDEXED_TX_TYPES = frozenset(
 
 
 def process_transaction(tx: Transaction):
+    # The legacy smart-contract envelope types can carry vBTC V2 functions;
+    # the node routes them through its function switch before anything else.
+    if vbtc_dispatch.route_envelope(tx):
+        return
+
     if tx.type in [Transaction.Type.NFT_MINT, Transaction.Type.TKNZ_MINT, Transaction.Type.VBTC_V2_MINT]:
         logging.info(f"NFT Mint: {tx.hash}")
 
@@ -629,13 +635,14 @@ def process_transaction(tx: Transaction):
 
                         try:
                             v2_token = VbtcV2Token.objects.get(sc_identifier=identifier)
+                            is_new_v2_token = False
                         except VbtcV2Token.DoesNotExist:
                             v2_token = VbtcV2Token(sc_identifier=identifier)
+                            is_new_v2_token = True
 
                         v2_token.nft = nft
                         v2_token.name = nft.name
                         v2_token.description = nft.description
-                        v2_token.owner_address = nft.owner_address
                         v2_token.image_base64 = v2_info.get("ImageBase", "default")
                         v2_token.deposit_address = v2_info["DepositAddress"]
                         v2_token.frost_group_public_key = v2_info.get("FrostGroupPublicKey", "")
@@ -645,8 +652,16 @@ def process_transaction(tx: Transaction):
                         )
                         v2_token.required_threshold = v2_info.get("RequiredThreshold", 0)
                         v2_token.proof_block_height = v2_info.get("ProofBlockHeight", 0)
-                        v2_token.global_balance = Decimal(0)
-                        v2_token.created_at = tx.date_crafted
+                        if is_new_v2_token:
+                            # Only a first index starts the token empty. On a
+                            # reprocess the owner may have changed hands since
+                            # the mint, and global_balance is the BTC on
+                            # deposit as of the last chain sync: resetting it
+                            # to zero drops every owner anchor until the next
+                            # sync runs (seen on the 2026-09-25 backfill).
+                            v2_token.owner_address = nft.owner_address
+                            v2_token.global_balance = Decimal(0)
+                            v2_token.created_at = tx.date_crafted
                         v2_token.save()
 
                         nft.is_vbtc = True
@@ -675,6 +690,9 @@ def process_transaction(tx: Transaction):
         if func == "Transfer()":
             nft.owner_address = tx.to_address
             nft.transfer_transactions.add(tx)
+            v2_token = VbtcV2Token.objects.filter(sc_identifier=identifier).first()
+            if v2_token is not None:
+                vbtc_dispatch.apply_ownership_transfer(v2_token, tx)
 
         elif func in ["ChangeEvolveStateSpecific()", "Evolve()", "Devolve()"]:
             nft.misc_transactions.add(tx)
@@ -779,6 +797,9 @@ def process_transaction(tx: Transaction):
                 original_tx.voided_from_callback = True
                 original_tx.save()
 
+            elif original_tx.type == Transaction.Type.VBTC_V2_TRANSFER:
+                vbtc_dispatch.void_reserve_transfer(original_tx)
+
             elif original_tx.type == Transaction.Type.NFT_TX:
                 parsed = json.loads(original_tx.data)[0]
                 identifier = parsed["ContractUID"]
@@ -813,7 +834,9 @@ def process_transaction(tx: Transaction):
                 )
             )
 
-            # additional_balance = Decimal(0)
+            # Materialised: the redirect below moves a transaction's unlock time,
+            # which would otherwise drop it from this lazily re-evaluated set.
+            outstanding_transactions = list(outstanding_transactions)
             for transaction in outstanding_transactions:
                 # additional_balance += tx.total_amount
 
@@ -830,6 +853,11 @@ def process_transaction(tx: Transaction):
 
                     transaction.voided_from_callback = True
                     transaction.save()
+
+                elif transaction.type == Transaction.Type.VBTC_V2_TRANSFER:
+                    vbtc_dispatch.redirect_reserve_transfer(
+                        transaction, new_address, tx.date_crafted
+                    )
 
                 elif transaction.type == Transaction.Type.NFT_TX:
                     parsed = json.loads(transaction.data)[0]
@@ -1021,56 +1049,15 @@ def process_transaction(tx: Transaction):
             except VbtcToken.DoesNotExist:
                 pass
 
-            # Try V2 token
+            # Try V2 token: the ownership effect is shared with every envelope
+            # type the node routes Transfer() through.
             try:
                 v2_token = VbtcV2Token.objects.get(sc_identifier=sc_identifier)
-                # tx.from_address is the chain-authoritative outgoing owner
-                # (the local owner_address could be stale on reprocess).
-                old_owner = tx.from_address
-                new_owner = tx.to_address
-
-                if old_owner and old_owner != new_owner:
-                    # Settle the outgoing owner's ledger so the new owner
-                    # inherits the un-transferred deposits minus the old
-                    # owner's withdrawals (less what the old owner must keep
-                    # for still-open withdrawal requests). Without this row,
-                    # the owner anchor in `addresses` re-attributes the whole
-                    # deposit history to the new owner and the old owner's
-                    # debits go negative — claims then exceed BTC backing.
-                    residual = v2_token.settlement_amount_for(old_owner)
-                    if residual:
-                        from_addr, to_addr = (
-                            (old_owner, new_owner)
-                            if residual > 0
-                            else (new_owner, old_owner)
-                        )
-                        VbtcV2TokenTransfer.objects.get_or_create(
-                            token=v2_token,
-                            transaction=tx,
-                            defaults={
-                                "from_address": from_addr,
-                                "to_address": to_addr,
-                                "amount": abs(residual),
-                                "created_at": tx.date_crafted,
-                            },
-                        )
-
-                v2_token.owner_address = new_owner
-                v2_token.save(update_fields=["owner_address"])
-                # Also update the NFT owner
-                try:
-                    nft = v2_token.nft
-                    nft.owner_address = tx.to_address
-                    nft.save(update_fields=["owner_address"])
-                except Exception:
-                    logging.exception(
-                        f"Failed to update NFT owner for V2 ownership "
-                        f"transfer {tx.hash} ({sc_identifier})"
-                    )
-                return
             except VbtcV2Token.DoesNotExist:
                 print(f"No VbtcToken or VbtcV2Token with sc id of {sc_identifier} found.")
                 return
+            vbtc_dispatch.apply_ownership_transfer(v2_token, tx)
+            return
 
         elif func == "TransferCoinMulti()":
             inputs = parsed["Inputs"]
@@ -1104,234 +1091,19 @@ def process_transaction(tx: Transaction):
                     print(e)
 
     elif tx.type == Transaction.Type.VBTC_V2_TRANSFER:
-        parsed = json.loads(tx.data)
-        if isinstance(parsed, str):
-            parsed = json.loads(parsed)
-        if isinstance(parsed, list):
-            parsed = parsed[0]
-
-        func = parsed["Function"]
-
-        if func == "TransferVBTCV2()":
-            sc_identifier = parsed["ContractUID"]
-            from_address = parsed["FromAddress"]
-            to_address = parsed["ToAddress"]
-            amount = Decimal(parsed["Amount"])
-
-            try:
-                token = VbtcV2Token.objects.get(sc_identifier=sc_identifier)
-            except VbtcV2Token.DoesNotExist:
-                logging.error(f"VbtcV2Token with sc id of {sc_identifier} not found.")
-                return
-
-            VbtcV2TokenTransfer.objects.get_or_create(
-                token=token,
-                transaction=tx,
-                defaults={
-                    "from_address": from_address,
-                    "to_address": to_address,
-                    "amount": amount,
-                    "created_at": tx.date_crafted,
-                },
-            )
-
-        elif func == "TransferVBTCMultiV2()" and "ContractUID" not in parsed:
-            # One transaction debiting the sender on several contracts. The
-            # node applies it as one ledger pair per input, all from the
-            # transaction's sender to its recipient, and consensus guarantees
-            # distinct SCUIDs, so one row per (token, transaction) holds.
-            # The ContractUID guard mirrors the node's own dispatch rule
-            # (VBTCService.GetVbtcV2TransferOutflows): a payload that also
-            # carries the single-shape fields is applied as a single transfer.
-            from_address = parsed["FromAddress"]
-            to_address = parsed["ToAddress"]
-
-            for entry in parsed["Inputs"]:
-                sc_identifier = entry["SCUID"]
-                amount = Decimal(str(entry["Amount"]))
-
-                try:
-                    token = VbtcV2Token.objects.get(sc_identifier=sc_identifier)
-                except VbtcV2Token.DoesNotExist:
-                    # Skip rather than return: the other inputs are
-                    # independent contracts and must still be indexed.
-                    logging.error(
-                        f"VbtcV2Token with sc id of {sc_identifier} not found "
-                        f"(multi transfer {tx.hash})."
-                    )
-                    continue
-
-                VbtcV2TokenTransfer.objects.get_or_create(
-                    token=token,
-                    transaction=tx,
-                    defaults={
-                        "from_address": from_address,
-                        "to_address": to_address,
-                        "amount": amount,
-                        "is_multi": True,
-                        "created_at": tx.date_crafted,
-                    },
-                )
-
-        else:
-            # Multi transfers passed through here silently for a week before
-            # anyone noticed. Anything else that lands is worth a line.
-            logging.warning(
-                f"Unrecognised VBTC_V2_TRANSFER payload on {tx.hash}: "
-                f"function={func!r}, has_contract_uid={'ContractUID' in parsed}"
-            )
+        vbtc_dispatch.route_transfer(tx)
 
     elif tx.type == Transaction.Type.VBTC_V2_WITHDRAWAL_REQUEST:
-        parsed = json.loads(tx.data)
-        if isinstance(parsed, str):
-            parsed = json.loads(parsed)
-        if isinstance(parsed, list):
-            parsed = parsed[0]
-
-        func = parsed["Function"]
-
-        if func == "VBTCWithdrawalRequest()":
-            sc_identifier = parsed["ContractUID"]
-
-            try:
-                token = VbtcV2Token.objects.get(sc_identifier=sc_identifier)
-            except VbtcV2Token.DoesNotExist:
-                logging.error(f"VbtcV2Token with sc id of {sc_identifier} not found.")
-                return
-
-            VbtcV2WithdrawalRequest.objects.get_or_create(
-                token=token,
-                request_transaction=tx,
-                defaults={
-                    "requestor_address": parsed["RequestorAddress"],
-                    "btc_address": parsed["BTCAddress"],
-                    "amount": Decimal(parsed["Amount"]),
-                    "fee_rate": Decimal(parsed["FeeRate"]),
-                    "status": VbtcV2WithdrawalRequest.Status.REQUESTED,
-                    "created_at": tx.date_crafted,
-                },
-            )
-
-            token.recompute_pending_withdrawal()
+        vbtc_dispatch.route_withdrawal_request(tx)
 
     elif tx.type == Transaction.Type.VBTC_V2_WITHDRAWAL_COMPLETE:
-        parsed = json.loads(tx.data)
-        if isinstance(parsed, str):
-            parsed = json.loads(parsed)
-        if isinstance(parsed, list):
-            parsed = parsed[0]
-
-        func = parsed["Function"]
-
-        if func == "VBTCWithdrawalComplete()":
-            sc_identifier = parsed["ContractUID"]
-            withdrawal_request_hash = parsed["WithdrawalRequestHash"]
-
-            try:
-                token = VbtcV2Token.objects.get(sc_identifier=sc_identifier)
-            except VbtcV2Token.DoesNotExist:
-                logging.error(f"VbtcV2Token with sc id of {sc_identifier} not found.")
-                return
-
-            try:
-                withdrawal = VbtcV2WithdrawalRequest.objects.get(
-                    request_transaction__hash=withdrawal_request_hash
-                )
-            except VbtcV2WithdrawalRequest.DoesNotExist:
-                logging.error(
-                    f"Withdrawal request with hash {withdrawal_request_hash} not found."
-                )
-                return
-
-            if withdrawal.status == VbtcV2WithdrawalRequest.Status.CANCELLED:
-                # The chain is authoritative: if a completion landed on-chain,
-                # the BTC moved — but a completion after a cancel means the
-                # CLI's state machine broke, so make noise about it.
-                logging.error(
-                    f"VBTCWithdrawalComplete for cancelled withdrawal {withdrawal.pk} "
-                    f"(request hash {withdrawal_request_hash}) — completing anyway."
-                )
-
-            withdrawal.completion_transaction = tx
-            withdrawal.btc_transaction_hash = parsed["BTCTransactionHash"]
-            withdrawal.status = VbtcV2WithdrawalRequest.Status.COMPLETED
-            withdrawal.completed_at = tx.date_crafted
-            # update_fields, not a bare save: this instance was loaded earlier
-            # in this function, and the FROST path writes signed_at and
-            # signed_btc_tx_hex from the web process. A bare save writes every
-            # column from this instance and would erase whatever landed in
-            # between — the record of the signature this completion is for.
-            withdrawal.save(
-                update_fields=[
-                    "completion_transaction",
-                    "btc_transaction_hash",
-                    "status",
-                    "completed_at",
-                ]
-            )
-
-            # Balance fields (global_balance, total_sent) are updated by the
-            # periodic BTC chain sync (update_vbtc_balances), not here.
-            token.recompute_pending_withdrawal()
+        vbtc_dispatch.apply_complete(tx)
 
     elif tx.type == Transaction.Type.VBTC_V2_WITHDRAWAL_CANCEL:
-        parsed = json.loads(tx.data)
-        if isinstance(parsed, str):
-            parsed = json.loads(parsed)
-        if isinstance(parsed, list):
-            parsed = parsed[0]
+        vbtc_dispatch.apply_cancel(tx)
 
-        # The exact Function string for type 29 is not yet confirmed (no
-        # on-chain examples exist), so key off the payload instead.
-        withdrawal_request_hash = parsed.get("WithdrawalRequestHash")
-        if not withdrawal_request_hash:
-            logging.error(
-                f"VBTC_V2_WITHDRAWAL_CANCEL tx {tx.hash}: no WithdrawalRequestHash "
-                f"in payload (function={parsed.get('Function')})"
-            )
-            return
-
-        try:
-            withdrawal = VbtcV2WithdrawalRequest.objects.get(
-                request_transaction__hash=withdrawal_request_hash
-            )
-        except VbtcV2WithdrawalRequest.DoesNotExist:
-            logging.error(
-                f"Withdrawal request with hash {withdrawal_request_hash} not found "
-                f"for cancel tx {tx.hash}."
-            )
-            return
-
-        if withdrawal.status == VbtcV2WithdrawalRequest.Status.COMPLETED:
-            # Never un-complete: the BTC already moved.
-            logging.error(
-                f"VBTC_V2_WITHDRAWAL_CANCEL for completed withdrawal {withdrawal.pk} "
-                f"(request hash {withdrawal_request_hash}) — ignoring."
-            )
-            return
-
-        if withdrawal.signed_at:
-            # A signed Bitcoin transaction for this withdrawal already exists
-            # and may be on the network. The chain is authoritative, so the
-            # cancel still applies — but the BTC can still confirm afterwards,
-            # so this must not pass unnoticed.
-            logging.error(
-                f"VBTC_V2_WITHDRAWAL_CANCEL for withdrawal {withdrawal.pk} "
-                f"(request hash {withdrawal_request_hash}) whose BTC transaction "
-                f"was already FROST-signed at {withdrawal.signed_at} — the "
-                f"signed transaction may still confirm."
-            )
-
-        withdrawal.cancel_transaction = tx
-        withdrawal.status = VbtcV2WithdrawalRequest.Status.CANCELLED
-        withdrawal.cancelled_at = tx.date_crafted
-        # Same reason as the completion handler: a bare save from this
-        # instance would erase signing metadata written after it was loaded.
-        withdrawal.save(
-            update_fields=["cancel_transaction", "status", "cancelled_at"]
-        )
-
-        withdrawal.token.recompute_pending_withdrawal()
+    elif tx.type == Transaction.Type.VBTC_V2_WITHDRAWAL_VOTE:
+        vbtc_dispatch.apply_vote(tx)
 
     elif tx.type not in UNINDEXED_TX_TYPES:
         logging.warning(
