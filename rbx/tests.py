@@ -3,7 +3,7 @@ import gzip
 import json
 from decimal import Decimal
 
-from django.test import TestCase
+from django.test import TestCase, override_settings
 from django.utils import timezone
 
 from unittest.mock import patch
@@ -161,6 +161,7 @@ class AddressesTests(TestCase):
         self.assertTrue(any("hiding negative" in m for m in logs.output))
 
 
+@override_settings(VBTC_NETWORK="testnet")
 class MultiTransferTests(TestCase):
     """TransferVBTCMultiV2(): one type-26 transaction debiting the sender on
     several contracts. The node applies one ledger pair per input, all from
@@ -288,19 +289,20 @@ class MultiTransferTests(TestCase):
         self.assertEqual(row.amount, Decimal("0.001"))
         self.assertFalse(row.is_multi)
 
-    def test_hybrid_payload_is_not_indexed_as_multi(self):
-        # A multi Function that also carries the single-shape ContractUID is
-        # applied as a single transfer by every node (and rejected outright
-        # once multi is active). Never fan it out as if it were multi.
+    def test_hybrid_payload_follows_the_node_dispatch(self):
+        # The node's apply keys on Function plus the multi gate alone
+        # (StateData.cs:497): at or past the gate a multi Function applies
+        # every input, whatever else the payload carries. Consensus refuses
+        # a hybrid post-gate, so this only pins the apply order; below the
+        # gate the same payload applies as a single transfer.
         tx = self.multi_tx(
             "h1", [("sc:a", 0.001), ("sc:b", 0.002)], extra={"ContractUID": "sc:a", "Amount": 0.001}
         )
 
-        with self.assertLogs(level="WARNING") as logs:
-            process_transaction(tx)
+        process_transaction(tx)
 
-        self.assertFalse(VbtcV2TokenTransfer.objects.filter(transaction=tx).exists())
-        self.assertTrue(any("Unrecognised VBTC_V2_TRANSFER" in m for m in logs.output))
+        rows = {r.token.sc_identifier: r.amount for r in VbtcV2TokenTransfer.objects.filter(transaction=tx)}
+        self.assertEqual(rows, {"sc:a": Decimal("0.001"), "sc:b": Decimal("0.002")})
 
     def test_recipient_lists_every_input_contract(self):
         tx = self.multi_tx("m1", [("sc:a", 0.001), ("sc:c", 0.003)])
@@ -552,6 +554,7 @@ class WithdrawalStateMachineTests(TestCase):
             self.block,
             tx_hash,
             Transaction.Type.VBTC_V2_WITHDRAWAL_COMPLETE,
+            from_address="O",
             data={
                 "Function": "VBTCWithdrawalComplete()",
                 "ContractUID": self.token.sc_identifier,
@@ -565,6 +568,7 @@ class WithdrawalStateMachineTests(TestCase):
             self.block,
             tx_hash,
             Transaction.Type.VBTC_V2_WITHDRAWAL_CANCEL,
+            from_address="O",
             data={
                 "Function": "VBTCWithdrawalCancel()",
                 "ContractUID": self.token.sc_identifier,
@@ -593,16 +597,31 @@ class WithdrawalStateMachineTests(TestCase):
         self.token.refresh_from_db()
         self.assertFalse(self.token.is_pending_withdrawal)
 
-    def test_cancel_clears_request_and_flag(self):
+    def test_cancel_request_keeps_the_request_open(self):
+        # A type-29 cancel is a request to the validators, not a refund: the
+        # node keeps the row open (IsCompleted false) until a vote approves
+        # it, so the contract stays blocked and any escrow stays debited.
         process_transaction(self.request_tx("r1", "0.0001"))
         process_transaction(self.cancel_tx("x1", "r1"))
 
         self.token.refresh_from_db()
         withdrawal = self.token.withdrawal_requests.get()
-        self.assertEqual(withdrawal.status, VbtcV2WithdrawalRequest.Status.CANCELLED)
+        self.assertEqual(
+            withdrawal.status, VbtcV2WithdrawalRequest.Status.CANCELLATION_REQUESTED
+        )
         self.assertIsNotNone(withdrawal.cancel_transaction)
-        self.assertIsNotNone(withdrawal.cancelled_at)
-        self.assertFalse(self.token.is_pending_withdrawal)
+        self.assertIsNone(withdrawal.cancelled_at)
+        self.assertTrue(self.token.is_pending_withdrawal)
+
+    def test_second_cancel_request_is_ignored(self):
+        process_transaction(self.request_tx("r1", "0.0001"))
+        process_transaction(self.cancel_tx("x1", "r1"))
+
+        with self.assertLogs(level="ERROR"):
+            process_transaction(self.cancel_tx("x2", "r1"))
+
+        withdrawal = self.token.withdrawal_requests.get()
+        self.assertEqual(withdrawal.cancel_transaction.hash, "x1")
 
     def test_cancel_of_completed_withdrawal_is_refused(self):
         process_transaction(self.request_tx("r1", "0.0001"))
@@ -614,16 +633,28 @@ class WithdrawalStateMachineTests(TestCase):
         withdrawal = self.token.withdrawal_requests.get()
         self.assertEqual(withdrawal.status, VbtcV2WithdrawalRequest.Status.COMPLETED)
 
-    def test_complete_of_cancelled_withdrawal_completes_anyway(self):
-        # The chain is authoritative: a completion means BTC moved.
+    def test_complete_after_cancel_request_completes(self):
+        # The row is still open after a cancel request, so the node honours
+        # the requester's completion (StateData.cs:3752).
         process_transaction(self.request_tx("r1", "0.0001"))
         process_transaction(self.cancel_tx("x1", "r1"))
 
-        with self.assertLogs(level="ERROR"):
-            process_transaction(self.complete_tx("c1", "r1"))
+        process_transaction(self.complete_tx("c1", "r1"))
 
         withdrawal = self.token.withdrawal_requests.get()
         self.assertEqual(withdrawal.status, VbtcV2WithdrawalRequest.Status.COMPLETED)
+
+    def test_complete_from_a_non_requester_is_ignored(self):
+        process_transaction(self.request_tx("r1", "0.0001"))
+        stranger = self.complete_tx("c1", "r1")
+        stranger.from_address = "xValidator"
+        stranger.save(update_fields=["from_address"])
+
+        with self.assertLogs(level="ERROR"):
+            process_transaction(stranger)
+
+        withdrawal = self.token.withdrawal_requests.get()
+        self.assertEqual(withdrawal.status, VbtcV2WithdrawalRequest.Status.REQUESTED)
 
 
 MINT_DATA = {
@@ -1219,8 +1250,10 @@ class PendingBtcWithdrawalTests(TestCase):
         _mark_withdrawal_signed("w-req", "0200000001deadbeef")
         cancel_tx = make_tx(
             self.block, "w-cancel", Transaction.Type.VBTC_V2_WITHDRAWAL_CANCEL,
-            data=[{"Function": "VBTCWithdrawalCancel()",
-                   "WithdrawalRequestHash": "w-req"}],
+            from_address="U",
+            data={"Function": "VBTCWithdrawalCancel()",
+                  "ContractUID": self.token.sc_identifier,
+                  "WithdrawalRequestHash": "w-req"},
         )
 
         with self.assertLogs(level="ERROR") as logs:
@@ -1232,7 +1265,8 @@ class PendingBtcWithdrawalTests(TestCase):
         )
         self.withdrawal.refresh_from_db()
         self.assertEqual(
-            self.withdrawal.status, VbtcV2WithdrawalRequest.Status.CANCELLED
+            self.withdrawal.status,
+            VbtcV2WithdrawalRequest.Status.CANCELLATION_REQUESTED,
         )
 
 
@@ -1538,22 +1572,25 @@ class WithdrawalStatusRaceTests(TestCase):
         return make_tx(
             self.block, "w-complete",
             Transaction.Type.VBTC_V2_WITHDRAWAL_COMPLETE,
-            data=[{
+            from_address="U",
+            data={
                 "Function": "VBTCWithdrawalComplete()",
                 "ContractUID": self.token.sc_identifier,
                 "WithdrawalRequestHash": "w-req",
                 "BTCTransactionHash": "btc-txid",
-            }],
+            },
         )
 
     def cancel_tx(self):
         return make_tx(
             self.block, "w-cancel",
             Transaction.Type.VBTC_V2_WITHDRAWAL_CANCEL,
-            data=[{
+            from_address="U",
+            data={
                 "Function": "VBTCWithdrawalCancel()",
+                "ContractUID": self.token.sc_identifier,
                 "WithdrawalRequestHash": "w-req",
-            }],
+            },
         )
 
     # --- signing arrives last -------------------------------------------
@@ -1591,7 +1628,8 @@ class WithdrawalStatusRaceTests(TestCase):
 
         self.withdrawal.refresh_from_db()
         self.assertEqual(
-            self.withdrawal.status, VbtcV2WithdrawalRequest.Status.CANCELLED
+            self.withdrawal.status,
+            VbtcV2WithdrawalRequest.Status.CANCELLATION_REQUESTED,
         )
         self.assertIsNotNone(self.withdrawal.signed_at)
 
@@ -1632,7 +1670,8 @@ class WithdrawalStatusRaceTests(TestCase):
 
         self.withdrawal.refresh_from_db()
         self.assertEqual(
-            self.withdrawal.status, VbtcV2WithdrawalRequest.Status.CANCELLED
+            self.withdrawal.status,
+            VbtcV2WithdrawalRequest.Status.CANCELLATION_REQUESTED,
         )
         self.assertIsNotNone(self.withdrawal.signed_at)
         self.assertEqual(self.withdrawal.signed_btc_tx_hex, "0200000001deadbeef")
@@ -1656,3 +1695,43 @@ class WithdrawalStatusRaceTests(TestCase):
         self.assertIsNotNone(self.withdrawal.signed_at)
         self.token.refresh_from_db()
         self.assertFalse(self.token.is_pending_withdrawal)
+
+
+class NodeApiTokenTests(TestCase):
+    """CLI 8.0 (security audit VX-03) wants the apitoken header on every call
+    to our node; nothing else on the wire changes."""
+
+    @override_settings(RBX_WALLET_API_TOKEN="secret")
+    def test_token_goes_to_our_node_only(self):
+        from rbx import client
+        from project.utils.url import join_url
+
+        self.assertEqual(
+            client._node_headers(join_url(client.BASE_URL, "api/V1/SendBlock/1")),
+            {"apitoken": "secret"},
+        )
+        self.assertEqual(
+            client._node_headers(join_url(client.SHOP_CRAWLER_BASE_URL, "wsapi/WebShopV1/GetDecShopData")),
+            {"apitoken": "secret"},
+        )
+        self.assertEqual(client._node_headers("http://203.0.113.9:17292/api/V1/CheckStatus"), {})
+
+    @override_settings(RBX_WALLET_API_TOKEN="secret")
+    def test_explicit_headers_are_kept_alongside_the_token(self):
+        from rbx import client
+
+        url = client.BASE_URL + "/wsapi/WebShopV1/SendBid/x/y"
+        with patch.object(client.requests, "post") as post:
+            client._http.post(url, json={"a": 1}, headers={"Content-Type": "application/json"})
+        post.assert_called_once_with(
+            url, json={"a": 1}, headers={"apitoken": "secret", "Content-Type": "application/json"}
+        )
+
+    @override_settings(RBX_WALLET_API_TOKEN="")
+    def test_no_token_means_the_request_is_unchanged(self):
+        from rbx import client
+
+        url = client.BASE_URL + "/api/V1/GetWalletInfo"
+        with patch.object(client.requests, "get") as get:
+            client._http.get(url, timeout=(5, 30))
+        get.assert_called_once_with(url, timeout=(5, 30))

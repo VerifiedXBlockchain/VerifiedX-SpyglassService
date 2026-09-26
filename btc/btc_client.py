@@ -1,4 +1,6 @@
+import hashlib
 import logging
+import re
 from decimal import Decimal
 
 import requests
@@ -7,6 +9,68 @@ from django.conf import settings
 logger = logging.getLogger(__name__)
 
 _SATS = Decimal(100_000_000)
+
+
+# Bitcoin Core reports a duplicate submission as RPC error -27 ("Transaction
+# already in block chain") or as a txn-already-in-mempool / txn-already-known
+# reject. Esplora and Blockbook both pass the node's text through.
+_ALREADY_KNOWN_RE = re.compile(
+    r"already[ -]in[ -](?:block[ -]?chain|mempool)|txn-already-known|already known|(?<![0-9])-27(?![0-9])",
+    re.IGNORECASE,
+)
+
+
+def _read_varint(buf, pos):
+    n = buf[pos]
+    if n < 0xFD:
+        return n, pos + 1
+    if n == 0xFD:
+        return int.from_bytes(buf[pos + 1:pos + 3], "little"), pos + 3
+    if n == 0xFE:
+        return int.from_bytes(buf[pos + 1:pos + 5], "little"), pos + 5
+    return int.from_bytes(buf[pos + 1:pos + 9], "little"), pos + 9
+
+
+def txid_from_raw_hex(raw_tx_hex):
+    """Txid of a serialized Bitcoin transaction, or None when it does not parse.
+
+    Witness data is left out of the hash, as BIP 141 defines the txid, so the
+    value matches what a node or explorer reports for the same transaction.
+    Used to recognise a transaction the network already has when a provider
+    rejects a re-submission or fails to answer a submission it accepted.
+    """
+    try:
+        raw = bytes.fromhex(raw_tx_hex.strip())
+        pos = 4  # version
+        segwit = raw[pos] == 0x00 and raw[pos + 1] == 0x01
+        if segwit:
+            pos += 2
+        body_start = pos
+        n_in, pos = _read_varint(raw, pos)
+        if n_in == 0:
+            return None
+        for _ in range(n_in):
+            pos += 36  # previous txid + output index
+            script_len, pos = _read_varint(raw, pos)
+            pos += script_len + 4  # script + sequence
+        n_out, pos = _read_varint(raw, pos)
+        for _ in range(n_out):
+            pos += 8  # value
+            script_len, pos = _read_varint(raw, pos)
+            pos += script_len
+        body_end = pos
+        if segwit:
+            for _ in range(n_in):
+                n_items, pos = _read_varint(raw, pos)
+                for _ in range(n_items):
+                    item_len, pos = _read_varint(raw, pos)
+                    pos += item_len
+        if pos + 4 != len(raw):
+            return None
+        stripped = raw[:4] + raw[body_start:body_end] + raw[pos:pos + 4]
+        return hashlib.sha256(hashlib.sha256(stripped).digest()).digest()[::-1].hex()
+    except (ValueError, IndexError):
+        return None
 
 
 class BtcClient:
@@ -186,6 +250,14 @@ class BtcClient:
         else:
             return data.get("transactions", [])
 
+    # Every provider call has to fit inside gunicorn's 30s worker budget with
+    # room for the fallback. 2026-09-26: mempool.space held a testnet4 POST
+    # open past 30s from the cluster (it answered the same hex from outside in
+    # 80ms), gunicorn killed the worker mid-request, and the wallet got a 503
+    # for a transaction it could not tell had been sent.
+    BROADCAST_TIMEOUT = (2, 5)
+    LOOKUP_TIMEOUT = (2, 3)
+
     def broadcast_transaction(self, raw_tx_hex: str):
         """Broadcast a signed transaction to the Bitcoin network.
 
@@ -193,18 +265,41 @@ class BtcClient:
         /testnet endpoint is testnet3, where testnet4 UTXOs don't exist. Every
         broadcast sent there fails `bad-txns-inputs-missingorspent` (2026-08-13:
         this dead-ended every web-wallet withdrawal at the broadcast step).
-        Providers are tried in order; any success wins.
+        Providers are tried in order; any success wins. Three providers plus the
+        lookup fit inside gunicorn's 30s worker budget at these timeouts.
+
+        A transaction the network already holds counts as sent: a provider
+        that rejects the re-submission as a duplicate, or a lookup that finds
+        the txid after every provider failed, both return success with the
+        txid computed from the hex. Without this a submission that was
+        accepted but not answered in time (or by a retry from elsewhere)
+        reads as a failure forever, and a retry can only ever re-sign.
         """
+        # Submissions from the cluster to mempool.space never get an answer
+        # (2026-09-26: a real testnet4 hex sat 35s and died with a connection
+        # error while GETs and malformed POSTs to the same host returned in
+        # 40ms), so it is not a testnet submission provider here; it is still
+        # the lookup. mempool.emzy.de and mempool.ninja are independent
+        # Esplora-compatible instances that serve testnet4.
         if self.is_testnet:
             providers = [
-                ("https://mempool.space/testnet4/api/tx", "esplora"),
                 ("https://blockbook.tbtc-1.zelcore.io/api/v2/sendtx/", "blockbook"),
+                ("https://mempool.emzy.de/testnet4/api/tx", "esplora"),
+                ("https://mempool.ninja/testnet4/api/tx", "esplora"),
             ]
+            lookup_url = "https://mempool.space/testnet4/api/tx/{txid}"
         else:
             providers = [
                 ("https://mempool.space/api/tx", "esplora"),
                 ("https://blockstream.info/api/tx", "esplora"),
+                ("https://mempool.emzy.de/api/tx", "esplora"),
             ]
+            lookup_url = "https://mempool.space/api/tx/{txid}"
+
+        expected_txid = txid_from_raw_hex(raw_tx_hex)
+        logger.info(
+            f"BTC broadcast: txid={expected_txid or 'unparsed'} via {[url for url, _ in providers]}"
+        )
 
         last_message = "BTC broadcast failed"
         for url, kind in providers:
@@ -213,7 +308,7 @@ class BtcClient:
                     url,
                     data=raw_tx_hex,
                     headers={"Content-Type": "text/plain"},
-                    timeout=(5, 30),
+                    timeout=self.BROADCAST_TIMEOUT,
                 )
 
                 if response.status_code == 200:
@@ -230,8 +325,22 @@ class BtcClient:
                     logger.error(
                         f"BTC broadcast via {url} failed ({response.status_code}): {last_message}"
                     )
+                    if expected_txid and _ALREADY_KNOWN_RE.search(last_message):
+                        logger.info(f"BTC broadcast: {expected_txid} already known to {url}")
+                        return {"success": True, "txid": expected_txid, "already_known": True}
             except Exception as e:
                 last_message = str(e)
                 logger.error(f"Error broadcasting BTC transaction via {url}: {e}")
 
+        if expected_txid and self._transaction_is_known(lookup_url.format(txid=expected_txid)):
+            logger.info(f"BTC broadcast: {expected_txid} found on the network after provider errors")
+            return {"success": True, "txid": expected_txid, "already_known": True}
+
         return {"success": False, "message": last_message}
+
+    def _transaction_is_known(self, url):
+        try:
+            return requests.get(url, headers=self.headers, timeout=self.LOOKUP_TIMEOUT).status_code == 200
+        except Exception as e:
+            logger.error(f"Error looking up BTC transaction via {url}: {e}")
+            return False
