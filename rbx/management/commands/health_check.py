@@ -75,7 +75,7 @@ class Command(BaseCommand):
         print(f"PROBLEM. Last block is {height}")
 
         lines = [
-            "🚨 RBX Issue Detected! 🚨",
+            "🚨 VFX Issue Detected! 🚨",
             f"It's been {round(delta)} seconds since the last block.",
             f"Man your battle stations.",
         ]
@@ -89,7 +89,7 @@ class Command(BaseCommand):
 
     def handle_exception(self, exception):
         lines = [
-            "⚠️ RBX Issue Detected! ⚠️",
+            "⚠️ VFX Issue Detected! ⚠️",
             f"Explorer Wallet is Unreachable",
         ]
         body = "\n".join(lines)
