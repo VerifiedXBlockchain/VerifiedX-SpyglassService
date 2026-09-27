@@ -3,7 +3,7 @@ import gzip
 import json
 from decimal import Decimal
 
-from django.test import TestCase
+from django.test import TestCase, override_settings
 from django.utils import timezone
 
 from unittest.mock import patch
@@ -1656,3 +1656,51 @@ class WithdrawalStatusRaceTests(TestCase):
         self.assertIsNotNone(self.withdrawal.signed_at)
         self.token.refresh_from_db()
         self.assertFalse(self.token.is_pending_withdrawal)
+
+
+class HealthCheckAlertTests(TestCase):
+    """Health-check alerts go to Discord (shared ops channel) and SMS, and a
+    failure on one channel never blocks the other."""
+
+    def _command(self):
+        from rbx.management.commands.health_check import Command
+
+        return Command()
+
+    @override_settings(DISCORD_ALERT_WEBHOOK_URL="https://discord.test/hook", ENVIRONMENT="mainnet")
+    def test_stall_alert_reaches_discord_even_when_sms_fails(self):
+        with patch("rbx.discord_alerts.requests.post") as post, patch(
+            "rbx.management.commands.health_check.send_sms", side_effect=RuntimeError("twilio 401")
+        ) as sms:
+            self._command().handle_problem(7387081, 4000)
+        post.assert_called_once()
+        content = post.call_args.kwargs["json"]["content"]
+        self.assertTrue(content.startswith("[mainnet] "))
+        self.assertIn("4000 seconds since the last block", content)
+        self.assertEqual(sms.call_count, 2)  # every number is still attempted
+
+    @override_settings(DISCORD_ALERT_WEBHOOK_URL="https://discord.test/hook", ENVIRONMENT="testnet")
+    def test_unreachable_alert_reaches_discord(self):
+        with patch("rbx.discord_alerts.requests.post") as post, patch(
+            "rbx.management.commands.health_check.send_sms"
+        ) as sms:
+            self._command().handle_exception(Exception("down"))
+        self.assertIn("Explorer Wallet is Unreachable", post.call_args.kwargs["json"]["content"])
+        sms.assert_called_once()
+
+    @override_settings(DISCORD_ALERT_WEBHOOK_URL="")
+    def test_no_webhook_means_sms_only(self):
+        with patch("rbx.discord_alerts.requests.post") as post, patch(
+            "rbx.management.commands.health_check.send_sms"
+        ) as sms:
+            self._command().handle_problem(1, 300)
+        post.assert_not_called()
+        self.assertEqual(sms.call_count, 2)
+
+    @override_settings(DISCORD_ALERT_WEBHOOK_URL="https://discord.test/hook")
+    def test_discord_failure_does_not_raise(self):
+        import requests as real_requests
+        from rbx.discord_alerts import send_discord_alert
+
+        with patch("rbx.discord_alerts.requests.post", side_effect=real_requests.ConnectionError("down")):
+            self.assertFalse(send_discord_alert("x"))

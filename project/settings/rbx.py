@@ -41,6 +41,10 @@ AWS_BUCKET_NFT_ASSETS = ENV.str("AWS_BUCKET_NFT_ASSETS", None)
 
 RBX_WEB_BASE_URL = ENV.str("RBX_WEB_BASE_URL")
 
+# Shared ops Discord channel for health-check alerts (backup to SMS). Same
+# variable name as the node farm so one webhook can serve every repo.
+DISCORD_ALERT_WEBHOOK_URL = ENV.str("DISCORD_ALERT_WEBHOOK_URL", default="")
+
 
 with open(RBX_WALLET_SSH_KEY_PATH, "w+") as file:
     file.write(base64.b64decode(ENV.str("RBX_WALLET_SSH_KEY_B64")).decode("utf-8"))
