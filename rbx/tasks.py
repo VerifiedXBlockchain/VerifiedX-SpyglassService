@@ -439,6 +439,8 @@ def expire_stale_withdrawals():
         logging.warning("Skipping withdrawal expiry sweep: no blocks synced")
         return
 
+    vbtc_dispatch.lapse_cancellations(current_height)
+
     for token in VbtcV2Token.objects.filter(is_pending_withdrawal=True):
         was_pending = token.is_pending_withdrawal
         token.recompute_pending_withdrawal(current_height=current_height)
