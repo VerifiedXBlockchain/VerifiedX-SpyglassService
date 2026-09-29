@@ -3,10 +3,14 @@ from django.db.models import Q
 
 from rbx.models import Transaction, VbtcV2Token
 from rbx.tasks import process_transaction
+from rbx.models import VbtcV2TokenTransfer
 from rbx.vbtc_dispatch import (
     ENVELOPE_TRANSFER_FUNCTION,
+    KEEP_STORED,
     OWNERSHIP_TRANSFER_FUNCTION,
     SC_ENVELOPE_TYPES,
+    planned_settlement,
+    replaying,
 )
 from rbx.vbtc_gates import field, net_string, parse_envelope
 
@@ -92,22 +96,58 @@ class Command(BaseCommand):
                 self.stdout.write(
                     f"  [DRY RUN] {tx.hash} type={tx.type} height={tx.height}"
                 )
+            self.report_settlements(txs)
             return
 
         processed = 0
         errors = 0
 
-        for tx in txs.iterator():
-            try:
-                self.stdout.write(
-                    f"Processing {tx.hash} (type={tx.type}, height={tx.height})..."
-                )
-                process_transaction(tx)
-                processed += 1
-            except Exception as e:
-                errors += 1
-                self.stderr.write(f"  ERROR processing {tx.hash}: {e}")
+        with replaying():
+            for tx in txs.iterator():
+                try:
+                    self.stdout.write(
+                        f"Processing {tx.hash} (type={tx.type}, height={tx.height})..."
+                    )
+                    process_transaction(tx)
+                    processed += 1
+                except Exception as e:
+                    errors += 1
+                    self.stderr.write(f"  ERROR processing {tx.hash}: {e}")
 
         self.stdout.write(
             f"Done. Processed: {processed}, Errors: {errors}, Total: {count}"
         )
+
+    def report_settlements(self, txs):
+        """Every settlement row the run would write, change or remove. It is
+        read from the table as it is now; a run that first corrects the rows
+        a settlement is derived from can plan a different one."""
+        tokens = {t.sc_identifier: t for t in VbtcV2Token.objects.all()}
+        changes = 0
+        with replaying():
+            for tx in txs:
+                payload, _ = parse_envelope(tx.data)
+                if net_string(field(payload, "Function")) != OWNERSHIP_TRANSFER_FUNCTION:
+                    continue
+                token = tokens.get(net_string(field(payload, "ContractUID")))
+                if token is None or tx.type not in SC_ENVELOPE_TYPES:
+                    continue
+                plan = planned_settlement(token, tx)
+                if plan is KEEP_STORED:
+                    continue
+                row = VbtcV2TokenTransfer.objects.filter(token=token, transaction=tx).first()
+                stored = (row.from_address, row.to_address, row.amount) if row else None
+                if stored != plan:
+                    changes += 1
+                    self.stdout.write(
+                        f"  [DRY RUN] settlement {tx.hash} on {token.sc_identifier}: "
+                        f"{self.describe(stored)} would become {self.describe(plan)}"
+                    )
+        self.stdout.write(f"Settlement rows that would change: {changes}")
+
+    @staticmethod
+    def describe(settlement):
+        if settlement is None:
+            return "no row"
+        from_address, to_address, amount = settlement
+        return f"{from_address} -> {to_address} {amount.normalize():f}"
