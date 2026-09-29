@@ -1219,9 +1219,21 @@ class VbtcV2Token(models.Model):
             self.is_pending_withdrawal = pending
             self.save(update_fields=["is_pending_withdrawal"])
 
-    def ledger_entries(self):
+    def ledger_entries(self, before=None):
         """Per-address ledger from transfers and withdrawal debits, WITHOUT
         the owner anchor (global_balance + withdrawn add-back).
+
+        With `before`, the ledger as the chain had it when it applied that
+        transaction: rows from later blocks are left out, and a request that
+        was refunded in a later block still counts as held. A replayed
+        transaction needs this, because the table already holds everything
+        that came after it.
+
+        Every transaction of a block carries the block's timestamp and the
+        order inside a block is not stored, so rows of `before`'s own block
+        count as earlier. At the chain tip they are: the rows in the table
+        are the ones already applied. A replay cannot know, and
+        has_unordered_activity() tells it when that matters.
 
         Mirrors the node's per-contract tokenization rows at 63468588:
 
@@ -1239,7 +1251,7 @@ class VbtcV2Token(models.Model):
         Settlement rows created at ownership transfer are ordinary
         VbtcV2TokenTransfer rows, so they flow through here unchanged.
         """
-        now = timezone.now()
+        as_of = timezone.now() if before is None else before.date_crafted
         transfers = (
             VbtcV2TokenTransfer.objects.filter(token=self)
             .select_related("transaction")
@@ -1247,20 +1259,23 @@ class VbtcV2Token(models.Model):
         )
         entries = {}
         for t in transfers:
+            if not self._applied_before(t.transaction, before):
+                continue
             if t.from_address.startswith("xRBX"):
                 tx = t.transaction
                 if tx.voided_from_callback:
                     continue
-                if tx.unlock_time is not None and tx.unlock_time > now:
+                if tx.unlock_time is not None and tx.unlock_time > as_of:
                     continue
             entries[t.to_address] = entries.get(t.to_address, Decimal(0)) + t.amount
             entries[t.from_address] = entries.get(t.from_address, Decimal(0)) - t.amount
 
-        for w in self.withdrawal_requests.select_related("request_transaction"):
+        for w in self._requests(before):
+            status = self._status(w, before)
             if escrow_applies(w.request_transaction.height):
-                debit = w.status != VbtcV2WithdrawalRequest.Status.CANCELLED
+                debit = status != VbtcV2WithdrawalRequest.Status.CANCELLED
             else:
-                debit = w.status == VbtcV2WithdrawalRequest.Status.COMPLETED
+                debit = status == VbtcV2WithdrawalRequest.Status.COMPLETED
             if debit:
                 entries[w.requestor_address] = (
                     entries.get(w.requestor_address, Decimal(0)) - w.amount
@@ -1268,7 +1283,64 @@ class VbtcV2Token(models.Model):
 
         return entries
 
-    def settlement_amount_for(self, address):
+    @staticmethod
+    def _applied_before(tx, before):
+        return before is None or (tx.height <= before.height and tx.pk != before.pk)
+
+    def _requests(self, before):
+        requests = self.withdrawal_requests.select_related("request_transaction")
+        return [w for w in requests if self._applied_before(w.request_transaction, before)]
+
+    @staticmethod
+    def _status(request, before):
+        """A refund decided after `before` had not happened yet. A completion
+        after it needs no such care: an open request below the escrow gate is
+        held back from the settlement and a completed one is a ledger debit
+        of the same amount, and an escrowed request is a debit either way."""
+        if before is not None and request.refunded_after(before):
+            return VbtcV2WithdrawalRequest.Status.REQUESTED
+        return request.status
+
+    def has_unordered_activity(self, tx):
+        """Whether the ledger holds something that nothing stored places
+        before or after tx. Every transaction carries its block's time, so
+        that is a row or a request in tx's block, a refund decided in that
+        block or with no time recorded, and a reserve send that unlocked
+        since the block before, which the node applies once a block has
+        passed the unlock time. A replay cannot settle tx from the ledger
+        when there is one.
+
+        Whose row it is does not narrow this: a row an older indexer stored
+        under the wrong parties is corrected by the same replay, and may be
+        reached after tx. A completion or a cancellation request does not
+        count: an open request and a completed one settle the same (see
+        _status)."""
+        unlocked = Q(
+            from_address__startswith="xRBX",
+            transaction__voided_from_callback=False,
+            transaction__unlock_time__lte=tx.date_crafted,
+        )
+        previous = (
+            Block.objects.filter(height=tx.height - 1)
+            .values_list("date_crafted", flat=True)
+            .first()
+        )
+        if previous is not None:
+            unlocked &= Q(transaction__unlock_time__gte=previous)
+        rows = VbtcV2TokenTransfer.objects.filter(token=self).exclude(transaction=tx)
+        if rows.filter(Q(transaction__height=tx.height) | unlocked).exists():
+            return True
+        return self.withdrawal_requests.filter(
+            Q(request_transaction__height=tx.height)
+            | Q(cancelled_at=tx.date_crafted)
+            | Q(
+                status=VbtcV2WithdrawalRequest.Status.CANCELLED,
+                cancelled_at__isnull=True,
+                request_transaction__height__lt=tx.height,
+            )
+        ).exists()
+
+    def settlement_amount_for(self, address, before=None):
         """Signed amount that must move from `address` to the incoming owner
         at ownership transfer (negative = the incoming owner owes `address`).
 
@@ -1277,21 +1349,20 @@ class VbtcV2Token(models.Model):
         withdrawals. The old owner keeps exactly enough to cover their
         still-open withdrawal requests — those will debit them when they
         complete, and the BTC pays out to their address, not the new owner's.
+
+        `before` is the ownership transfer being applied (see ledger_entries).
         """
         # An escrowed request is already a debit in ledger_entries; only a
         # request below the escrow gate is still owed out of the entry.
-        pending = sum(
-            (
-                w.amount
-                for w in self.withdrawal_requests.filter(
-                    status__in=VbtcV2WithdrawalRequest.ACTIVE_STATUSES,
-                    requestor_address=address,
-                ).select_related("request_transaction")
-                if not escrow_applies(w.request_transaction.height)
-            ),
-            Decimal(0),
-        )
-        return self.ledger_entries().get(address, Decimal(0)) - pending
+        pending = Decimal(0)
+        for w in self._requests(before):
+            if w.requestor_address != address:
+                continue
+            if self._status(w, before) not in VbtcV2WithdrawalRequest.ACTIVE_STATUSES:
+                continue
+            if not escrow_applies(w.request_transaction.height):
+                pending += w.amount
+        return self.ledger_entries(before).get(address, Decimal(0)) - pending
 
     @property
     def addresses(self):
@@ -1464,6 +1535,15 @@ class VbtcV2WithdrawalRequest(models.Model):
 
     def __str__(self):
         return f"{self.token.sc_identifier} withdrawal [{self.status}]"
+
+    def refunded_after(self, tx):
+        """Whether the vote that refunded this request came in a block after
+        tx's. cancelled_at is that block's timestamp."""
+        return (
+            self.status == self.Status.CANCELLED
+            and self.cancelled_at is not None
+            and self.cancelled_at > tx.date_crafted
+        )
 
 
 class UnindexedMint(models.Model):
