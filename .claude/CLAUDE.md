@@ -102,11 +102,11 @@ The vBTC V2 indexer (`rbx/vbtc_dispatch.py`, `rbx/vbtc_gates.py`, balance math i
 
 1. **Deploy** (push to `main` for mainnet, `testnet` for testnet). Porter's predeploy runs migrations; the workers restart.
 2. **Wait for quiescence**: no fresh `ready.` lines in `./scripts/fetch-logs.sh <network> --since 8m` for a few minutes (Porter can roll a second revision after the Action goes green).
-3. **Preview the run.** `--dry-run` lists the transactions and every settlement row the run would write, change or remove:
+3. **Preview the run.** `--dry-run` lists the transactions, every settlement row the run would write, change or remove, and every one it would leave because the order inside the block is not stored:
    ```bash
    python3 -c 'import pty,sys; sys.exit(pty.spawn(["porter","app","run","rbx-explorer-<network>","--wait","--","python","manage.py","reprocess_vbtc_v2","--dry-run"]))'
    ```
-   `Settlement rows that would change: 0` is what a chain that was indexed correctly gives. Account for every row it names before going on.
+   `Settlement rows that would change: 0; left as stored: 0` is what a chain that was indexed correctly gives when no transfer shares its block with other activity. Account for every row it names before going on. A row "left as stored" is not checked by the run at all: compare that holder with the node by hand (step 7). The preview reads each transfer against the table as it is, so where one settlement feeds the next on the same contract the run can end on a different row; steps 4 and 6 are the check on the result.
 4. **Snapshot the balances** the API serves, before anything is rewritten:
    ```bash
    ./scripts/vbtc-v2-balances.py snapshot <network> before.json
@@ -115,7 +115,7 @@ The vBTC V2 indexer (`rbx/vbtc_dispatch.py`, `rbx/vbtc_gates.py`, balance math i
    ```bash
    python3 -c 'import pty,sys; sys.exit(pty.spawn(["porter","app","run","rbx-explorer-<network>","--wait","--","python","manage.py","reprocess_vbtc_v2"]))'
    ```
-   (`porter app run` needs a pseudo-terminal; macOS `script` fails when stdin is a socket, the Python pty module does not.) It reprocesses types 25-30 plus the legacy envelope transactions that touch vBTC V2 contracts, in chain order, idempotently. Expect one `Found N transaction(s)` line and `Done. Processed: N, Errors: 0`. A clean exit says the transactions were processed, not that the ledger is right; steps 6 and 7 say that.
+   (`porter app run` needs a pseudo-terminal; macOS `script` fails when stdin is a socket, the Python pty module does not.) It reprocesses types 25-30 plus the legacy envelope transactions that touch vBTC V2 contracts, block by block, idempotently. Inside a block it goes in hash order, which is not the chain's. Run it whole: `--type` and `--skip-envelopes` replay mints without the transfers that follow them and leave `Nft.owner_address` on the minter. Expect one `Found N transaction(s)` line and `Done. Processed: N, Errors: 0`. A clean exit says the transactions were processed, not that the ledger is right; steps 6 and 7 say that.
 6. **Read every balance the backfill changed**:
    ```bash
    ./scripts/vbtc-v2-balances.py snapshot <network> after.json
@@ -126,9 +126,24 @@ The vBTC V2 indexer (`rbx/vbtc_dispatch.py`, `rbx/vbtc_gates.py`, balance math i
    ```bash
    VFX_NODE_TOKEN=<token> ./scripts/vbtc-v2-balances.py node after.json --node http://<node>:<port> --token-env VFX_NODE_TOKEN
    ```
-   It compares every holder balance with the node's `vbtcapi/VBTC/GetVBTCBalance/{address}/{scUID}`. A balance that matched the node before the backfill and does not after it is a defect in the backfill. Known owner-formula differences on Core's side are listed in the 2026-09-25 notes (`reviews/remediation-audit-2026-09-25` in the platform-context repo); on mainnet they are the owners of `4bb6f099`, `76c995d5`, `8234b371` and `d11a9ef3`, and holder `RNiQ` on `d11a9ef3`.
+   It compares every holder balance Spyglass lists with the node's `vbtcapi/VBTC/GetVBTCBalance/{address}/{scUID}`. A balance that matched the node before the backfill and does not after it is a defect in the backfill. A holder the backfill dropped is not in `after.json` and is not asked about; step 6 is what shows it. Known owner-formula differences on Core's side are listed in the 2026-09-25 notes (`reviews/remediation-audit-2026-09-25` in the platform-context repo); on mainnet they are the owners of `4bb6f099`, `76c995d5`, `8234b371` and `d11a9ef3`, and holder `RNiQ` on `d11a9ef3`.
 
 **What went wrong on 2026-09-28.** The first mainnet backfill replayed each ownership transfer against the present-day ledger and wrote three settlement rows that handed the former owner's current balance to the new owner (contracts `3de79275`, `6fc51819`, `b8f0d376`). The rows were deleted and the settlement now comes from the ledger as it stood at the transfer (`planned_settlement`, `before=tx`). Anything else that derives a row from the ledger during a replay needs the same cut-off. The order of transactions inside a block is not stored, so when the transfer's block holds other activity on the contract a replay keeps the row that live indexing wrote and logs a warning.
+
+**What a replay cannot order.** `sync_block` stamps every transaction with its block's time, so nothing stored says which of two transactions in one block the chain applied first. `VbtcV2Token.has_unordered_activity` names the cases for the outgoing owner of a transfer: a row or a request of that address in the transfer's block, a refund of its request decided in that block or with no time recorded, and a reserve send to or from it that unlocked between the block before and the transfer's block. In each a replay, or a second pass over a transfer that already has its row, leaves the settlement as it is stored and logs a warning. Activity of other addresses, completions and cancellation requests do not hold a settlement, because none of them changes what the outgoing owner settles. Neither network holds any of these cases as of 2026-09-29 (59 transfers on mainnet, 2 on testnet).
+
+A block cannot hold two `Transfer()` of one contract: the node checks each against the owner before the block and rejects a block where one sender touches a contract twice (`TransactionValidatorService.cs:981`, `BlockValidatorService.cs:1066`).
+
+A reserve send that a recovery redirected keeps the recovery's address on every later pass (`Recovery.outstanding_transactions`). Recoveries and callbacks are not replayed.
+
+Known limits. A backfill triggers none of them:
+
+- `validate_transactions --fix` deletes a block's transactions and re-syncs it. The delete cascades to every ledger row and withdrawal request that points at one of them, including a request from an earlier block whose completion or cancel is in this one. After using it on a block with vBTC V2 activity, run the backfill by this checklist.
+- A second pass outside `replaying()` over a transfer with no row settles against the table as it is. No caller does this today. Wrap any new replay in `replaying()`.
+- When a transfer is first indexed, a reserve send to the outgoing owner counts as applied if its unlock time is at or before the transfer's block time. Core applies a send at the end of the first block stamped after the unlock (`ReserveService.Run`), so a send that unlocked since the block before has not been applied yet. Read from Core's code, not confirmed against a node. No vBTC V2 contract on either network has a reserve send.
+- A `Transfer()` from a reserve address moves the owner on Core when it unlocks; Spyglass moves it when it is mined.
+
+Storing each transaction's index inside its block at sync would remove the cases a replay cannot order and the second limit. That is a schema change and its own piece of work.
 
 **Mainnet specifics.** `VBTC_NETWORK` defaults to the mainnet height table whenever `ENVIRONMENT` is not `testnet` (`project/settings/rbx.py`), so mainnet needs no new env var. The escrow gate on mainnet is block 7,296,200 and the multi-transfer gate 7,281,000; both are already below the tip, so the backfill will re-derive every escrowed request. **Do not skip step 5 on mainnet**: until it runs, every holder with a stalled or cancelled-but-unapproved withdrawal request is overstated, which is the SG-01 defect this code exists to fix. The mainnet backfill ran on 2026-09-28 and, once the three settlement rows were removed, left every balance as it was.
 

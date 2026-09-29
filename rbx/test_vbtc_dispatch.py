@@ -16,6 +16,7 @@ from rbx.tests import add_transfer, add_withdrawal, make_block, make_token, make
 from rbx.vbtc_dispatch import (
     cancellation_uid_for,
     redirect_reserve_transfer,
+    replaying,
     void_reserve_transfer,
 )
 from rbx.vbtc_gates import bound_field, field, net_decimal, net_int, parse_envelope
@@ -562,6 +563,49 @@ class ReserveTransferTests(TestCase):
         self.assertEqual(self.token.addresses["Recovered"], Decimal("0.002"))
         self.assertNotIn("R", self.token.addresses)
 
+    def recover(self):
+        recovery = make_tx(
+            self.block, "rc1", Transaction.Type.RESERVE, from_address="xRBXreserve",
+            data={"Function": "Recover()", "RecoveryAddress": "Recovered"},
+        )
+        process_transaction(recovery)
+        self.tx.refresh_from_db()
+
+    def test_recovery_transaction_routes_to_the_redirect(self):
+        self.recover()
+        row = VbtcV2TokenTransfer.objects.get(transaction=self.tx)
+        self.assertEqual(row.to_address, "Recovered")
+        self.assertEqual(self.token.addresses["Recovered"], Decimal("0.002"))
+
+    def test_replay_keeps_the_recipient_a_recovery_set(self):
+        # A backfill replays the send and not the recovery that followed it.
+        self.recover()
+
+        with replaying():
+            process_transaction(self.tx)
+
+        self.assertEqual(self.token.addresses["Recovered"], Decimal("0.002"))
+        self.assertNotIn("R", self.token.addresses)
+
+    def test_second_pass_keeps_the_recipient_a_recovery_set(self):
+        self.recover()
+
+        process_transaction(self.tx)
+
+        self.assertEqual(self.token.addresses["Recovered"], Decimal("0.002"))
+        self.assertNotIn("R", self.token.addresses)
+
+    def test_replay_corrects_a_reserve_send_no_recovery_moved(self):
+        VbtcV2TokenTransfer.objects.filter(transaction=self.tx).update(
+            to_address="Payload", amount=Decimal("0.009")
+        )
+
+        with replaying():
+            process_transaction(self.tx)
+
+        row = VbtcV2TokenTransfer.objects.get(transaction=self.tx)
+        self.assertEqual((row.to_address, row.amount), ("R", Decimal("0.002")))
+
 
 @TESTNET
 class ReprocessCommandTests(TestCase):
@@ -625,8 +669,47 @@ class ReprocessCommandTests(TestCase):
 
         text = out.getvalue()
         self.assertIn("settlement h1 on sc:a: M -> U 0.0003 would become no row", text)
-        self.assertIn("Settlement rows that would change: 1", text)
+        self.assertIn("Settlement rows that would change: 1; left as stored: 0", text)
         self.assertTrue(VbtcV2TokenTransfer.objects.filter(transaction=handover).exists())
+
+    def test_dry_run_names_the_settlement_a_run_would_leave(self):
+        token = make_token(owner="U", global_balance="0.001", sc_identifier="sc:a")
+        block = make_block(10)
+        handover = make_tx(
+            block, "h1", Transaction.Type.TKNZ_TX, from_address="M",
+            to_address="U", data={"Function": "Transfer()", "ContractUID": "sc:a"},
+        )
+        add_transfer(token, make_tx(block, "t1", Transaction.Type.VBTC_V2_TRANSFER),
+                     "U", "M", "0.0003")
+        add_transfer(token, handover, "M", "U", "0.0003")
+
+        from io import StringIO
+        out = StringIO()
+        call_command("reprocess_vbtc_v2", "--dry-run", stdout=out)
+
+        text = out.getvalue()
+        self.assertIn(
+            "settlement h1 on sc:a: M -> U 0.0003 would be left, order not stored", text
+        )
+        self.assertIn("Settlement rows that would change: 0; left as stored: 1", text)
+
+    def test_dry_run_reports_only_the_transfers_a_run_applies(self):
+        # process_transaction applies Transfer() from NFT_TX, TKNZ_TX and
+        # SC_TX. A run leaves the row of any other type as it is.
+        token = make_token(owner="U", global_balance="0.001", sc_identifier="sc:a")
+        burn = make_tx(
+            make_block(10), "b1", Transaction.Type.TKNZ_BURN, from_address="M",
+            to_address="U", data={"Function": "Transfer()", "ContractUID": "sc:a"},
+        )
+        add_transfer(token, burn, "M", "U", "0.0003")
+
+        from io import StringIO
+        out = StringIO()
+        call_command("reprocess_vbtc_v2", "--dry-run", stdout=out)
+        self.assertIn("Settlement rows that would change: 0; left as stored: 0", out.getvalue())
+
+        call_command("reprocess_vbtc_v2", stdout=StringIO())
+        self.assertTrue(VbtcV2TokenTransfer.objects.filter(transaction=burn).exists())
 
 
 @TESTNET

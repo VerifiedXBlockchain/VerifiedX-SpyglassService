@@ -530,12 +530,17 @@ class OwnershipTransferSettlementTests(TestCase):
         self.assertEqual(settlements.count(), 1)
 
 
+# The heights below are under the mainnet escrow gate, whatever network the
+# environment names.
+@override_settings(VBTC_NETWORK="mainnet", VBTC_WITHDRAWAL_ESCROW_HEIGHT=None)
 class OwnershipTransferReplayTests(TestCase):
     """A backfill replays an ownership transfer with every later row of the
     contract already in the table. The settlement has to come from the ledger
     as the chain had it at that transaction, or the former owner's present
     balance is handed to the new owner (mainnet 3de79275, 6fc51819 and
     b8f0d376 on 2026-09-28)."""
+
+    KEPT = "is not stored; the settlement is left as it is stored"
 
     def setUp(self):
         self.genesis = timezone.now() - timedelta(days=1)
@@ -582,6 +587,10 @@ class OwnershipTransferReplayTests(TestCase):
                 token=token, transaction__type=Transaction.Type.TKNZ_TX
             )
         )
+
+    def assertKept(self, logs, count=1):
+        kept = [line for line in logs.output if self.KEPT in line]
+        self.assertEqual(len(kept), count, logs.output)
 
     def test_later_receipts_are_not_settled(self):
         # The minter M hands the fresh contract to U, then receives vBTC on it.
@@ -771,7 +780,7 @@ class OwnershipTransferReplayTests(TestCase):
         with self.assertLogs(level="WARNING") as logs:
             self.replay(handover)
 
-        self.assertIn("order is not stored", logs.output[0])
+        self.assertKept(logs)
         self.assertEqual(self.settlements(token), indexed)
         token.refresh_from_db()
         self.assertEqual(
@@ -786,9 +795,10 @@ class OwnershipTransferReplayTests(TestCase):
         process_transaction(handover)
         self.transfer(token, 100, "aa", "P", "O", "0.0002")
 
-        with self.assertLogs(level="WARNING"):
+        with self.assertLogs(level="WARNING") as logs:
             process_transaction(handover)
 
+        self.assertKept(logs)
         self.assertEqual(
             self.settlements(token), [("ff", "Q", "O", Decimal("0.0004"))]
         )
@@ -798,9 +808,10 @@ class OwnershipTransferReplayTests(TestCase):
         handover = self.handover(token, 10, "h1", "M", "U")
         self.transfer(token, 10, "t1", "U", "M", "0.0001")
 
-        with self.assertLogs(level="WARNING"):
+        with self.assertLogs(level="WARNING") as logs:
             self.replay(handover)
 
+        self.assertKept(logs)
         self.assertEqual(self.settlements(token), [])
 
     @override_settings(VBTC_WITHDRAWAL_ESCROW_HEIGHT=1)
@@ -817,10 +828,175 @@ class OwnershipTransferReplayTests(TestCase):
         request.cancelled_at = handover.date_crafted
         request.save(update_fields=["status", "cancelled_at"])
 
-        with self.assertLogs(level="WARNING"):
+        with self.assertLogs(level="WARNING") as logs:
             self.replay(handover)
 
+        self.assertKept(logs)
         self.assertEqual(self.settlements(token), indexed)
+
+    def test_request_mined_after_the_handover_is_left_out(self):
+        token = make_token(owner="P", global_balance="0.001")
+        handover = self.handover(token, 10, "h1", "O", "P")
+        self.request(
+            token, 20, "w1", "O", "0.0003", VbtcV2WithdrawalRequest.Status.REQUESTED
+        )
+
+        self.assertEqual(token.settlement_amount_for("O", before=handover), Decimal(0))
+        self.assertEqual(token.settlement_amount_for("O"), Decimal("-0.0003"))
+
+    def test_refund_in_the_block_of_the_handover_is_not_after_it(self):
+        token = make_token(owner="O", global_balance="0.001")
+        request = self.request(
+            token, 5, "w1", "O", "0.0003", VbtcV2WithdrawalRequest.Status.CANCELLED
+        )
+        handover = self.handover(token, 10, "h1", "O", "P")
+
+        request.cancelled_at = self.block_time(10)
+        self.assertFalse(request.refunded_after(handover))
+        request.cancelled_at = self.block_time(11)
+        self.assertTrue(request.refunded_after(handover))
+
+    def test_replay_writes_no_settlement_when_a_request_shares_its_block(self):
+        # Block 10 holds the handover and then O's request. A replay that
+        # took the request as the earlier of the two would settle it.
+        token = make_token(owner="O", global_balance="0.001")
+        handover = self.handover(token, 10, "h1", "O", "P")
+        process_transaction(handover)
+        self.request(
+            token, 10, "w1", "O", "0.0003", VbtcV2WithdrawalRequest.Status.REQUESTED
+        )
+
+        with self.assertLogs(level="WARNING") as logs:
+            self.replay(handover)
+
+        self.assertKept(logs)
+        self.assertEqual(self.settlements(token), [])
+
+    def test_replay_keeps_the_settlement_when_a_refund_has_no_time(self):
+        token = make_token(owner="O", global_balance="0.001")
+        request = self.request(
+            token, 5, "w1", "O", "0.0003", VbtcV2WithdrawalRequest.Status.REQUESTED
+        )
+        handover = self.handover(token, 10, "h1", "O", "Q")
+        process_transaction(handover)
+        indexed = self.settlements(token)
+        self.assertEqual(indexed, [("h1", "Q", "O", Decimal("0.0003"))])
+        request.status = VbtcV2WithdrawalRequest.Status.CANCELLED
+        request.save(update_fields=["status"])
+
+        with self.assertLogs(level="WARNING") as logs:
+            self.replay(handover)
+
+        self.assertKept(logs)
+        self.assertEqual(self.settlements(token), indexed)
+
+    def reserve_send(self, token, unlocks_at):
+        send = self.transfer(token, 5, "r1", "xRBXreserve", "O", "0.0002")
+        send.transaction.unlock_time = unlocks_at
+        send.transaction.save(update_fields=["unlock_time"])
+        make_block(9)
+        Block.objects.filter(height=9).update(date_crafted=self.block_time(9))
+        return send
+
+    def test_replay_keeps_the_settlement_when_a_reserve_send_unlocked_in_its_block(self):
+        token = make_token(owner="O", global_balance="0.001")
+        self.reserve_send(token, self.block_time(10))
+        handover = self.handover(token, 10, "h1", "O", "P")
+        process_transaction(handover)
+        indexed = self.settlements(token)
+
+        with self.assertLogs(level="WARNING") as logs:
+            self.replay(handover)
+
+        self.assertKept(logs)
+        self.assertEqual(self.settlements(token), indexed)
+
+    def test_replay_keeps_the_settlement_when_a_reserve_send_unlocked_since_the_last_block(self):
+        # The node applies the send at the end of the first block stamped
+        # after the unlock, which is the handover's own block.
+        token = make_token(owner="O", global_balance="0.001")
+        self.reserve_send(token, self.block_time(10) - timedelta(seconds=5))
+        handover = self.handover(token, 10, "h1", "O", "P")
+        process_transaction(handover)
+        indexed = self.settlements(token)
+
+        with self.assertLogs(level="WARNING") as logs:
+            self.replay(handover)
+
+        self.assertKept(logs)
+        self.assertEqual(self.settlements(token), indexed)
+
+    def test_replay_settles_a_reserve_send_that_unlocked_blocks_earlier(self):
+        token = make_token(owner="O", global_balance="0.001")
+        self.reserve_send(token, self.block_time(7))
+        handover = self.handover(token, 10, "h1", "O", "P")
+        add_transfer(token, handover, "O", "P", "0.0009")
+
+        self.replay(handover)
+
+        self.assertEqual(
+            self.settlements(token), [("h1", "O", "P", Decimal("0.0002"))]
+        )
+
+    def test_replay_corrects_a_settlement_when_others_share_the_block(self):
+        # X paying Y in the handover's block moves neither owner's entry.
+        token = make_token(owner="U", global_balance="0.001")
+        handover = self.handover(token, 10, "h1", "M", "U")
+        self.transfer(token, 10, "t1", "X", "Y", "0.0001")
+        self.transfer(token, 20, "t2", "U", "M", "0.0003")
+        add_transfer(token, handover, "M", "U", "0.0003")
+
+        self.replay(handover)
+
+        self.assertEqual(self.settlements(token), [])
+
+    def test_replay_corrects_a_settlement_when_another_holder_requests_in_the_block(self):
+        token = make_token(owner="U", global_balance="0.001")
+        handover = self.handover(token, 10, "h1", "M", "U")
+        self.request(
+            token, 10, "w1", "X", "0.0001", VbtcV2WithdrawalRequest.Status.REQUESTED
+        )
+        add_transfer(token, handover, "M", "U", "0.0003")
+
+        self.replay(handover)
+
+        self.assertEqual(self.settlements(token), [])
+
+    def test_replay_corrects_a_settlement_when_a_completion_shares_the_block(self):
+        token = make_token(owner="O", global_balance="0.001")
+        request = self.request(
+            token, 5, "w1", "O", "0.0003", VbtcV2WithdrawalRequest.Status.COMPLETED
+        )
+        completion = self.tx(10, "c1", Transaction.Type.VBTC_V2_WITHDRAWAL_COMPLETE)
+        request.completion_transaction = completion
+        request.completed_at = completion.date_crafted
+        request.save(update_fields=["completion_transaction", "completed_at"])
+        handover = self.handover(token, 10, "h1", "O", "P")
+        add_transfer(token, handover, "P", "O", "0.0009")
+
+        self.replay(handover)
+
+        self.assertEqual(
+            self.settlements(token), [("h1", "P", "O", Decimal("0.0003"))]
+        )
+
+    def test_replay_that_keeps_a_settlement_still_moves_the_owner(self):
+        token = make_token(owner="A", global_balance="0.001")
+        first = self.handover(token, 10, "h1", "A", "B")
+        process_transaction(first)
+        self.transfer(token, 20, "t1", "B", "X", "0.0002")
+        second = self.handover(token, 20, "h2", "B", "C")
+        process_transaction(second)
+        indexed = self.settlements(token)
+        self.assertEqual(indexed, [("h2", "C", "B", Decimal("0.0002"))])
+
+        with self.assertLogs(level="WARNING") as logs:
+            self.replay(first, second)
+
+        self.assertKept(logs)
+        self.assertEqual(self.settlements(token), indexed)
+        token.refresh_from_db()
+        self.assertEqual(token.owner_address, "C")
 
 
 class WithdrawalStateMachineTests(TestCase):
