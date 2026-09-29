@@ -1,6 +1,7 @@
 import base64
 import gzip
 import json
+from datetime import timedelta
 from decimal import Decimal
 
 from django.test import TestCase, override_settings
@@ -526,6 +527,141 @@ class OwnershipTransferSettlementTests(TestCase):
 
         settlements = VbtcV2TokenTransfer.objects.filter(token=token, transaction=tx)
         self.assertEqual(settlements.count(), 1)
+
+
+class OwnershipTransferReplayTests(TestCase):
+    """A backfill replays an ownership transfer with every later row of the
+    contract already in the table. The settlement has to come from the ledger
+    as the chain had it at that transaction, or the former owner's present
+    balance is handed to the new owner (mainnet 3de79275, 6fc51819 and
+    b8f0d376 on 2026-09-28)."""
+
+    def setUp(self):
+        self.block = make_block()
+
+    def handover_tx(self, token, tx_hash, from_address, to_address):
+        return make_tx(
+            self.block,
+            tx_hash,
+            Transaction.Type.TKNZ_TX,
+            from_address=from_address,
+            to_address=to_address,
+            data={"Function": "Transfer()", "ContractUID": token.sc_identifier},
+        )
+
+    def later_tx(self, tx_hash, tx_type, height=2):
+        block = Block.objects.filter(height=height).first() or make_block(height)
+        return make_tx(block, tx_hash, tx_type)
+
+    def test_later_receipts_are_not_settled(self):
+        # The minter M hands the fresh contract to U, then receives vBTC on it.
+        token = make_token(owner="U", global_balance="0.001")
+        handover = self.handover_tx(token, "ot1", "M", "U")
+        add_transfer(
+            token, self.later_tx("t1", Transaction.Type.VBTC_V2_TRANSFER), "U", "M", "0.0001"
+        )
+
+        process_transaction(handover)
+
+        self.assertFalse(VbtcV2TokenTransfer.objects.filter(transaction=handover).exists())
+        token.refresh_from_db()
+        self.assertEqual(
+            token.addresses, {"U": Decimal("0.0009"), "M": Decimal("0.0001")}
+        )
+
+    def test_settlement_the_chain_never_made_is_removed(self):
+        token = make_token(owner="U", global_balance="0.001")
+        handover = self.handover_tx(token, "ot1", "M", "U")
+        add_transfer(
+            token, self.later_tx("t1", Transaction.Type.VBTC_V2_TRANSFER), "U", "M", "0.0001"
+        )
+        add_transfer(token, handover, "M", "U", "0.0001")
+
+        process_transaction(handover)
+
+        self.assertFalse(VbtcV2TokenTransfer.objects.filter(transaction=handover).exists())
+        token.refresh_from_db()
+        self.assertEqual(
+            token.addresses, {"U": Decimal("0.0009"), "M": Decimal("0.0001")}
+        )
+
+    def test_settlement_made_at_the_time_survives_later_activity(self):
+        token = make_token(owner="O", global_balance="0.001")
+        t1 = make_tx(self.block, "t1", Transaction.Type.VBTC_V2_TRANSFER)
+        add_transfer(token, t1, "O", "P", "0.0001")
+        handover = self.handover_tx(token, "ot1", "O", "P")
+        process_transaction(handover)
+        add_transfer(
+            token, self.later_tx("t2", Transaction.Type.VBTC_V2_TRANSFER), "P", "O", "0.0003"
+        )
+
+        process_transaction(handover)
+
+        settlement = VbtcV2TokenTransfer.objects.get(token=token, transaction=handover)
+        self.assertEqual(
+            (settlement.from_address, settlement.to_address, settlement.amount),
+            ("P", "O", Decimal("0.0001")),
+        )
+
+    def test_wrong_settlement_amount_is_corrected(self):
+        token = make_token(owner="P", global_balance="0.001")
+        t1 = make_tx(self.block, "t1", Transaction.Type.VBTC_V2_TRANSFER)
+        add_transfer(token, t1, "O", "P", "0.0001")
+        handover = self.handover_tx(token, "ot1", "O", "P")
+        add_transfer(token, handover, "O", "P", "0.0005")
+
+        process_transaction(handover)
+
+        settlement = VbtcV2TokenTransfer.objects.get(token=token, transaction=handover)
+        self.assertEqual(
+            (settlement.from_address, settlement.to_address, settlement.amount),
+            ("P", "O", Decimal("0.0001")),
+        )
+
+    def test_request_completed_afterwards_was_still_open(self):
+        # Below the escrow gate the old owner keeps what its open request
+        # will burn. The request has since completed; at the handover it had not.
+        token = make_token(owner="O", global_balance="0.001")
+        request = add_withdrawal(
+            token,
+            make_tx(self.block, "w1", Transaction.Type.VBTC_V2_WITHDRAWAL_REQUEST),
+            "O",
+            "0.0003",
+            VbtcV2WithdrawalRequest.Status.COMPLETED,
+        )
+        handover = self.handover_tx(token, "ot1", "O", "P")
+        completion = self.later_tx("c1", Transaction.Type.VBTC_V2_WITHDRAWAL_COMPLETE)
+        request.completion_transaction = completion
+        request.completed_at = completion.date_crafted
+        request.save(update_fields=["completion_transaction", "completed_at"])
+
+        self.assertEqual(
+            token.settlement_amount_for("O", before=handover), Decimal("-0.0003")
+        )
+        self.assertEqual(
+            request.status_before(handover), VbtcV2WithdrawalRequest.Status.REQUESTED
+        )
+
+    @override_settings(VBTC_WITHDRAWAL_ESCROW_HEIGHT=1)
+    def test_escrow_refunded_afterwards_was_still_held(self):
+        # An escrowed request is a debit until a vote refunds it. The refund
+        # came after the handover, so the settlement still covers the debit.
+        token = make_token(owner="O", global_balance="0.001")
+        request = add_withdrawal(
+            token,
+            make_tx(self.block, "w1", Transaction.Type.VBTC_V2_WITHDRAWAL_REQUEST),
+            "O",
+            "0.0003",
+            VbtcV2WithdrawalRequest.Status.CANCELLED,
+        )
+        handover = self.handover_tx(token, "ot1", "O", "P")
+        request.cancelled_at = handover.date_crafted + timedelta(minutes=5)
+        request.save(update_fields=["cancelled_at"])
+
+        self.assertEqual(
+            token.settlement_amount_for("O", before=handover), Decimal("-0.0003")
+        )
+        self.assertEqual(token.settlement_amount_for("O"), Decimal(0))
 
 
 class WithdrawalStateMachineTests(TestCase):

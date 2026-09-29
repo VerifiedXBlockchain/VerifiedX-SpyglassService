@@ -583,6 +583,32 @@ class ReprocessCommandTests(TestCase):
         self.assertIn("v1", text)
         self.assertIn("1 envelope transaction(s) included", text)
 
+    def test_backfill_of_an_indexed_chain_changes_nothing(self):
+        # Mainnet 3de79275 on 2026-09-28: the minter M hands the contract to
+        # U and only then trades vBTC on it. The backfill settled M's present
+        # balance to U, as if M had held it at the handover.
+        token = make_token(owner="M", global_balance="0.001", sc_identifier="sc:a")
+        chain = [
+            make_tx(make_block(10), "h1", Transaction.Type.TKNZ_TX, from_address="M",
+                    to_address="U", data={"Function": "Transfer()", "ContractUID": "sc:a"}),
+            single_transfer_tx(make_block(11), "t1", "U", "M", "sc:a", 0.0004),
+            single_transfer_tx(make_block(12), "t2", "M", "R", "sc:a", 0.0001),
+        ]
+        for tx in chain:
+            process_transaction(tx)
+        token.refresh_from_db()
+        indexed = (token.addresses, VbtcV2TokenTransfer.objects.count())
+        self.assertEqual(
+            indexed[0],
+            {"U": Decimal("0.0006"), "M": Decimal("0.0003"), "R": Decimal("0.0001")},
+        )
+
+        from io import StringIO
+        call_command("reprocess_vbtc_v2", stdout=StringIO())
+
+        token.refresh_from_db()
+        self.assertEqual((token.addresses, VbtcV2TokenTransfer.objects.count()), indexed)
+
 
 @TESTNET
 class MintReprocessTests(TestCase):
