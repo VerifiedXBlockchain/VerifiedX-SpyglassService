@@ -653,6 +653,33 @@ class ReprocessCommandTests(TestCase):
         token.refresh_from_db()
         self.assertEqual((token.addresses, VbtcV2TokenTransfer.objects.count()), indexed)
 
+    def test_backfill_reaches_an_ownership_transfer_after_the_rest_of_its_block(self):
+        # Block 10 holds O paying Y and then the handover, whose hash sorts
+        # first. The payment's row is missing, as validate_transactions --fix
+        # can leave it, so only the replayed payment shows the block is shared.
+        token = make_token(owner="P", global_balance="0.001", sc_identifier="sc:a")
+        process_transaction(single_transfer_tx(make_block(5), "t0", "O", "Z", "sc:a", 0.0003))
+        block = make_block(10)
+        single_transfer_tx(block, "ff", "O", "Y", "sc:a", 0.0002)
+        handover = make_tx(
+            block, "aa", Transaction.Type.TKNZ_TX, from_address="O",
+            to_address="P", data={"Function": "Transfer()", "ContractUID": "sc:a"},
+        )
+        add_transfer(token, handover, "P", "O", "0.0005")
+
+        from io import StringIO
+        with self.assertLogs(level="WARNING") as logs:
+            call_command("reprocess_vbtc_v2", stdout=StringIO())
+
+        self.assertTrue(any("the settlement is left as it is stored" in line for line in logs.output))
+        settlement = VbtcV2TokenTransfer.objects.get(transaction=handover)
+        self.assertEqual(
+            (settlement.from_address, settlement.to_address, settlement.amount),
+            ("P", "O", Decimal("0.0005")),
+        )
+        self.assertTrue(VbtcV2TokenTransfer.objects.filter(transaction__hash="ff").exists())
+        self.assertNotIn("O", token.addresses)
+
     def test_dry_run_names_the_settlement_a_run_would_remove(self):
         token = make_token(owner="U", global_balance="0.001", sc_identifier="sc:a")
         handover = make_tx(
