@@ -1783,3 +1783,5 @@ class HealthCheckAlertTests(TestCase):
 
         with patch("rbx.discord_alerts.requests.post", side_effect=real_requests.ConnectionError("down")):
             self.assertFalse(send_discord_alert("x"))
+
+
