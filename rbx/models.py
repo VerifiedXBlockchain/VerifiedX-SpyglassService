@@ -1233,7 +1233,7 @@ class VbtcV2Token(models.Model):
         order inside a block is not stored, so rows of `before`'s own block
         count as earlier. At the chain tip they are: the rows in the table
         are the ones already applied. A replay cannot know, and
-        shares_block_with() tells it when that matters.
+        has_unordered_activity() tells it when that matters.
 
         Mirrors the node's per-contract tokenization rows at 63468588:
 
@@ -1301,14 +1301,19 @@ class VbtcV2Token(models.Model):
             return VbtcV2WithdrawalRequest.Status.REQUESTED
         return request.status
 
-    def shares_block_with(self, tx):
-        """Whether the chain applied anything else to this contract in tx's
-        block. The order inside a block is not stored, so a replay cannot
-        tell which side of tx it fell on."""
-        transfers = VbtcV2TokenTransfer.objects.filter(
-            token=self, transaction__height=tx.height
-        ).exclude(transaction=tx)
-        if transfers.exists():
+    def has_unordered_activity(self, tx):
+        """Whether the ledger holds something that nothing stored places
+        before or after tx: a row or a request event in tx's block, a reserve
+        send that matured with that block, or a refund with no time recorded.
+        A replay cannot settle tx from the ledger when it does."""
+        transfers = VbtcV2TokenTransfer.objects.filter(token=self).exclude(transaction=tx)
+        if transfers.filter(
+            Q(transaction__height=tx.height)
+            | Q(
+                from_address__startswith="xRBX",
+                transaction__unlock_time=tx.date_crafted,
+            )
+        ).exists():
             return True
         return self.withdrawal_requests.filter(
             Q(request_transaction__height=tx.height)
@@ -1316,6 +1321,11 @@ class VbtcV2Token(models.Model):
             | Q(cancel_transaction__height=tx.height)
             | Q(completed_at=tx.date_crafted)
             | Q(cancelled_at=tx.date_crafted)
+            | Q(
+                status=VbtcV2WithdrawalRequest.Status.CANCELLED,
+                cancelled_at__isnull=True,
+                request_transaction__height__lt=tx.height,
+            )
         ).exists()
 
     def settlement_amount_for(self, address, before=None):

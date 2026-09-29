@@ -102,11 +102,11 @@ The vBTC V2 indexer (`rbx/vbtc_dispatch.py`, `rbx/vbtc_gates.py`, balance math i
 
 1. **Deploy** (push to `main` for mainnet, `testnet` for testnet). Porter's predeploy runs migrations; the workers restart.
 2. **Wait for quiescence**: no fresh `ready.` lines in `./scripts/fetch-logs.sh <network> --since 8m` for a few minutes (Porter can roll a second revision after the Action goes green).
-3. **Preview the run.** `--dry-run` lists the transactions and every settlement row the run would write, change or remove:
+3. **Preview the run.** `--dry-run` lists the transactions, every settlement row the run would write, change or remove, and every one it would leave because the order inside the block is not stored:
    ```bash
    python3 -c 'import pty,sys; sys.exit(pty.spawn(["porter","app","run","rbx-explorer-<network>","--wait","--","python","manage.py","reprocess_vbtc_v2","--dry-run"]))'
    ```
-   `Settlement rows that would change: 0` is what a chain that was indexed correctly gives. Account for every row it names before going on.
+   `Settlement rows that would change: 0; left as stored: 0` is what a chain that was indexed correctly gives when no transfer shares its block with other activity. Account for every row it names before going on. A row "left as stored" is not checked by the run at all: compare that holder with the node by hand (step 7). The preview reads each transfer against the table as it is, so where one settlement feeds the next on the same contract the run can end on a different row; steps 4 and 6 are the check on the result.
 4. **Snapshot the balances** the API serves, before anything is rewritten:
    ```bash
    ./scripts/vbtc-v2-balances.py snapshot <network> before.json
@@ -129,6 +129,16 @@ The vBTC V2 indexer (`rbx/vbtc_dispatch.py`, `rbx/vbtc_gates.py`, balance math i
    It compares every holder balance with the node's `vbtcapi/VBTC/GetVBTCBalance/{address}/{scUID}`. A balance that matched the node before the backfill and does not after it is a defect in the backfill. Known owner-formula differences on Core's side are listed in the 2026-09-25 notes (`reviews/remediation-audit-2026-09-25` in the platform-context repo); on mainnet they are the owners of `4bb6f099`, `76c995d5`, `8234b371` and `d11a9ef3`, and holder `RNiQ` on `d11a9ef3`.
 
 **What went wrong on 2026-09-28.** The first mainnet backfill replayed each ownership transfer against the present-day ledger and wrote three settlement rows that handed the former owner's current balance to the new owner (contracts `3de79275`, `6fc51819`, `b8f0d376`). The rows were deleted and the settlement now comes from the ledger as it stood at the transfer (`planned_settlement`, `before=tx`). Anything else that derives a row from the ledger during a replay needs the same cut-off. The order of transactions inside a block is not stored, so when the transfer's block holds other activity on the contract a replay keeps the row that live indexing wrote and logs a warning.
+
+**What a replay cannot order.** `sync_block` stamps every transaction with its block's time, so nothing stored says which of two transactions in one block the chain applied first. `planned_settlement` names the cases: anything else on the contract in the transfer's block (a row, a request, a completion, a cancel, a refund, a second `Transfer()`), a reserve send whose unlock time is the block's time, and a refund with no time recorded. In each a replay, or a second pass over a transfer that already has its row, leaves the settlement as it is stored and logs a warning. When one block holds several transfers of a contract, a replay sets the owner to the address the block ends on, which does not depend on their order. A replay also keeps the recipient of a reserve send it already holds, because a recovery moves it and recoveries are not replayed. Neither network holds any of these cases as of 2026-09-29 (59 transfers on mainnet, 2 on testnet).
+
+Known limits, none of which a backfill triggers:
+
+- Re-syncing a block outside a backfill (`validate_transactions --fix`) recomputes a transfer that has lost its row. If a refund followed the transfer in that block, the settlement is computed as if the refund came first.
+- A second pass outside `replaying()` over a transfer with no row, in a block that holds other activity on the contract, settles against the table as it is. No caller does this today. Wrap any new replay in `replaying()`.
+- A reserve send that unlocks exactly at the transfer's block time is counted as applied before the transfer when the block is first indexed. Core's code reads as applying it after the block. Not confirmed against a node.
+
+The fix for all three is to store each transaction's index inside its block at sync and order by it. That is a schema change and a re-sync of the index column, so it is its own piece of work.
 
 **Mainnet specifics.** `VBTC_NETWORK` defaults to the mainnet height table whenever `ENVIRONMENT` is not `testnet` (`project/settings/rbx.py`), so mainnet needs no new env var. The escrow gate on mainnet is block 7,296,200 and the multi-transfer gate 7,281,000; both are already below the tip, so the backfill will re-derive every escrowed request. **Do not skip step 5 on mainnet**: until it runs, every holder with a stalled or cancelled-but-unapproved withdrawal request is overstated, which is the SG-01 defect this code exists to fix. The mainnet backfill ran on 2026-09-28 and, once the three settlement rows were removed, left every balance as it was.
 

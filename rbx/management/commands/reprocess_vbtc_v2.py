@@ -8,6 +8,7 @@ from rbx.vbtc_dispatch import (
     ENVELOPE_TRANSFER_FUNCTION,
     KEEP_STORED,
     OWNERSHIP_TRANSFER_FUNCTION,
+    OWNERSHIP_TRANSFER_TYPES,
     SC_ENVELOPE_TYPES,
     planned_settlement,
     replaying,
@@ -119,31 +120,45 @@ class Command(BaseCommand):
         )
 
     def report_settlements(self, txs):
-        """Every settlement row the run would write, change or remove. It is
-        read from the table as it is now; a run that first corrects the rows
-        a settlement is derived from can plan a different one."""
+        """The settlement rows the run would write, change or remove, and
+        the ones it would leave because the order is not stored.
+
+        Each is read from the table as it is now. The run applies them in
+        chain order, so where one settlement feeds the next on the same
+        contract the run can end on a different row than the one named here.
+        The balances before and after the run are the check on the result.
+        """
         tokens = {t.sc_identifier: t for t in VbtcV2Token.objects.all()}
         changes = 0
+        kept = 0
         with replaying():
             for tx in txs:
+                if tx.type not in OWNERSHIP_TRANSFER_TYPES:
+                    continue
                 payload, _ = parse_envelope(tx.data)
                 if net_string(field(payload, "Function")) != OWNERSHIP_TRANSFER_FUNCTION:
                     continue
                 token = tokens.get(net_string(field(payload, "ContractUID")))
-                if token is None or tx.type not in SC_ENVELOPE_TYPES:
-                    continue
-                plan = planned_settlement(token, tx)
-                if plan is KEEP_STORED:
+                if token is None:
                     continue
                 row = VbtcV2TokenTransfer.objects.filter(token=token, transaction=tx).first()
                 stored = (row.from_address, row.to_address, row.amount) if row else None
-                if stored != plan:
+                plan = planned_settlement(token, tx)
+                if plan is KEEP_STORED:
+                    kept += 1
+                    self.stdout.write(
+                        f"  [DRY RUN] settlement {tx.hash} on {token.sc_identifier}: "
+                        f"{self.describe(stored)} would be left, order not stored"
+                    )
+                elif stored != plan:
                     changes += 1
                     self.stdout.write(
                         f"  [DRY RUN] settlement {tx.hash} on {token.sc_identifier}: "
                         f"{self.describe(stored)} would become {self.describe(plan)}"
                     )
-        self.stdout.write(f"Settlement rows that would change: {changes}")
+        self.stdout.write(
+            f"Settlement rows that would change: {changes}; left as stored: {kept}"
+        )
 
     @staticmethod
     def describe(settlement):
