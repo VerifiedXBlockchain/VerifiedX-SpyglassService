@@ -102,11 +102,11 @@ The vBTC V2 indexer (`rbx/vbtc_dispatch.py`, `rbx/vbtc_gates.py`, balance math i
 
 1. **Deploy** (push to `main` for mainnet, `testnet` for testnet). Porter's predeploy runs migrations; the workers restart.
 2. **Wait for quiescence**: no fresh `ready.` lines in `./scripts/fetch-logs.sh <network> --since 8m` for a few minutes (Porter can roll a second revision after the Action goes green).
-3. **Preview the run.** `--dry-run` lists the transactions, every settlement row the run would write, change or remove, and every one it would leave because the order inside the block is not stored:
+3. **Preview the run.** `--dry-run` lists the transactions, the settlement rows the run would write, change or remove, and the ones it would leave because the order inside the block is not stored, all read from the table as it is:
    ```bash
    python3 -c 'import pty,sys; sys.exit(pty.spawn(["porter","app","run","rbx-explorer-<network>","--wait","--","python","manage.py","reprocess_vbtc_v2","--dry-run"]))'
    ```
-   `Settlement rows that would change: 0; left as stored: 0` is what a chain that was indexed correctly gives when no transfer shares its block with other activity. Account for every row it names before going on. A row "left as stored" is not checked by the run at all: compare that holder with the node by hand (step 7). The preview reads each transfer against the table as it is, so where one settlement feeds the next on the same contract the run can end on a different row; steps 4 and 6 are the check on the result.
+   `Settlement rows that would change: 0; left as stored: 0` is what a chain that was indexed correctly gives when no transfer shares its block with other activity. Account for every row it names before going on. A row "left as stored" is not checked by the run at all: compare that holder with the node by hand (step 7). The run rebuilds the table as it goes, so it can end on a different row than the preview names: where one settlement feeds the next on the same contract, and where a row of the transfer's block is missing until the run writes it. Steps 4 and 6 are the check on the result.
 4. **Snapshot the balances** the API serves, before anything is rewritten:
    ```bash
    ./scripts/vbtc-v2-balances.py snapshot <network> before.json
