@@ -8,6 +8,8 @@ from rbx.models import Transaction, VbtcV2WithdrawalRequest
 from decimal import Decimal
 from rbx.client import get_info, get_block
 from rbx.sms import send_sms
+from rbx.discord_alerts import send_discord_alert
+from django.conf import settings
 
 """
 python manage.py health_check
@@ -73,25 +75,36 @@ class Command(BaseCommand):
         print(f"PROBLEM. Last block is {height}")
 
         lines = [
-            "🚨 RBX Issue Detected! 🚨",
+            "🚨 VFX Issue Detected! 🚨",
             f"It's been {round(delta)} seconds since the last block.",
             f"Man your battle stations.",
         ]
 
         body = "\n".join(lines)
 
-        for number in ALERT_NUMBERS:
-            send_sms(number, body)
+        self.notify(body, ALERT_NUMBERS)
 
     def handle_success(self, height):
         print(f"All is well at block {height}")
 
     def handle_exception(self, exception):
-        for number in WARNING_NUMBERS:
-            lines = [
-                "⚠️ RBX Issue Detected! ⚠️",
-                f"Explorer Wallet is Unreachable",
-            ]
-            body = "\n".join(lines)
+        lines = [
+            "⚠️ VFX Issue Detected! ⚠️",
+            f"Explorer Wallet is Unreachable",
+        ]
+        body = "\n".join(lines)
 
-            send_sms(number, body)
+        self.notify(body, WARNING_NUMBERS)
+
+    def notify(self, body, numbers):
+        """Send an alert on every channel; one failing channel never blocks another.
+
+        Discord goes first so an SMS outage (e.g. a lapsed Twilio account)
+        can't stop it. SMS failures are logged to Sentry, not raised.
+        """
+        send_discord_alert(f"[{settings.ENVIRONMENT}] {body}")
+        for number in numbers:
+            try:
+                send_sms(number, body)
+            except Exception:
+                logging.exception(f"health_check: SMS to {number} failed")

@@ -11,6 +11,10 @@ height or its ledger diverges from the chain's. The values are per network:
     WithdrawalEscrowHeight           1          7,296,200
     V2TransferMultiHeight            1          7,281,000
     V2WithdrawalOwnerAddBackFixHeight 1         7,281,000
+    VbtcCancellationVoteRulesHeight  1,019,000  7,400,500
+
+VbtcCancellationVoteRulesHeight is from VerifiedX-Core 9601f132 (Globals.cs,
+Program.cs); the others are from 63468588.
 
 Which network this deployment indexes comes from settings.VBTC_NETWORK, which
 defaults from the deployment's ENVIRONMENT (testnet) or IS_DEVNET flag; each
@@ -27,8 +31,10 @@ _MAINNET = {
     "WITHDRAWAL_ESCROW_HEIGHT": 7_296_200,
     "V2_TRANSFER_MULTI_HEIGHT": 7_281_000,
     "V2_WITHDRAWAL_OWNER_ADDBACK_FIX_HEIGHT": 7_281_000,
+    "CANCELLATION_VOTE_RULES_HEIGHT": 7_400_500,
 }
 _TESTNET = {k: 1 for k in _MAINNET}
+_TESTNET["CANCELLATION_VOTE_RULES_HEIGHT"] = 1_019_000
 
 
 def _gate(name):
@@ -50,6 +56,10 @@ def v2_transfer_multi_height():
 
 def v2_withdrawal_owner_addback_fix_height():
     return _gate("V2_WITHDRAWAL_OWNER_ADDBACK_FIX_HEIGHT")
+
+
+def cancellation_vote_rules_height():
+    return _gate("CANCELLATION_VOTE_RULES_HEIGHT")
 
 
 def escrow_applies(request_block_height):

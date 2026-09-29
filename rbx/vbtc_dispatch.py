@@ -19,7 +19,8 @@ ledger the node does from the same mined transactions:
   a COMPLETE only finalises it, and only when sent by the requester for that
   contract (:3736-3765); a CANCEL request is not a refund (:3830-3905); only
   a 75 percent approval vote by the contract's validator snapshot refunds an
-  escrowed request (:3913-4010);
+  escrowed request (:3913-4010); from VbtcCancellationVoteRulesHeight the
+  cancel and vote rules are 9601f132's, in rbx.vbtc_cancellation;
 - reserve (xRBX) senders move vBTC only when the reserve transaction
   unlocks, or are redirected by recovery (:481-490, :769-790, :1202-1222).
 
@@ -34,6 +35,7 @@ from rbx.models import (
     VbtcV2TokenTransfer,
     VbtcV2WithdrawalRequest,
 )
+from rbx import vbtc_cancellation
 from rbx.vbtc_gates import (
     bound_field,
     field,
@@ -483,6 +485,9 @@ def apply_cancel(tx):
             f"{withdrawal.requestor_address}; the node ignores it."
         )
         return
+    if vbtc_cancellation.rules_active(tx.height):
+        _apply_cancel_by_rules(tx, what, withdrawal)
+        return
     if withdrawal.status in VbtcV2WithdrawalRequest.TERMINAL_STATUSES:
         logging.error(
             f"{what} {tx.hash}: request {request_hash} on {sc_uid} is already "
@@ -498,6 +503,10 @@ def apply_cancel(tx):
             f"the node ignores it."
         )
         return
+    _record_cancel(tx, what, withdrawal)
+
+
+def _record_cancel(tx, what, withdrawal):
     if withdrawal.signed_at:
         # The chain is authoritative and the request stays open until a
         # vote, but a signed Bitcoin transaction may still confirm.
@@ -509,7 +518,75 @@ def apply_cancel(tx):
     withdrawal.cancel_transaction = tx
     withdrawal.status = VbtcV2WithdrawalRequest.Status.CANCELLATION_REQUESTED
     withdrawal.save(update_fields=["cancel_transaction", "status"])
-    token.recompute_pending_withdrawal()
+    withdrawal.token.recompute_pending_withdrawal()
+
+
+def _apply_cancel_by_rules(tx, what, withdrawal):
+    """VBTCCancellationVoting.ApplyCancel: a new cancel is accepted unless
+    this withdrawal share already has one open, so a cancel after a reject,
+    after a lapse, or after one filed before the rules height starts a new
+    vote. The row keeps only the latest cancel; votes name it by hash."""
+    if withdrawal.cancel_transaction_id == tx.hash:
+        # A reprocess of the cancellation request already recorded here.
+        return
+    if withdrawal.status in VbtcV2WithdrawalRequest.TERMINAL_STATUSES:
+        logging.error(
+            f"{what} {tx.hash}: withdrawal {withdrawal.pk} is already "
+            f"{withdrawal.status}; the node ignores it."
+        )
+        return
+    current = withdrawal.cancel_transaction
+    if current is not None and current.height > tx.height:
+        # A reprocess of an older cancel; the row already holds a later one.
+        return
+    if vbtc_cancellation.is_open(withdrawal, tx.height):
+        logging.error(
+            f"{what} {tx.hash}: cancellation CANCEL_{current.hash} of withdrawal "
+            f"{withdrawal.pk} is still being voted on; the node ignores this cancel."
+        )
+        return
+    _record_cancel(tx, what, withdrawal)
+
+
+def reopen_status(withdrawal):
+    """The status a withdrawal returns to when its cancellation is rejected
+    or lapses: the request is open again, and payable if it was signed."""
+    if withdrawal.signed_at:
+        return VbtcV2WithdrawalRequest.Status.PENDING_BTC
+    return VbtcV2WithdrawalRequest.Status.REQUESTED
+
+
+def _reopen(withdrawal):
+    """Moves a row out of CANCELLATION_REQUESTED only if nothing changed it
+    since it was read: block sync and the lapse sweep run in different
+    workers, and a cancel recorded between the read and the write must not
+    lose its status."""
+    reopened = VbtcV2WithdrawalRequest.objects.filter(
+        pk=withdrawal.pk,
+        status=VbtcV2WithdrawalRequest.Status.CANCELLATION_REQUESTED,
+        cancel_transaction_id=withdrawal.cancel_transaction_id,
+    ).update(status=reopen_status(withdrawal))
+    return bool(reopened)
+
+
+def _settle(withdrawal, result):
+    """Writes a decided cancellation to the row. An approval cancels the
+    request and refunds its escrow, unless it already completed with a burn,
+    which stands. A reject reopens the request."""
+    if result.outcome is vbtc_cancellation.Outcome.APPROVED:
+        if withdrawal.status == VbtcV2WithdrawalRequest.Status.COMPLETED:
+            logging.info(
+                f"Withdrawal {withdrawal.pk} completed before its cancellation was "
+                f"approved; the completion stands."
+            )
+            return
+        withdrawal.status = VbtcV2WithdrawalRequest.Status.CANCELLED
+        withdrawal.cancelled_at = result.decided_by.date_crafted
+        withdrawal.save(update_fields=["status", "cancelled_at"])
+        withdrawal.token.recompute_pending_withdrawal()
+    elif result.outcome is vbtc_cancellation.Outcome.REJECTED:
+        if _reopen(withdrawal):
+            withdrawal.token.recompute_pending_withdrawal()
 
 
 def cancellation_uid_for(withdrawal):
@@ -548,6 +625,9 @@ def apply_vote(tx):
         return
     if not uid.startswith(CANCELLATION_UID_PREFIX):
         logging.error(f"{what} {tx.hash}: unrecognised CancellationUID {uid!r}.")
+        return
+    if vbtc_cancellation.rules_active(tx.height):
+        _apply_vote_by_rules(tx, what, uid)
         return
     withdrawal = (
         VbtcV2WithdrawalRequest.objects.filter(
@@ -599,3 +679,73 @@ def apply_vote(tx):
     withdrawal.cancelled_at = tx.date_crafted
     withdrawal.save(update_fields=["status", "cancelled_at"])
     withdrawal.token.recompute_pending_withdrawal()
+
+
+def _apply_vote_by_rules(tx, what, uid):
+    """VBTCCancellationVoting.ApplyVote. The outcome is replayed from every
+    mined vote on the cancellation, so a reprocess, or votes indexed out of
+    order, reach the same state."""
+    withdrawal = (
+        VbtcV2WithdrawalRequest.objects.filter(
+            cancel_transaction__hash=uid[len(CANCELLATION_UID_PREFIX):]
+        )
+        .select_related("token", "cancel_transaction")
+        .first()
+    )
+    if withdrawal is None:
+        logging.error(
+            f"{what} {tx.hash}: no withdrawal holds cancellation {uid}; either it is "
+            f"not indexed or a later cancel replaced it, and the node refuses votes "
+            f"on a cancellation that is no longer open."
+        )
+        return
+    if not vbtc_cancellation.rules_active(withdrawal.cancel_transaction.height):
+        logging.error(
+            f"{what} {tx.hash}: {uid} was filed before the voting rules; the node "
+            f"refuses votes on it and the requester can cancel again."
+        )
+        return
+    if withdrawal.status == VbtcV2WithdrawalRequest.Status.CANCELLED:
+        # A reprocess of a vote on a cancellation already approved.
+        return
+    if not vbtc_cancellation.vote_window_open(withdrawal.cancel_transaction.height, tx.height):
+        # lapse_cancellations reopens the row once the window has closed.
+        logging.error(f"{what} {tx.hash}: the vote window of {uid} is closed; the node refuses it.")
+        return
+    result = vbtc_cancellation.tally(
+        withdrawal.token, withdrawal.cancel_transaction, uid, tx.height
+    )
+    if tx.hash in result.refused:
+        logging.error(f"{what} {tx.hash}: not counted on {uid}: {result.refused[tx.hash]}.")
+    else:
+        vbtc_cancellation.log_outcome(what, tx, uid, result)
+    _settle(withdrawal, result)
+
+
+def lapse_cancellations(current_height):
+    """Reopens withdrawals whose cancellation can no longer be approved: its
+    vote window closed undecided, or it was filed before the rules height and
+    the chain has passed it. No transaction marks either, so nothing else
+    revisits the row. A cancellation the votes did decide is settled as the
+    vote would have settled it."""
+    if not vbtc_cancellation.rules_active(current_height):
+        return
+    waiting = VbtcV2WithdrawalRequest.objects.filter(
+        status=VbtcV2WithdrawalRequest.Status.CANCELLATION_REQUESTED,
+        cancel_transaction__isnull=False,
+    ).select_related("token", "cancel_transaction")
+    for withdrawal in waiting:
+        cancel_tx = withdrawal.cancel_transaction
+        if vbtc_cancellation.vote_window_open(cancel_tx.height, current_height):
+            continue
+        uid = f"{CANCELLATION_UID_PREFIX}{cancel_tx.hash}"
+        result = vbtc_cancellation.tally(withdrawal.token, cancel_tx, uid, current_height)
+        if result.outcome is not vbtc_cancellation.Outcome.PENDING:
+            _settle(withdrawal, result)
+            continue
+        if _reopen(withdrawal):
+            logging.info(
+                f"Cancellation {uid} of withdrawal {withdrawal.pk} lapsed undecided; "
+                f"the withdrawal is {reopen_status(withdrawal)} again."
+            )
+            withdrawal.token.recompute_pending_withdrawal(current_height=current_height)
