@@ -27,6 +27,8 @@ ledger the node does from the same mined transactions:
 The balance math that consumes these rows is in rbx.models.VbtcV2Token.
 """
 import logging
+from contextlib import contextmanager
+from contextvars import ContextVar
 from decimal import Decimal
 
 from rbx.models import (
@@ -77,6 +79,22 @@ SC_ENVELOPE_TYPES = frozenset(
         Transaction.Type.TKNZ_WITHDRAWAL_COMPLETE,
     }
 )
+
+
+_replaying = ContextVar("vbtc_v2_replaying", default=False)
+
+
+@contextmanager
+def replaying():
+    """Marks the transactions applied inside it as a replay of history the
+    table already holds, as reprocess_vbtc_v2 does. A handler that derives a
+    row from the ledger must then use the ledger as it stood at the
+    transaction, not the one in the table now."""
+    marker = _replaying.set(True)
+    try:
+        yield
+    finally:
+        _replaying.reset(marker)
 
 
 class BindError(ValueError):
@@ -247,37 +265,66 @@ def route_envelope(tx):
 
 # --- ownership transfer of the contract itself ------------------------------
 
+KEEP_STORED = "keep the stored row"
+
+
+def planned_settlement(token, tx):
+    """The settlement row tx calls for: (from_address, to_address, amount),
+    None when it calls for no row, or KEEP_STORED.
+
+    The row zeroes the outgoing owner's entry in the ledger as it stood at tx
+    (VbtcV2Token.settlement_amount_for), so a replay plans the same row
+    however much has happened on the contract since.
+
+    When the chain applied something else to the contract in tx's block the
+    order of the two is not stored. At the chain tip the rows in the table
+    are the ones applied before tx. Later they are not, so a replay, or a
+    second pass over a transaction that already has its row, keeps what the
+    first pass wrote."""
+    stored = VbtcV2TokenTransfer.objects.filter(token=token, transaction=tx).exists()
+    if (stored or _replaying.get()) and token.shares_block_with(tx):
+        return KEEP_STORED
+    old_owner = tx.from_address
+    new_owner = tx.to_address
+    if not old_owner or old_owner == new_owner:
+        return None
+    residual = token.settlement_amount_for(old_owner, before=tx)
+    if not residual:
+        return None
+    if residual > 0:
+        return (old_owner, new_owner, residual)
+    return (new_owner, old_owner, -residual)
+
+
 def apply_ownership_transfer(token, tx):
     """Transfer() of a vBTC V2 contract, from any envelope type. The node
     (TransferSmartContract, StateData.cs:741-744) moves the contract owner to
     tx.ToAddress; the owner's balance is a formula there, so nothing else is
     written. Spyglass models the owner anchor with a settlement row instead
-    (see VbtcV2Token.settlement_amount_for).
-
-    The row is derived from the ledger as it stood at tx, so a replay writes
-    the same row however much has happened on the contract since, and
-    corrects or removes one that an earlier run got wrong."""
-    old_owner = tx.from_address
+    (see planned_settlement), rewritten on replay so that a backfill corrects
+    a row an earlier run got wrong."""
     new_owner = tx.to_address
-    residual = Decimal(0)
-    if old_owner and old_owner != new_owner:
-        residual = token.settlement_amount_for(old_owner, before=tx)
-    if residual:
-        from_addr, to_addr = (
-            (old_owner, new_owner) if residual > 0 else (new_owner, old_owner)
+    plan = planned_settlement(token, tx)
+    if plan is KEEP_STORED:
+        logging.warning(
+            f"V2 ownership transfer {tx.hash} ({token.sc_identifier}): block "
+            f"{tx.height} holds other activity on the contract and their order "
+            f"is not stored; the settlement is left as it was indexed."
         )
+    elif plan is None:
+        VbtcV2TokenTransfer.objects.filter(token=token, transaction=tx).delete()
+    else:
+        from_address, to_address, amount = plan
         VbtcV2TokenTransfer.objects.update_or_create(
             token=token,
             transaction=tx,
             defaults={
-                "from_address": from_addr,
-                "to_address": to_addr,
-                "amount": abs(residual),
+                "from_address": from_address,
+                "to_address": to_address,
+                "amount": amount,
                 "created_at": tx.date_crafted,
             },
         )
-    else:
-        VbtcV2TokenTransfer.objects.filter(token=token, transaction=tx).delete()
     token.owner_address = new_owner
     token.save(update_fields=["owner_address"])
     try:

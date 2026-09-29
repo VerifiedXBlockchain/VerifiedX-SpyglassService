@@ -1156,13 +1156,6 @@ class VbtcTokenAmountTransfer(models.Model):
 WITHDRAWAL_EXPIRY_BLOCKS = 360
 
 
-def chain_position(tx):
-    """Where a transaction sits in the chain, for ordering two of them. The
-    position inside a block is not stored, so transactions of one block fall
-    back to the order reprocess_vbtc_v2 replays them in."""
-    return (tx.height, tx.date_crafted, tx.hash)
-
-
 class VbtcV2Token(models.Model):
     sc_identifier = models.CharField(max_length=64, db_index=True)
     nft = models.ForeignKey(Nft, on_delete=models.CASCADE)
@@ -1230,10 +1223,17 @@ class VbtcV2Token(models.Model):
         """Per-address ledger from transfers and withdrawal debits, WITHOUT
         the owner anchor (global_balance + withdrawn add-back).
 
-        With `before`, the ledger as the chain had it when it reached that
-        transaction: rows mined later are left out and a request that settled
-        later still counts as open. A replayed transaction needs this, because
-        the table already holds everything that came after it.
+        With `before`, the ledger as the chain had it when it applied that
+        transaction: rows from later blocks are left out, and a request that
+        was refunded in a later block still counts as held. A replayed
+        transaction needs this, because the table already holds everything
+        that came after it.
+
+        Every transaction of a block carries the block's timestamp and the
+        order inside a block is not stored, so rows of `before`'s own block
+        count as earlier. At the chain tip they are: the rows in the table
+        are the ones already applied. A replay cannot know, and
+        shares_block_with() tells it when that matters.
 
         Mirrors the node's per-contract tokenization rows at 63468588:
 
@@ -1259,7 +1259,7 @@ class VbtcV2Token(models.Model):
         )
         entries = {}
         for t in transfers:
-            if not self._mined_before(t.transaction, before):
+            if not self._applied_before(t.transaction, before):
                 continue
             if t.from_address.startswith("xRBX"):
                 tx = t.transaction
@@ -1271,7 +1271,7 @@ class VbtcV2Token(models.Model):
             entries[t.from_address] = entries.get(t.from_address, Decimal(0)) - t.amount
 
         for w in self._requests(before):
-            status = w.status if before is None else w.status_before(before)
+            status = self._status(w, before)
             if escrow_applies(w.request_transaction.height):
                 debit = status != VbtcV2WithdrawalRequest.Status.CANCELLED
             else:
@@ -1284,14 +1284,39 @@ class VbtcV2Token(models.Model):
         return entries
 
     @staticmethod
-    def _mined_before(tx, before):
-        return before is None or chain_position(tx) < chain_position(before)
+    def _applied_before(tx, before):
+        return before is None or (tx.height <= before.height and tx.pk != before.pk)
 
     def _requests(self, before):
-        requests = self.withdrawal_requests.select_related(
-            "request_transaction", "completion_transaction"
-        )
-        return [w for w in requests if self._mined_before(w.request_transaction, before)]
+        requests = self.withdrawal_requests.select_related("request_transaction")
+        return [w for w in requests if self._applied_before(w.request_transaction, before)]
+
+    @staticmethod
+    def _status(request, before):
+        """A refund decided after `before` had not happened yet. A completion
+        after it needs no such care: an open request below the escrow gate is
+        held back from the settlement and a completed one is a ledger debit
+        of the same amount, and an escrowed request is a debit either way."""
+        if before is not None and request.refunded_after(before):
+            return VbtcV2WithdrawalRequest.Status.REQUESTED
+        return request.status
+
+    def shares_block_with(self, tx):
+        """Whether the chain applied anything else to this contract in tx's
+        block. The order inside a block is not stored, so a replay cannot
+        tell which side of tx it fell on."""
+        transfers = VbtcV2TokenTransfer.objects.filter(
+            token=self, transaction__height=tx.height
+        ).exclude(transaction=tx)
+        if transfers.exists():
+            return True
+        return self.withdrawal_requests.filter(
+            Q(request_transaction__height=tx.height)
+            | Q(completion_transaction__height=tx.height)
+            | Q(cancel_transaction__height=tx.height)
+            | Q(completed_at=tx.date_crafted)
+            | Q(cancelled_at=tx.date_crafted)
+        ).exists()
 
     def settlement_amount_for(self, address, before=None):
         """Signed amount that must move from `address` to the incoming owner
@@ -1311,8 +1336,7 @@ class VbtcV2Token(models.Model):
         for w in self._requests(before):
             if w.requestor_address != address:
                 continue
-            status = w.status if before is None else w.status_before(before)
-            if status not in VbtcV2WithdrawalRequest.ACTIVE_STATUSES:
+            if self._status(w, before) not in VbtcV2WithdrawalRequest.ACTIVE_STATUSES:
                 continue
             if not escrow_applies(w.request_transaction.height):
                 pending += w.amount
@@ -1490,27 +1514,14 @@ class VbtcV2WithdrawalRequest(models.Model):
     def __str__(self):
         return f"{self.token.sc_identifier} withdrawal [{self.status}]"
 
-    def status_before(self, tx):
-        """The status this request had when the chain reached `tx`. A
-        completion or a refund mined later had not happened yet, so the
-        request was still open. Which open status it had is not recorded;
-        callers only tell open from settled."""
-        if self.status == self.Status.COMPLETED:
-            completion = self.completion_transaction
-            if completion is not None:
-                settled_later = chain_position(completion) > chain_position(tx)
-            else:
-                settled_later = (
-                    self.completed_at is not None
-                    and self.completed_at > tx.date_crafted
-                )
-        elif self.status == self.Status.CANCELLED:
-            settled_later = (
-                self.cancelled_at is not None and self.cancelled_at > tx.date_crafted
-            )
-        else:
-            return self.status
-        return self.Status.REQUESTED if settled_later else self.status
+    def refunded_after(self, tx):
+        """Whether the vote that refunded this request came in a block after
+        tx's. cancelled_at is that block's timestamp."""
+        return (
+            self.status == self.Status.CANCELLED
+            and self.cancelled_at is not None
+            and self.cancelled_at > tx.date_crafted
+        )
 
 
 class UnindexedMint(models.Model):

@@ -609,6 +609,25 @@ class ReprocessCommandTests(TestCase):
         token.refresh_from_db()
         self.assertEqual((token.addresses, VbtcV2TokenTransfer.objects.count()), indexed)
 
+    def test_dry_run_names_the_settlement_a_run_would_remove(self):
+        token = make_token(owner="U", global_balance="0.001", sc_identifier="sc:a")
+        handover = make_tx(
+            make_block(10), "h1", Transaction.Type.TKNZ_TX, from_address="M",
+            to_address="U", data={"Function": "Transfer()", "ContractUID": "sc:a"},
+        )
+        add_transfer(token, make_tx(make_block(11), "t1", Transaction.Type.VBTC_V2_TRANSFER),
+                     "U", "M", "0.0003")
+        add_transfer(token, handover, "M", "U", "0.0003")
+
+        from io import StringIO
+        out = StringIO()
+        call_command("reprocess_vbtc_v2", "--dry-run", stdout=out)
+
+        text = out.getvalue()
+        self.assertIn("settlement h1 on sc:a: M -> U 0.0003 would become no row", text)
+        self.assertIn("Settlement rows that would change: 1", text)
+        self.assertTrue(VbtcV2TokenTransfer.objects.filter(transaction=handover).exists())
+
 
 @TESTNET
 class MintReprocessTests(TestCase):

@@ -36,6 +36,7 @@ from rbx.tasks import (
     process_transaction,
     retry_unindexed_mints,
 )
+from rbx.vbtc_dispatch import replaying
 
 
 def make_block(height=1):
@@ -537,11 +538,31 @@ class OwnershipTransferReplayTests(TestCase):
     b8f0d376 on 2026-09-28)."""
 
     def setUp(self):
-        self.block = make_block()
+        self.genesis = timezone.now() - timedelta(days=1)
 
-    def handover_tx(self, token, tx_hash, from_address, to_address):
-        return make_tx(
-            self.block,
+    def block_time(self, height):
+        return self.genesis + timedelta(minutes=height)
+
+    def tx(self, height, tx_hash, tx_type, **fields):
+        """A transaction as sync_block stores it: stamped with its block's
+        time, so nothing records the order inside the block."""
+        block = Block.objects.filter(height=height).first() or make_block(height)
+        tx = make_tx(block, tx_hash, tx_type, **fields)
+        tx.date_crafted = self.block_time(height)
+        tx.save(update_fields=["date_crafted"])
+        return tx
+
+    def transfer(self, token, height, tx_hash, from_address, to_address, amount):
+        tx = self.tx(height, tx_hash, Transaction.Type.VBTC_V2_TRANSFER)
+        return add_transfer(token, tx, from_address, to_address, amount)
+
+    def request(self, token, height, tx_hash, requestor, amount, status):
+        tx = self.tx(height, tx_hash, Transaction.Type.VBTC_V2_WITHDRAWAL_REQUEST)
+        return add_withdrawal(token, tx, requestor, amount, status)
+
+    def handover(self, token, height, tx_hash, from_address, to_address):
+        return self.tx(
+            height,
             tx_hash,
             Transaction.Type.TKNZ_TX,
             from_address=from_address,
@@ -549,37 +570,51 @@ class OwnershipTransferReplayTests(TestCase):
             data={"Function": "Transfer()", "ContractUID": token.sc_identifier},
         )
 
-    def later_tx(self, tx_hash, tx_type, height=2):
-        block = Block.objects.filter(height=height).first() or make_block(height)
-        return make_tx(block, tx_hash, tx_type)
+    def replay(self, *txs):
+        with replaying():
+            for tx in txs:
+                process_transaction(tx)
+
+    def settlements(self, token):
+        return sorted(
+            (t.transaction_id, t.from_address, t.to_address, t.amount)
+            for t in VbtcV2TokenTransfer.objects.filter(
+                token=token, transaction__type=Transaction.Type.TKNZ_TX
+            )
+        )
 
     def test_later_receipts_are_not_settled(self):
         # The minter M hands the fresh contract to U, then receives vBTC on it.
         token = make_token(owner="U", global_balance="0.001")
-        handover = self.handover_tx(token, "ot1", "M", "U")
-        add_transfer(
-            token, self.later_tx("t1", Transaction.Type.VBTC_V2_TRANSFER), "U", "M", "0.0001"
-        )
+        handover = self.handover(token, 10, "h1", "M", "U")
+        self.transfer(token, 20, "t1", "U", "M", "0.0001")
 
-        process_transaction(handover)
+        self.replay(handover)
 
-        self.assertFalse(VbtcV2TokenTransfer.objects.filter(transaction=handover).exists())
+        self.assertEqual(self.settlements(token), [])
         token.refresh_from_db()
         self.assertEqual(
             token.addresses, {"U": Decimal("0.0009"), "M": Decimal("0.0001")}
         )
 
-    def test_settlement_the_chain_never_made_is_removed(self):
+    def test_second_pass_outside_a_backfill_settles_the_same(self):
         token = make_token(owner="U", global_balance="0.001")
-        handover = self.handover_tx(token, "ot1", "M", "U")
-        add_transfer(
-            token, self.later_tx("t1", Transaction.Type.VBTC_V2_TRANSFER), "U", "M", "0.0001"
-        )
-        add_transfer(token, handover, "M", "U", "0.0001")
+        handover = self.handover(token, 10, "h1", "M", "U")
+        self.transfer(token, 20, "t1", "U", "M", "0.0001")
 
         process_transaction(handover)
 
-        self.assertFalse(VbtcV2TokenTransfer.objects.filter(transaction=handover).exists())
+        self.assertEqual(self.settlements(token), [])
+
+    def test_settlement_the_chain_never_made_is_removed(self):
+        token = make_token(owner="U", global_balance="0.001")
+        handover = self.handover(token, 10, "h1", "M", "U")
+        self.transfer(token, 20, "t1", "U", "M", "0.0001")
+        add_transfer(token, handover, "M", "U", "0.0001")
+
+        self.replay(handover)
+
+        self.assertEqual(self.settlements(token), [])
         token.refresh_from_db()
         self.assertEqual(
             token.addresses, {"U": Decimal("0.0009"), "M": Decimal("0.0001")}
@@ -587,81 +622,205 @@ class OwnershipTransferReplayTests(TestCase):
 
     def test_settlement_made_at_the_time_survives_later_activity(self):
         token = make_token(owner="O", global_balance="0.001")
-        t1 = make_tx(self.block, "t1", Transaction.Type.VBTC_V2_TRANSFER)
-        add_transfer(token, t1, "O", "P", "0.0001")
-        handover = self.handover_tx(token, "ot1", "O", "P")
+        self.transfer(token, 5, "t1", "O", "P", "0.0001")
+        handover = self.handover(token, 10, "h1", "O", "P")
         process_transaction(handover)
-        add_transfer(
-            token, self.later_tx("t2", Transaction.Type.VBTC_V2_TRANSFER), "P", "O", "0.0003"
-        )
+        self.transfer(token, 20, "t2", "P", "O", "0.0003")
 
-        process_transaction(handover)
+        self.replay(handover)
 
-        settlement = VbtcV2TokenTransfer.objects.get(token=token, transaction=handover)
         self.assertEqual(
-            (settlement.from_address, settlement.to_address, settlement.amount),
-            ("P", "O", Decimal("0.0001")),
+            self.settlements(token), [("h1", "P", "O", Decimal("0.0001"))]
         )
 
     def test_wrong_settlement_amount_is_corrected(self):
         token = make_token(owner="P", global_balance="0.001")
-        t1 = make_tx(self.block, "t1", Transaction.Type.VBTC_V2_TRANSFER)
-        add_transfer(token, t1, "O", "P", "0.0001")
-        handover = self.handover_tx(token, "ot1", "O", "P")
+        self.transfer(token, 5, "t1", "O", "P", "0.0001")
+        handover = self.handover(token, 10, "h1", "O", "P")
         add_transfer(token, handover, "O", "P", "0.0005")
 
-        process_transaction(handover)
+        self.replay(handover)
 
-        settlement = VbtcV2TokenTransfer.objects.get(token=token, transaction=handover)
         self.assertEqual(
-            (settlement.from_address, settlement.to_address, settlement.amount),
-            ("P", "O", Decimal("0.0001")),
+            self.settlements(token), [("h1", "P", "O", Decimal("0.0001"))]
         )
 
-    def test_request_completed_afterwards_was_still_open(self):
-        # Below the escrow gate the old owner keeps what its open request
-        # will burn. The request has since completed; at the handover it had not.
-        token = make_token(owner="O", global_balance="0.001")
-        request = add_withdrawal(
-            token,
-            make_tx(self.block, "w1", Transaction.Type.VBTC_V2_WITHDRAWAL_REQUEST),
-            "O",
-            "0.0003",
-            VbtcV2WithdrawalRequest.Status.COMPLETED,
+    def test_two_handovers_replay_to_the_rows_they_wrote(self):
+        token = make_token(owner="A", global_balance="0.001")
+        self.transfer(token, 5, "t1", "A", "X", "0.0001")
+        first = self.handover(token, 10, "h1", "A", "B")
+        process_transaction(first)
+        self.transfer(token, 15, "t2", "B", "Y", "0.0002")
+        second = self.handover(token, 20, "h2", "B", "C")
+        process_transaction(second)
+        self.transfer(token, 30, "t3", "X", "A", "0.00005")
+        indexed = self.settlements(token)
+        self.assertEqual(
+            indexed,
+            [("h1", "B", "A", Decimal("0.0001")), ("h2", "C", "B", Decimal("0.0003"))],
         )
-        handover = self.handover_tx(token, "ot1", "O", "P")
-        completion = self.later_tx("c1", Transaction.Type.VBTC_V2_WITHDRAWAL_COMPLETE)
+
+        self.replay(first, second)
+
+        self.assertEqual(self.settlements(token), indexed)
+        token.refresh_from_db()
+        self.assertEqual(token.owner_address, "C")
+
+    def test_completion_afterwards_settles_like_an_open_request(self):
+        # Below the escrow gate the old owner keeps what its open request
+        # will burn. Completed since or still open, that is the same amount.
+        token = make_token(owner="O", global_balance="0.001")
+        request = self.request(
+            token, 5, "w1", "O", "0.0003", VbtcV2WithdrawalRequest.Status.REQUESTED
+        )
+        handover = self.handover(token, 10, "h1", "O", "P")
+        self.assertEqual(
+            token.settlement_amount_for("O", before=handover), Decimal("-0.0003")
+        )
+
+        completion = self.tx(20, "c1", Transaction.Type.VBTC_V2_WITHDRAWAL_COMPLETE)
+        request.status = VbtcV2WithdrawalRequest.Status.COMPLETED
         request.completion_transaction = completion
         request.completed_at = completion.date_crafted
-        request.save(update_fields=["completion_transaction", "completed_at"])
+        request.save()
 
         self.assertEqual(
             token.settlement_amount_for("O", before=handover), Decimal("-0.0003")
         )
-        self.assertEqual(
-            request.status_before(handover), VbtcV2WithdrawalRequest.Status.REQUESTED
-        )
 
     @override_settings(VBTC_WITHDRAWAL_ESCROW_HEIGHT=1)
     def test_escrow_refunded_afterwards_was_still_held(self):
-        # An escrowed request is a debit until a vote refunds it. The refund
-        # came after the handover, so the settlement still covers the debit.
+        # An escrowed request is a debit until a vote refunds it.
         token = make_token(owner="O", global_balance="0.001")
-        request = add_withdrawal(
-            token,
-            make_tx(self.block, "w1", Transaction.Type.VBTC_V2_WITHDRAWAL_REQUEST),
-            "O",
-            "0.0003",
-            VbtcV2WithdrawalRequest.Status.CANCELLED,
+        request = self.request(
+            token, 5, "w1", "O", "0.0003", VbtcV2WithdrawalRequest.Status.CANCELLED
         )
-        handover = self.handover_tx(token, "ot1", "O", "P")
-        request.cancelled_at = handover.date_crafted + timedelta(minutes=5)
+        request.cancelled_at = self.block_time(20)
         request.save(update_fields=["cancelled_at"])
+        handover = self.handover(token, 10, "h1", "O", "P")
 
         self.assertEqual(
             token.settlement_amount_for("O", before=handover), Decimal("-0.0003")
         )
         self.assertEqual(token.settlement_amount_for("O"), Decimal(0))
+
+    def test_legacy_request_refunded_afterwards_was_still_open(self):
+        token = make_token(owner="O", global_balance="0.001")
+        request = self.request(
+            token, 5, "w1", "O", "0.0003", VbtcV2WithdrawalRequest.Status.CANCELLED
+        )
+        request.cancelled_at = self.block_time(20)
+        request.save(update_fields=["cancelled_at"])
+        handover = self.handover(token, 10, "h1", "O", "P")
+
+        self.assertEqual(
+            token.settlement_amount_for("O", before=handover), Decimal("-0.0003")
+        )
+        self.assertEqual(token.settlement_amount_for("O"), Decimal(0))
+
+    @override_settings(VBTC_WITHDRAWAL_ESCROW_HEIGHT=1)
+    def test_refund_before_the_handover_stays_refunded(self):
+        token = make_token(owner="O", global_balance="0.001")
+        request = self.request(
+            token, 5, "w1", "O", "0.0003", VbtcV2WithdrawalRequest.Status.CANCELLED
+        )
+        request.cancelled_at = self.block_time(7)
+        request.save(update_fields=["cancelled_at"])
+        handover = self.handover(token, 10, "h1", "O", "P")
+
+        self.assertEqual(token.settlement_amount_for("O", before=handover), Decimal(0))
+
+    def test_reserve_send_still_locked_at_the_handover_is_not_settled(self):
+        token = make_token(owner="O", global_balance="0.001")
+        send = self.transfer(token, 5, "r1", "xRBXreserve", "O", "0.0002")
+        send.transaction.unlock_time = self.block_time(20)
+        send.transaction.save(update_fields=["unlock_time"])
+        handover = self.handover(token, 10, "h1", "O", "P")
+
+        self.assertEqual(token.settlement_amount_for("O", before=handover), Decimal(0))
+        self.assertEqual(token.settlement_amount_for("O"), Decimal("0.0002"))
+
+    def test_transfer_earlier_in_the_block_is_settled_at_the_tip(self):
+        # sync_block applies a block in order, so what is in the table when
+        # the handover arrives was applied before it.
+        token = make_token(owner="O", global_balance="0.001")
+        self.transfer(token, 100, "ff", "O", "P", "0.0004")
+        handover = self.handover(token, 100, "aa", "O", "Q")
+
+        process_transaction(handover)
+
+        self.assertEqual(
+            self.settlements(token), [("aa", "Q", "O", Decimal("0.0004"))]
+        )
+        token.refresh_from_db()
+        self.assertEqual(
+            token.addresses, {"Q": Decimal("0.0006"), "P": Decimal("0.0004")}
+        )
+
+    def test_replay_keeps_the_settlement_of_a_shared_block(self):
+        # Block 100 holds the handover and then a transfer back to O. Nothing
+        # stored says which came first, so the replay keeps the indexed row.
+        token = make_token(owner="O", global_balance="0.001")
+        self.transfer(token, 99, "t1", "O", "P", "0.0004")
+        handover = self.handover(token, 100, "ff", "O", "Q")
+        process_transaction(handover)
+        self.transfer(token, 100, "aa", "P", "O", "0.0002")
+        indexed = self.settlements(token)
+        self.assertEqual(indexed, [("ff", "Q", "O", Decimal("0.0004"))])
+
+        with self.assertLogs(level="WARNING") as logs:
+            self.replay(handover)
+
+        self.assertIn("order is not stored", logs.output[0])
+        self.assertEqual(self.settlements(token), indexed)
+        token.refresh_from_db()
+        self.assertEqual(
+            token.addresses,
+            {"O": Decimal("0.0002"), "P": Decimal("0.0002"), "Q": Decimal("0.0006")},
+        )
+
+    def test_second_pass_keeps_the_settlement_of_a_shared_block(self):
+        token = make_token(owner="O", global_balance="0.001")
+        self.transfer(token, 99, "t1", "O", "P", "0.0004")
+        handover = self.handover(token, 100, "ff", "O", "Q")
+        process_transaction(handover)
+        self.transfer(token, 100, "aa", "P", "O", "0.0002")
+
+        with self.assertLogs(level="WARNING"):
+            process_transaction(handover)
+
+        self.assertEqual(
+            self.settlements(token), [("ff", "Q", "O", Decimal("0.0004"))]
+        )
+
+    def test_replay_writes_no_settlement_into_a_shared_block(self):
+        token = make_token(owner="U", global_balance="0.001")
+        handover = self.handover(token, 10, "h1", "M", "U")
+        self.transfer(token, 10, "t1", "U", "M", "0.0001")
+
+        with self.assertLogs(level="WARNING"):
+            self.replay(handover)
+
+        self.assertEqual(self.settlements(token), [])
+
+    @override_settings(VBTC_WITHDRAWAL_ESCROW_HEIGHT=1)
+    def test_replay_keeps_the_settlement_when_the_refund_shares_its_block(self):
+        token = make_token(owner="O", global_balance="0.001")
+        request = self.request(
+            token, 5, "w1", "O", "0.0003", VbtcV2WithdrawalRequest.Status.REQUESTED
+        )
+        handover = self.handover(token, 10, "h1", "O", "Q")
+        process_transaction(handover)
+        indexed = self.settlements(token)
+        self.assertEqual(indexed, [("h1", "Q", "O", Decimal("0.0003"))])
+        request.status = VbtcV2WithdrawalRequest.Status.CANCELLED
+        request.cancelled_at = handover.date_crafted
+        request.save(update_fields=["status", "cancelled_at"])
+
+        with self.assertLogs(level="WARNING"):
+            self.replay(handover)
+
+        self.assertEqual(self.settlements(token), indexed)
 
 
 class WithdrawalStateMachineTests(TestCase):
