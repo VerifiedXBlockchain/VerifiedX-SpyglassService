@@ -938,19 +938,35 @@ class OwnershipTransferReplayTests(TestCase):
             self.settlements(token), [("h1", "O", "P", Decimal("0.0002"))]
         )
 
-    def test_replay_corrects_a_settlement_when_others_share_the_block(self):
-        # X paying Y in the handover's block moves neither owner's entry.
-        token = make_token(owner="U", global_balance="0.001")
-        handover = self.handover(token, 10, "h1", "M", "U")
-        self.transfer(token, 10, "t1", "X", "Y", "0.0001")
-        self.transfer(token, 20, "t2", "U", "M", "0.0003")
-        add_transfer(token, handover, "M", "U", "0.0003")
+    def test_replay_keeps_the_settlement_when_a_row_in_its_block_names_other_parties(self):
+        # Block 10 holds O paying Y and then the handover. An older indexer
+        # stored the payment as X paying Y. A backfill corrects that row, and
+        # reaches the handover first when its hash sorts first.
+        token = make_token(owner="O", global_balance="0.001")
+        self.transfer(token, 5, "t0", "O", "Z", "0.0003")
+        payment = self.tx(
+            10, "ff", Transaction.Type.VBTC_V2_TRANSFER, from_address="O",
+            to_address="Y",
+            data={"Function": "TransferVBTCV2()", "ContractUID": token.sc_identifier,
+                  "Amount": 0.0002},
+        )
+        add_transfer(token, payment, "X", "Y", "0.0002")
+        handover = self.handover(token, 10, "aa", "O", "P")
+        add_transfer(token, handover, "P", "O", "0.0005")
 
-        self.replay(handover)
+        with self.assertLogs(level="WARNING") as logs:
+            self.replay(handover, payment)
 
-        self.assertEqual(self.settlements(token), [])
+        self.assertKept(logs)
+        self.assertEqual(
+            self.settlements(token), [("aa", "P", "O", Decimal("0.0005"))]
+        )
+        corrected = VbtcV2TokenTransfer.objects.get(transaction=payment)
+        self.assertEqual(corrected.from_address, "O")
+        token.refresh_from_db()
+        self.assertEqual(token.ledger_entries().get("O", Decimal(0)), Decimal(0))
 
-    def test_replay_corrects_a_settlement_when_another_holder_requests_in_the_block(self):
+    def test_replay_keeps_the_settlement_when_another_holder_requests_in_the_block(self):
         token = make_token(owner="U", global_balance="0.001")
         handover = self.handover(token, 10, "h1", "M", "U")
         self.request(
@@ -958,9 +974,13 @@ class OwnershipTransferReplayTests(TestCase):
         )
         add_transfer(token, handover, "M", "U", "0.0003")
 
-        self.replay(handover)
+        with self.assertLogs(level="WARNING") as logs:
+            self.replay(handover)
 
-        self.assertEqual(self.settlements(token), [])
+        self.assertKept(logs)
+        self.assertEqual(
+            self.settlements(token), [("h1", "M", "U", Decimal("0.0003"))]
+        )
 
     def test_replay_corrects_a_settlement_when_a_completion_shares_the_block(self):
         token = make_token(owner="O", global_balance="0.001")

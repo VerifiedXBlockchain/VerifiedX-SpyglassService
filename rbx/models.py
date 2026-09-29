@@ -1301,33 +1301,36 @@ class VbtcV2Token(models.Model):
             return VbtcV2WithdrawalRequest.Status.REQUESTED
         return request.status
 
-    def has_unordered_activity(self, address, tx):
-        """Whether something moved `address`'s entry in this ledger that
-        nothing stored places before or after tx. Every transaction carries
-        its block's time, so that is a row or a request of the address in
-        tx's block, a refund decided in that block or with no time recorded,
-        and a reserve send that unlocked since the block before, which the
-        node applies once a block has passed the unlock time. A replay
-        cannot settle the address from the ledger when there is one.
+    def has_unordered_activity(self, tx):
+        """Whether the ledger holds something that nothing stored places
+        before or after tx. Every transaction carries its block's time, so
+        that is a row or a request in tx's block, a refund decided in that
+        block or with no time recorded, and a reserve send that unlocked
+        since the block before, which the node applies once a block has
+        passed the unlock time. A replay cannot settle tx from the ledger
+        when there is one.
 
-        A completion or a cancellation request is neither: an open request
-        and a completed one settle the same (see _status)."""
+        Whose row it is does not narrow this: a row an older indexer stored
+        under the wrong parties is corrected by the same replay, and may be
+        reached after tx. A completion or a cancellation request does not
+        count: an open request and a completed one settle the same (see
+        _status)."""
         unlocked = Q(
             from_address__startswith="xRBX",
             transaction__voided_from_callback=False,
             transaction__unlock_time__lte=tx.date_crafted,
         )
-        previous = Block.objects.filter(height=tx.height - 1).first()
-        if previous is not None:
-            unlocked &= Q(transaction__unlock_time__gte=previous.date_crafted)
-        rows = (
-            VbtcV2TokenTransfer.objects.filter(token=self)
-            .filter(Q(from_address=address) | Q(to_address=address))
-            .exclude(transaction=tx)
+        previous = (
+            Block.objects.filter(height=tx.height - 1)
+            .values_list("date_crafted", flat=True)
+            .first()
         )
+        if previous is not None:
+            unlocked &= Q(transaction__unlock_time__gte=previous)
+        rows = VbtcV2TokenTransfer.objects.filter(token=self).exclude(transaction=tx)
         if rows.filter(Q(transaction__height=tx.height) | unlocked).exists():
             return True
-        return self.withdrawal_requests.filter(requestor_address=address).filter(
+        return self.withdrawal_requests.filter(
             Q(request_transaction__height=tx.height)
             | Q(cancelled_at=tx.date_crafted)
             | Q(
