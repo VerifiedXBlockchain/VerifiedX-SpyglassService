@@ -5,6 +5,7 @@ from typing import Tuple
 
 import rbx.client as client
 from api.raw.serializers import RawTransactionSerializer
+from rbx.exceptions import UnsafeAssetFileName
 from shop.tasks import remote_nft_media_to_urls
 
 
@@ -93,7 +94,13 @@ class RetrieveSmartContractView(GenericAPIView):
 class SmartContractDataView(GenericAPIView):
     def post(self, request, *args, **kwargs):
 
-        data = client.nft_data(payload=request.data)
+        try:
+            data = client.nft_data(payload=request.data)
+        except UnsafeAssetFileName as e:
+            return Response(
+                {"error": str(e), "file_name": e.file_name},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         if not data:
             return Response({}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)

@@ -2,6 +2,7 @@ import json
 import string
 import threading
 import time
+import unicodedata
 from decimal import Decimal
 from typing import List, Optional, Tuple
 
@@ -12,7 +13,7 @@ from django.conf import settings
 from django.utils import timezone
 
 from project.utils.url import join_url
-from rbx.exceptions import RBXException
+from rbx.exceptions import RBXException, UnsafeAssetFileName
 from rbx.models import Nft
 from shop.models import Bid
 import logging
@@ -101,6 +102,18 @@ def _fix_amount(amount):
     return amount * 1.0
 
 
+def _fix_decimals(transaction: dict) -> dict:
+    """Write Amount and Fee as floats so a whole number keeps a decimal point.
+
+    The wallet's JSON arrives through DRF, which keeps 1 as an integer, and
+    the CLI refuses a non-zero Fee written without decimal places (NEW-23).
+    """
+    transaction["Amount"] = _fix_amount(transaction["Amount"])
+    if "Fee" in transaction:
+        transaction["Fee"] = _fix_amount(transaction["Fee"])
+    return transaction
+
+
 def get_status() -> str:
     url = join_url(BASE_URL, "api/V1/CheckStatus")
     response = _http.get(url)
@@ -165,8 +178,7 @@ def tx_get_fee(transaction: dict, *args) -> Tuple[dict, int]:
 
 def tx_get_hash(transaction: dict) -> Tuple[dict, int]:
     url = join_url(BASE_URL, "txapi/txV1/GetTxHash")
-    data = transaction
-    data["Amount"] = _fix_amount(data["Amount"])
+    data = _fix_decimals(transaction)
 
     response = _http.post(url, json=data)
     if response.status_code != 200:
@@ -181,8 +193,7 @@ def tx_get_hash(transaction: dict) -> Tuple[dict, int]:
 def tx_verify(transaction: dict) -> Tuple[dict, int]:
     url = join_url(BASE_URL, "txapi/txV1/VerifyRawTransaction")
 
-    data = transaction
-    data["Amount"] = _fix_amount(data["Amount"])
+    data = _fix_decimals(transaction)
 
     response = _http.post(url, json=data)
     if response.status_code != 200:
@@ -197,8 +208,7 @@ def tx_verify(transaction: dict) -> Tuple[dict, int]:
 def tx_send(transaction: dict) -> Tuple[dict, int]:
     url = join_url(BASE_URL, "txapi/txV1/SendRawTransaction")
 
-    data = transaction
-    data["Amount"] = _fix_amount(data["Amount"])
+    data = _fix_decimals(transaction)
 
     response = _http.post(url, json=data)
 
@@ -224,9 +234,47 @@ def get_smart_contract(identifier: str) -> Optional[dict]:
         return None
 
 
+def is_safe_asset_file_name(file_name: str) -> bool:
+    """The CLI's plain file name rule for NFT assets (VX-04, NEW-03).
+
+    Mirrors NFTAssetFileUtility.IsSafeAssetFileName plus the HTTP beacon's
+    refusal of a trailing space or dot.
+    """
+    if "/" in file_name or "\\" in file_name or ":" in file_name or ".." in file_name:
+        return False
+    if any(unicodedata.category(char) == "Cc" for char in file_name):
+        return False
+    return not file_name.endswith((" ", "."))
+
+
+def _asset_file_names(payload: dict) -> List[str]:
+    """Every asset name nft_data forwards to GetSCMintDeployData."""
+    names = []
+    primary = payload.get("SmartContractAsset")
+    if primary:
+        names.append(primary.get("Name"))
+    for feature in payload.get("Features") or []:
+        if feature.get("FeatureName") == 2:
+            names.extend(asset.get("FileName") for asset in feature.get("FeatureFeatures") or [])
+        if feature.get("FeatureName") == 0:
+            for phase in feature.get("FeatureFeatures") or []:
+                if phase.get("SmartContractAsset"):
+                    names.append(phase["SmartContractAsset"].get("Name"))
+    return [name for name in names if isinstance(name, str) and name]
+
+
 def nft_data(payload: dict, *args) -> Optional[dict]:
+    """Mint deploy data for the wallet's contract.
+
+    Raises UnsafeAssetFileName before any upload when an asset name would
+    mint but later fail beacon uploads and shop thumbnails.
+    """
     logger = logging.getLogger(__name__)
     url = join_url(SHOP_BASE_URL, f"txapi/txv1/GetSCMintDeployData/")
+
+    for file_name in _asset_file_names(payload):
+        if not is_safe_asset_file_name(file_name):
+            raise UnsafeAssetFileName(file_name)
 
     asset_urls = {}
 
@@ -945,14 +993,17 @@ def send_raw_bid(bid: Bid) -> bool:
         logging.error(f"Shop is third party.")
         return
 
-    if not is_already_connected_to_shop(shop.url):
-        connected, _ = connect_to_shop(shop.url)
+    # A shop only accepts a bid from a crawler that completed its "helo"
+    # handshake since the shop last started (VX-10), and it keeps answering
+    # pings without one, so an existing connection proves nothing. Each bid
+    # therefore starts with a fresh handshake.
+    connected, _ = connect_to_shop(shop.url, force_new_connection=True)
 
-        if not connected:
-            logging.error("Could not connect to shop")
-            return
+    if not connected:
+        logging.error("Could not connect to shop")
+        return
 
-        time.sleep(2)
+    time.sleep(2)
 
     time.sleep(1)
 

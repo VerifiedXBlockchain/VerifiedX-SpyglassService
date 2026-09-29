@@ -498,8 +498,8 @@ def handle_auction_sale_complete_tx(tx_hash: str, dryrun: bool = False):
     try:
         tx = Transaction.objects.get(hash=tx_hash)
     except Transaction.DoesNotExist:
-        print(f"Tx not found with hash of {tx_hash}")
-        pass
+        logging.error(f"Auction sale start transaction {tx_hash} is not indexed.")
+        return False
 
     parsed = json.loads(tx.data)
     bid_signature = parsed["BidSignature"] if "BidSignature" in parsed else None
@@ -529,8 +529,19 @@ def handle_auction_sale_complete_tx(tx_hash: str, dryrun: bool = False):
 
     response = tx_send(tx_payload)
 
-    if not response:
-        print("TX Failed")
+    if isinstance(response, dict) and response.get("Result") == "Success":
+        return True
+
+    # The node answers a refused transaction with {"Result": "Fail", ...},
+    # which is truthy, so only an explicit "Success" counts as settled.
+    message = response.get("Message") if isinstance(response, dict) else response
+    listing = bid.listing
+    logging.error(
+        f"Auction sale complete TX refused for listing {listing.pk} "
+        f"(listing_id {listing.listing_id}, {listing.smart_contract_uid}), "
+        f"bid {bid.bid_id}: {message}"
+    )
+    return False
 
 
 @app.task(autoretry_for=[RBXException])

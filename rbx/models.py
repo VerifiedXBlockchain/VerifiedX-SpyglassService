@@ -13,6 +13,7 @@ import json
 import uuid
 from phonenumber_field.modelfields import PhoneNumberField
 from django.contrib.postgres.fields import ArrayField
+from rbx.vbtc_gates import escrow_applies
 
 # class MasterNodeManager(models.Manager):
 #     def get_queryset(self):
@@ -1219,28 +1220,51 @@ class VbtcV2Token(models.Model):
             self.save(update_fields=["is_pending_withdrawal"])
 
     def ledger_entries(self):
-        """Per-address ledger from transfers and completed withdrawals,
-        WITHOUT the owner anchor (global_balance + withdrawn add-back).
+        """Per-address ledger from transfers and withdrawal debits, WITHOUT
+        the owner anchor (global_balance + withdrawn add-back).
+
+        Mirrors the node's per-contract tokenization rows at 63468588:
+
+        - a transfer credits to_address and debits from_address; a reserve
+          (xRBX) sender's transfer counts once its unlock time has passed
+          and it was not called back, because the node defers that pair to
+          unlock (StateData.cs:481-490, 769-790);
+        - a request mined at or past WithdrawalEscrowHeight was debited when
+          mined and is credited back only by an approved cancellation vote,
+          so every escrowed row that is not CANCELLED is a debit
+          (StateData.cs:3578-3583, 3985-4009);
+        - a request below the gate is debited at COMPLETE, using the stored
+          amount, and is never refunded (StateData.cs:3805-3810).
 
         Settlement rows created at ownership transfer are ordinary
         VbtcV2TokenTransfer rows, so they flow through here unchanged.
         """
-        transfers = VbtcV2TokenTransfer.objects.filter(token=self).order_by(
-            "created_at"
+        now = timezone.now()
+        transfers = (
+            VbtcV2TokenTransfer.objects.filter(token=self)
+            .select_related("transaction")
+            .order_by("created_at")
         )
         entries = {}
         for t in transfers:
+            if t.from_address.startswith("xRBX"):
+                tx = t.transaction
+                if tx.voided_from_callback:
+                    continue
+                if tx.unlock_time is not None and tx.unlock_time > now:
+                    continue
             entries[t.to_address] = entries.get(t.to_address, Decimal(0)) + t.amount
             entries[t.from_address] = entries.get(t.from_address, Decimal(0)) - t.amount
 
-        # Withdrawals reduce the withdrawer's balance (not the owner's).
-        completed_withdrawals = VbtcV2WithdrawalRequest.objects.filter(
-            token=self, status=VbtcV2WithdrawalRequest.Status.COMPLETED
-        )
-        for w in completed_withdrawals:
-            entries[w.requestor_address] = (
-                entries.get(w.requestor_address, Decimal(0)) - w.amount
-            )
+        for w in self.withdrawal_requests.select_related("request_transaction"):
+            if escrow_applies(w.request_transaction.height):
+                debit = w.status != VbtcV2WithdrawalRequest.Status.CANCELLED
+            else:
+                debit = w.status == VbtcV2WithdrawalRequest.Status.COMPLETED
+            if debit:
+                entries[w.requestor_address] = (
+                    entries.get(w.requestor_address, Decimal(0)) - w.amount
+                )
 
         return entries
 
@@ -1254,10 +1278,19 @@ class VbtcV2Token(models.Model):
         still-open withdrawal requests — those will debit them when they
         complete, and the BTC pays out to their address, not the new owner's.
         """
-        pending = self.withdrawal_requests.filter(
-            status__in=VbtcV2WithdrawalRequest.ACTIVE_STATUSES,
-            requestor_address=address,
-        ).aggregate(total=Sum("amount"))["total"] or Decimal(0)
+        # An escrowed request is already a debit in ledger_entries; only a
+        # request below the escrow gate is still owed out of the entry.
+        pending = sum(
+            (
+                w.amount
+                for w in self.withdrawal_requests.filter(
+                    status__in=VbtcV2WithdrawalRequest.ACTIVE_STATUSES,
+                    requestor_address=address,
+                ).select_related("request_transaction")
+                if not escrow_applies(w.request_transaction.height)
+            ),
+            Decimal(0),
+        )
         return self.ledger_entries().get(address, Decimal(0)) - pending
 
     @property
@@ -1291,15 +1324,17 @@ class VbtcV2Token(models.Model):
         return {addr: bal for addr, bal in entries.items() if bal > 0}
 
     def available_balances(self, current_height=None):
-        """`addresses` minus each address's open withdrawal requests.
+        """`addresses` minus each address's open legacy withdrawal requests.
 
-        A withdrawal request writes no ledger row until it completes, and
-        the node's transfer check reads the raw ledger, so a send that
-        spends a pending withdrawal is accepted on chain and the later
-        completion burn overdraws the address. The desktop wallet guards
-        this locally by subtracting incomplete requests
-        (VBTCWithdrawalRequest.GetIncompleteWithdrawalAmount); a wallet
-        picking multi-transfer inputs from the explorer needs the same view.
+        Below WithdrawalEscrowHeight a withdrawal request writes no ledger
+        row until it completes, and the node's transfer check reads the raw
+        ledger, so a send that spends a pending withdrawal is accepted on
+        chain and the later completion burn overdraws the address. The
+        desktop wallet guards this locally by subtracting incomplete
+        requests (VBTCWithdrawalRequest.GetIncompleteWithdrawalAmount); a
+        wallet picking multi-transfer inputs from the explorer needs the
+        same view. At or past the gate the node debits at REQUEST, and
+        `addresses` already reflects that.
 
         Mirror the CLI's window too: a request stops reserving once it ages
         past WITHDRAWAL_EXPIRY_BLOCKS, otherwise a stalled ceremony would
@@ -1314,19 +1349,21 @@ class VbtcV2Token(models.Model):
         if current_height is None:
             current_height = Block.objects.aggregate(v=Max("height"))["v"] or 0
 
-        reserved = (
-            self.withdrawal_requests.filter(
-                status__in=VbtcV2WithdrawalRequest.ACTIVE_STATUSES,
-                request_transaction__height__gte=current_height
-                - WITHDRAWAL_EXPIRY_BLOCKS,
-            )
-            .values("requestor_address")
-            .annotate(total=Sum("amount"))
-        )
-        for row in reserved:
-            address = row["requestor_address"]
+        # An escrowed request (at or past WithdrawalEscrowHeight) is already
+        # debited in `addresses`; reserving it again would hide funds twice.
+        # Only a request below the gate, which the node debits at COMPLETE,
+        # still needs the reservation, and only inside the expiry window.
+        reserved = self.withdrawal_requests.filter(
+            status__in=VbtcV2WithdrawalRequest.ACTIVE_STATUSES,
+            request_transaction__height__gte=current_height
+            - WITHDRAWAL_EXPIRY_BLOCKS,
+        ).select_related("request_transaction")
+        for w in reserved:
+            if escrow_applies(w.request_transaction.height):
+                continue
+            address = w.requestor_address
             if address in balances:
-                balances[address] = max(balances[address] - row["total"], Decimal(0))
+                balances[address] = max(balances[address] - w.amount, Decimal(0))
 
         return balances
 
@@ -1370,10 +1407,15 @@ class VbtcV2WithdrawalRequest(models.Model):
         CANCELLATION_REQUESTED = "cancellation_requested"
         CANCELLED = "cancelled"
 
-    # Mirrors VBTCContractV2.HasActiveWithdrawal: both states still commit the
-    # contract's funds, so both must keep blocking new withdrawals and keep
-    # their amount reserved at ownership transfer.
-    ACTIVE_STATUSES = (Status.REQUESTED, Status.PENDING_BTC)
+    # Mirrors the node's IsCompleted == false: a request stays open, keeps
+    # blocking new withdrawals on its contract and keeps its funds committed
+    # until it completes or a validator vote cancels it. A cancel REQUEST
+    # (type 29) does not close it; only the approved vote (type 30) does.
+    ACTIVE_STATUSES = (
+        Status.REQUESTED,
+        Status.PENDING_BTC,
+        Status.CANCELLATION_REQUESTED,
+    )
 
     # Settled on chain. These outrank anything observed off chain and must
     # never be walked backwards — a completed withdrawal that reverts to an
