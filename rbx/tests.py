@@ -890,11 +890,17 @@ class OwnershipTransferReplayTests(TestCase):
         self.assertKept(logs)
         self.assertEqual(self.settlements(token), indexed)
 
-    def test_replay_keeps_the_settlement_when_a_reserve_send_matures_in_its_block(self):
-        token = make_token(owner="O", global_balance="0.001")
+    def reserve_send(self, token, unlocks_at):
         send = self.transfer(token, 5, "r1", "xRBXreserve", "O", "0.0002")
-        send.transaction.unlock_time = self.block_time(10)
+        send.transaction.unlock_time = unlocks_at
         send.transaction.save(update_fields=["unlock_time"])
+        make_block(9)
+        Block.objects.filter(height=9).update(date_crafted=self.block_time(9))
+        return send
+
+    def test_replay_keeps_the_settlement_when_a_reserve_send_unlocked_in_its_block(self):
+        token = make_token(owner="O", global_balance="0.001")
+        self.reserve_send(token, self.block_time(10))
         handover = self.handover(token, 10, "h1", "O", "P")
         process_transaction(handover)
         indexed = self.settlements(token)
@@ -905,41 +911,74 @@ class OwnershipTransferReplayTests(TestCase):
         self.assertKept(logs)
         self.assertEqual(self.settlements(token), indexed)
 
-    def test_replay_of_two_handovers_in_one_block_ends_on_the_last_owner(self):
-        # The chain applied A to B and then B to C. A backfill replays a
-        # block in hash order, which here is the reverse.
-        token = make_token(owner="Z", global_balance="0.001")
-        earlier = self.handover(token, 50, "h0", "Z", "A")
-        first = self.handover(token, 100, "ff", "A", "B")
-        second = self.handover(token, 100, "aa", "B", "C")
-        for tx in (earlier, first, second):
-            process_transaction(tx)
-        token.refresh_from_db()
-        self.assertEqual(token.owner_address, "C")
+    def test_replay_keeps_the_settlement_when_a_reserve_send_unlocked_since_the_last_block(self):
+        # The node applies the send at the end of the first block stamped
+        # after the unlock, which is the handover's own block.
+        token = make_token(owner="O", global_balance="0.001")
+        self.reserve_send(token, self.block_time(10) - timedelta(seconds=5))
+        handover = self.handover(token, 10, "h1", "O", "P")
+        process_transaction(handover)
+        indexed = self.settlements(token)
 
         with self.assertLogs(level="WARNING") as logs:
-            self.replay(earlier, second, first)
+            self.replay(handover)
 
-        self.assertKept(logs, count=2)
-        token.refresh_from_db()
-        self.assertEqual(token.owner_address, "C")
-        self.assertEqual(token.nft.owner_address, "C")
+        self.assertKept(logs)
+        self.assertEqual(self.settlements(token), indexed)
+
+    def test_replay_settles_a_reserve_send_that_unlocked_blocks_earlier(self):
+        token = make_token(owner="O", global_balance="0.001")
+        self.reserve_send(token, self.block_time(7))
+        handover = self.handover(token, 10, "h1", "O", "P")
+        add_transfer(token, handover, "O", "P", "0.0009")
+
+        self.replay(handover)
+
+        self.assertEqual(
+            self.settlements(token), [("h1", "O", "P", Decimal("0.0002"))]
+        )
+
+    def test_replay_corrects_a_settlement_when_others_share_the_block(self):
+        # X paying Y in the handover's block moves neither owner's entry.
+        token = make_token(owner="U", global_balance="0.001")
+        handover = self.handover(token, 10, "h1", "M", "U")
+        self.transfer(token, 10, "t1", "X", "Y", "0.0001")
+        self.transfer(token, 20, "t2", "U", "M", "0.0003")
+        add_transfer(token, handover, "M", "U", "0.0003")
+
+        self.replay(handover)
+
         self.assertEqual(self.settlements(token), [])
 
-    def test_replay_of_a_handover_and_its_return_in_one_block_keeps_the_owner(self):
-        token = make_token(owner="Z", global_balance="0.001")
-        earlier = self.handover(token, 50, "h0", "Z", "A")
-        away = self.handover(token, 100, "ff", "A", "B")
-        back = self.handover(token, 100, "aa", "B", "A")
-        for tx in (earlier, away, back):
-            process_transaction(tx)
+    def test_replay_corrects_a_settlement_when_another_holder_requests_in_the_block(self):
+        token = make_token(owner="U", global_balance="0.001")
+        handover = self.handover(token, 10, "h1", "M", "U")
+        self.request(
+            token, 10, "w1", "X", "0.0001", VbtcV2WithdrawalRequest.Status.REQUESTED
+        )
+        add_transfer(token, handover, "M", "U", "0.0003")
 
-        with self.assertLogs(level="WARNING") as logs:
-            self.replay(earlier, back, away)
+        self.replay(handover)
 
-        self.assertKept(logs, count=2)
-        token.refresh_from_db()
-        self.assertEqual(token.owner_address, "A")
+        self.assertEqual(self.settlements(token), [])
+
+    def test_replay_corrects_a_settlement_when_a_completion_shares_the_block(self):
+        token = make_token(owner="O", global_balance="0.001")
+        request = self.request(
+            token, 5, "w1", "O", "0.0003", VbtcV2WithdrawalRequest.Status.COMPLETED
+        )
+        completion = self.tx(10, "c1", Transaction.Type.VBTC_V2_WITHDRAWAL_COMPLETE)
+        request.completion_transaction = completion
+        request.completed_at = completion.date_crafted
+        request.save(update_fields=["completion_transaction", "completed_at"])
+        handover = self.handover(token, 10, "h1", "O", "P")
+        add_transfer(token, handover, "P", "O", "0.0009")
+
+        self.replay(handover)
+
+        self.assertEqual(
+            self.settlements(token), [("h1", "P", "O", Decimal("0.0003"))]
+        )
 
     def test_replay_that_keeps_a_settlement_still_moves_the_owner(self):
         token = make_token(owner="A", global_balance="0.001")

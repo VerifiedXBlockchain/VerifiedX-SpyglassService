@@ -563,10 +563,23 @@ class ReserveTransferTests(TestCase):
         self.assertEqual(self.token.addresses["Recovered"], Decimal("0.002"))
         self.assertNotIn("R", self.token.addresses)
 
+    def recover(self):
+        recovery = make_tx(
+            self.block, "rc1", Transaction.Type.RESERVE, from_address="xRBXreserve",
+            data={"Function": "Recover()", "RecoveryAddress": "Recovered"},
+        )
+        process_transaction(recovery)
+        self.tx.refresh_from_db()
+
+    def test_recovery_transaction_routes_to_the_redirect(self):
+        self.recover()
+        row = VbtcV2TokenTransfer.objects.get(transaction=self.tx)
+        self.assertEqual(row.to_address, "Recovered")
+        self.assertEqual(self.token.addresses["Recovered"], Decimal("0.002"))
+
     def test_replay_keeps_the_recipient_a_recovery_set(self):
         # A backfill replays the send and not the recovery that followed it.
-        redirect_reserve_transfer(self.tx, "Recovered", timezone.now() - timedelta(seconds=1))
-        self.tx.refresh_from_db()
+        self.recover()
 
         with replaying():
             process_transaction(self.tx)
@@ -574,8 +587,18 @@ class ReserveTransferTests(TestCase):
         self.assertEqual(self.token.addresses["Recovered"], Decimal("0.002"))
         self.assertNotIn("R", self.token.addresses)
 
-    def test_replay_corrects_the_amount_of_a_reserve_send(self):
-        VbtcV2TokenTransfer.objects.filter(transaction=self.tx).update(amount=Decimal("0.009"))
+    def test_second_pass_keeps_the_recipient_a_recovery_set(self):
+        self.recover()
+
+        process_transaction(self.tx)
+
+        self.assertEqual(self.token.addresses["Recovered"], Decimal("0.002"))
+        self.assertNotIn("R", self.token.addresses)
+
+    def test_replay_corrects_a_reserve_send_no_recovery_moved(self):
+        VbtcV2TokenTransfer.objects.filter(transaction=self.tx).update(
+            to_address="Payload", amount=Decimal("0.009")
+        )
 
         with replaying():
             process_transaction(self.tx)

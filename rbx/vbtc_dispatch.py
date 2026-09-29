@@ -32,6 +32,7 @@ from contextvars import ContextVar
 from decimal import Decimal
 
 from rbx.models import (
+    Recovery,
     Transaction,
     VbtcV2Token,
     VbtcV2TokenTransfer,
@@ -163,13 +164,13 @@ def _bind_inputs(payload, what, tx):
 # --- transfers (type 26 and the envelope function) --------------------------
 
 def _write_transfer(token, tx, from_address, to_address, amount, is_multi):
-    if _replaying.get() and is_reserve_address(from_address):
-        # A recovery moves the recipient of a reserve send that is still in
-        # flight (redirect_reserve_transfer). Recoveries are not replayed, so
-        # a replay keeps the recipient of a row it already holds.
-        stored = VbtcV2TokenTransfer.objects.filter(token=token, transaction=tx).first()
-        if stored is not None:
-            to_address = stored.to_address
+    if tx.type == Transaction.Type.VBTC_V2_TRANSFER and is_reserve_address(from_address):
+        # A recovery moved this send to its own address while it was in
+        # flight (redirect_reserve_transfer). A later pass over the send
+        # does not replay the recovery, so it keeps that recipient.
+        recovery = Recovery.objects.filter(outstanding_transactions=tx).first()
+        if recovery is not None:
+            to_address = recovery.new_address
     # update_or_create, not get_or_create: a backfill must correct rows that
     # were indexed from payload addresses before the parties came from the
     # signed transaction.
@@ -286,35 +287,6 @@ def route_envelope(tx):
 KEEP_STORED = "keep the stored row"
 
 
-def _transfers_in_block(token, tx):
-    """Every Transfer() of the contract in tx's block, tx included."""
-    found = []
-    for other in Transaction.objects.filter(
-        block_id=tx.block_id, type__in=OWNERSHIP_TRANSFER_TYPES
-    ):
-        payload, _ = parse_envelope(other.data)
-        if (
-            net_string(field(payload, "Function")) == OWNERSHIP_TRANSFER_FUNCTION
-            and net_string(field(payload, "ContractUID")) == token.sc_identifier
-        ):
-            found.append(other)
-    return found
-
-
-def _owner_after(transfers):
-    """The owner once all of one block's transfers of a contract have
-    applied, in whatever order that was. Each moves the contract on from its
-    owner, so together they are one path, and it ends at the address that
-    received the contract once more than it sent it. None when there is no
-    such address: the path came back to the owner it started from."""
-    received = {}
-    for transfer in transfers:
-        received[transfer.to_address] = received.get(transfer.to_address, 0) + 1
-        received[transfer.from_address] = received.get(transfer.from_address, 0) - 1
-    ends = [address for address, count in received.items() if count > 0]
-    return ends[0] if len(ends) == 1 else None
-
-
 def planned_settlement(token, tx):
     """The settlement row tx calls for: (from_address, to_address, amount),
     None when it calls for no row, or KEEP_STORED.
@@ -327,17 +299,18 @@ def planned_settlement(token, tx):
     order of the two is not stored. At the chain tip the rows in the table
     are the ones applied before tx. Later they are not, so a replay, or a
     second pass over a transaction that already has its row, keeps what is
-    stored. A second Transfer() of the contract in the block counts: it
-    writes no row of its own when it has nothing to settle."""
-    stored = VbtcV2TokenTransfer.objects.filter(token=token, transaction=tx).exists()
-    if (stored or _replaying.get()) and (
-        token.has_unordered_activity(tx) or len(_transfers_in_block(token, tx)) > 1
-    ):
-        return KEEP_STORED
+    stored (VbtcV2Token.has_unordered_activity).
+
+    The block cannot hold a second Transfer() of the contract: the node
+    checks each against the owner before the block
+    (TransactionValidatorService.cs:981)."""
     old_owner = tx.from_address
     new_owner = tx.to_address
     if not old_owner or old_owner == new_owner:
         return None
+    stored = VbtcV2TokenTransfer.objects.filter(token=token, transaction=tx).exists()
+    if (stored or _replaying.get()) and token.has_unordered_activity(old_owner, tx):
+        return KEEP_STORED
     residual = token.settlement_amount_for(old_owner, before=tx)
     if not residual:
         return None
@@ -352,17 +325,15 @@ def apply_ownership_transfer(token, tx):
     tx.ToAddress; the owner's balance is a formula there, so nothing else is
     written. Spyglass models the owner anchor with a settlement row instead
     (see planned_settlement), rewritten on replay so that a backfill corrects
-    a row an earlier run got wrong.
-
-    A replay may not reach the transfers of one block in the chain's order,
-    so there the owner is the one the block ends on (_owner_after)."""
+    a row an earlier run got wrong."""
     new_owner = tx.to_address
     plan = planned_settlement(token, tx)
     if plan is KEEP_STORED:
         logging.warning(
             f"V2 ownership transfer {tx.hash} ({token.sc_identifier}): the order "
-            f"of this transfer and other activity on the contract around block "
-            f"{tx.height} is not stored; the settlement is left as it is stored."
+            f"of this transfer and other activity of {tx.from_address} on the "
+            f"contract around block {tx.height} is not stored; the settlement is "
+            f"left as it is stored."
         )
     elif plan is None:
         VbtcV2TokenTransfer.objects.filter(token=token, transaction=tx).delete()
@@ -378,12 +349,6 @@ def apply_ownership_transfer(token, tx):
                 "created_at": tx.date_crafted,
             },
         )
-    if _replaying.get():
-        transfers = _transfers_in_block(token, tx)
-        if len(transfers) > 1:
-            new_owner = _owner_after(transfers)
-            if new_owner is None:
-                return
     token.owner_address = new_owner
     token.save(update_fields=["owner_address"])
     try:

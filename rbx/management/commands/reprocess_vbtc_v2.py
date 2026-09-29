@@ -33,7 +33,7 @@ ENVELOPE_FUNCTIONS = (ENVELOPE_TRANSFER_FUNCTION, OWNERSHIP_TRANSFER_FUNCTION)
 class Command(BaseCommand):
     help = (
         "Reprocess existing vBTC V2 transactions (types 25-30) and the legacy "
-        "envelope transactions that touch vBTC V2 contracts, in chain order."
+        "envelope transactions that touch vBTC V2 contracts, block by block."
     )
 
     def add_arguments(self, parser):
@@ -123,10 +123,11 @@ class Command(BaseCommand):
         """The settlement rows the run would write, change or remove, and
         the ones it would leave because the order is not stored.
 
-        Each is read from the table as it is now. The run applies them in
-        chain order, so where one settlement feeds the next on the same
-        contract the run can end on a different row than the one named here.
-        The balances before and after the run are the check on the result.
+        Each is read from the table as it is now. The run applies them
+        block by block, so where one settlement feeds the next on the same
+        contract the run can end on a different row than the one named here,
+        and a transaction the run fails on keeps its row. The balances and
+        owners before and after the run are the check on the result.
         """
         tokens = {t.sc_identifier: t for t in VbtcV2Token.objects.all()}
         changes = 0
