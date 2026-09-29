@@ -252,25 +252,32 @@ def apply_ownership_transfer(token, tx):
     (TransferSmartContract, StateData.cs:741-744) moves the contract owner to
     tx.ToAddress; the owner's balance is a formula there, so nothing else is
     written. Spyglass models the owner anchor with a settlement row instead
-    (see VbtcV2Token.settlement_amount_for)."""
+    (see VbtcV2Token.settlement_amount_for).
+
+    The row is derived from the ledger as it stood at tx, so a replay writes
+    the same row however much has happened on the contract since, and
+    corrects or removes one that an earlier run got wrong."""
     old_owner = tx.from_address
     new_owner = tx.to_address
+    residual = Decimal(0)
     if old_owner and old_owner != new_owner:
-        residual = token.settlement_amount_for(old_owner)
-        if residual:
-            from_addr, to_addr = (
-                (old_owner, new_owner) if residual > 0 else (new_owner, old_owner)
-            )
-            VbtcV2TokenTransfer.objects.get_or_create(
-                token=token,
-                transaction=tx,
-                defaults={
-                    "from_address": from_addr,
-                    "to_address": to_addr,
-                    "amount": abs(residual),
-                    "created_at": tx.date_crafted,
-                },
-            )
+        residual = token.settlement_amount_for(old_owner, before=tx)
+    if residual:
+        from_addr, to_addr = (
+            (old_owner, new_owner) if residual > 0 else (new_owner, old_owner)
+        )
+        VbtcV2TokenTransfer.objects.update_or_create(
+            token=token,
+            transaction=tx,
+            defaults={
+                "from_address": from_addr,
+                "to_address": to_addr,
+                "amount": abs(residual),
+                "created_at": tx.date_crafted,
+            },
+        )
+    else:
+        VbtcV2TokenTransfer.objects.filter(token=token, transaction=tx).delete()
     token.owner_address = new_owner
     token.save(update_fields=["owner_address"])
     try:

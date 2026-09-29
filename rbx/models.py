@@ -1156,6 +1156,13 @@ class VbtcTokenAmountTransfer(models.Model):
 WITHDRAWAL_EXPIRY_BLOCKS = 360
 
 
+def chain_position(tx):
+    """Where a transaction sits in the chain, for ordering two of them. The
+    position inside a block is not stored, so transactions of one block fall
+    back to the order reprocess_vbtc_v2 replays them in."""
+    return (tx.height, tx.date_crafted, tx.hash)
+
+
 class VbtcV2Token(models.Model):
     sc_identifier = models.CharField(max_length=64, db_index=True)
     nft = models.ForeignKey(Nft, on_delete=models.CASCADE)
@@ -1219,9 +1226,14 @@ class VbtcV2Token(models.Model):
             self.is_pending_withdrawal = pending
             self.save(update_fields=["is_pending_withdrawal"])
 
-    def ledger_entries(self):
+    def ledger_entries(self, before=None):
         """Per-address ledger from transfers and withdrawal debits, WITHOUT
         the owner anchor (global_balance + withdrawn add-back).
+
+        With `before`, the ledger as the chain had it when it reached that
+        transaction: rows mined later are left out and a request that settled
+        later still counts as open. A replayed transaction needs this, because
+        the table already holds everything that came after it.
 
         Mirrors the node's per-contract tokenization rows at 63468588:
 
@@ -1239,7 +1251,7 @@ class VbtcV2Token(models.Model):
         Settlement rows created at ownership transfer are ordinary
         VbtcV2TokenTransfer rows, so they flow through here unchanged.
         """
-        now = timezone.now()
+        as_of = timezone.now() if before is None else before.date_crafted
         transfers = (
             VbtcV2TokenTransfer.objects.filter(token=self)
             .select_related("transaction")
@@ -1247,20 +1259,23 @@ class VbtcV2Token(models.Model):
         )
         entries = {}
         for t in transfers:
+            if not self._mined_before(t.transaction, before):
+                continue
             if t.from_address.startswith("xRBX"):
                 tx = t.transaction
                 if tx.voided_from_callback:
                     continue
-                if tx.unlock_time is not None and tx.unlock_time > now:
+                if tx.unlock_time is not None and tx.unlock_time > as_of:
                     continue
             entries[t.to_address] = entries.get(t.to_address, Decimal(0)) + t.amount
             entries[t.from_address] = entries.get(t.from_address, Decimal(0)) - t.amount
 
-        for w in self.withdrawal_requests.select_related("request_transaction"):
+        for w in self._requests(before):
+            status = w.status if before is None else w.status_before(before)
             if escrow_applies(w.request_transaction.height):
-                debit = w.status != VbtcV2WithdrawalRequest.Status.CANCELLED
+                debit = status != VbtcV2WithdrawalRequest.Status.CANCELLED
             else:
-                debit = w.status == VbtcV2WithdrawalRequest.Status.COMPLETED
+                debit = status == VbtcV2WithdrawalRequest.Status.COMPLETED
             if debit:
                 entries[w.requestor_address] = (
                     entries.get(w.requestor_address, Decimal(0)) - w.amount
@@ -1268,7 +1283,17 @@ class VbtcV2Token(models.Model):
 
         return entries
 
-    def settlement_amount_for(self, address):
+    @staticmethod
+    def _mined_before(tx, before):
+        return before is None or chain_position(tx) < chain_position(before)
+
+    def _requests(self, before):
+        requests = self.withdrawal_requests.select_related(
+            "request_transaction", "completion_transaction"
+        )
+        return [w for w in requests if self._mined_before(w.request_transaction, before)]
+
+    def settlement_amount_for(self, address, before=None):
         """Signed amount that must move from `address` to the incoming owner
         at ownership transfer (negative = the incoming owner owes `address`).
 
@@ -1277,21 +1302,21 @@ class VbtcV2Token(models.Model):
         withdrawals. The old owner keeps exactly enough to cover their
         still-open withdrawal requests — those will debit them when they
         complete, and the BTC pays out to their address, not the new owner's.
+
+        `before` is the ownership transfer being applied (see ledger_entries).
         """
         # An escrowed request is already a debit in ledger_entries; only a
         # request below the escrow gate is still owed out of the entry.
-        pending = sum(
-            (
-                w.amount
-                for w in self.withdrawal_requests.filter(
-                    status__in=VbtcV2WithdrawalRequest.ACTIVE_STATUSES,
-                    requestor_address=address,
-                ).select_related("request_transaction")
-                if not escrow_applies(w.request_transaction.height)
-            ),
-            Decimal(0),
-        )
-        return self.ledger_entries().get(address, Decimal(0)) - pending
+        pending = Decimal(0)
+        for w in self._requests(before):
+            if w.requestor_address != address:
+                continue
+            status = w.status if before is None else w.status_before(before)
+            if status not in VbtcV2WithdrawalRequest.ACTIVE_STATUSES:
+                continue
+            if not escrow_applies(w.request_transaction.height):
+                pending += w.amount
+        return self.ledger_entries(before).get(address, Decimal(0)) - pending
 
     @property
     def addresses(self):
@@ -1464,6 +1489,28 @@ class VbtcV2WithdrawalRequest(models.Model):
 
     def __str__(self):
         return f"{self.token.sc_identifier} withdrawal [{self.status}]"
+
+    def status_before(self, tx):
+        """The status this request had when the chain reached `tx`. A
+        completion or a refund mined later had not happened yet, so the
+        request was still open. Which open status it had is not recorded;
+        callers only tell open from settled."""
+        if self.status == self.Status.COMPLETED:
+            completion = self.completion_transaction
+            if completion is not None:
+                settled_later = chain_position(completion) > chain_position(tx)
+            else:
+                settled_later = (
+                    self.completed_at is not None
+                    and self.completed_at > tx.date_crafted
+                )
+        elif self.status == self.Status.CANCELLED:
+            settled_later = (
+                self.cancelled_at is not None and self.cancelled_at > tx.date_crafted
+            )
+        else:
+            return self.status
+        return self.Status.REQUESTED if settled_later else self.status
 
 
 class UnindexedMint(models.Model):
