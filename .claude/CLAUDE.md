@@ -102,13 +102,29 @@ The vBTC V2 indexer (`rbx/vbtc_dispatch.py`, `rbx/vbtc_gates.py`, balance math i
 
 1. **Deploy** (push to `main` for mainnet, `testnet` for testnet). Porter's predeploy runs migrations; the workers restart.
 2. **Wait for quiescence**: no fresh `ready.` lines in `./scripts/fetch-logs.sh <network> --since 8m` for a few minutes (Porter can roll a second revision after the Action goes green).
-3. **Run the backfill once**, on the app, not locally:
+3. **Snapshot the balances** the API serves, before anything is rewritten:
+   ```bash
+   ./scripts/vbtc-v2-balances.py snapshot <network> before.json
+   ```
+4. **Run the backfill once**, on the app, not locally:
    ```bash
    python3 -c 'import pty,sys; sys.exit(pty.spawn(["porter","app","run","rbx-explorer-<network>","--wait","--","python","manage.py","reprocess_vbtc_v2"]))'
    ```
-   (`porter app run` needs a pseudo-terminal; macOS `script` fails when stdin is a socket, the Python pty module does not.) It reprocesses types 25-30 plus the legacy envelope transactions that touch vBTC V2 contracts, in chain order, idempotently. Expect one `Found N transaction(s)` line and `Done. Processed: N, Errors: 0`.
-4. **Verify against a Core node**, not against Spyglass itself: for every token and address in `https://<network>-data.rbx.network/api/btc/vbtc-v2/`, compare `addresses[address]` with `GET http://<node>:17292/vbtcapi/VBTC/GetVBTCBalance/{address}/{scUID}` → `Balance`. Known pre-existing owner-formula divergences on Core's side are listed in the 2026-09-25 notes (`reviews/remediation-audit-2026-09-25` in the platform-context repo).
+   (`porter app run` needs a pseudo-terminal; macOS `script` fails when stdin is a socket, the Python pty module does not.) It reprocesses types 25-30 plus the legacy envelope transactions that touch vBTC V2 contracts, in chain order, idempotently. Expect one `Found N transaction(s)` line and `Done. Processed: N, Errors: 0`. A clean exit says the transactions were processed, not that the ledger is right; steps 5 and 6 say that.
+5. **Read every balance the backfill changed**:
+   ```bash
+   ./scripts/vbtc-v2-balances.py snapshot <network> after.json
+   ./scripts/vbtc-v2-balances.py diff before.json after.json
+   ```
+   Each line must be a change the deployed code was meant to make. A backfill over a chain that was indexed correctly changes nothing.
+6. **Verify against a Core node**, not against Spyglass itself:
+   ```bash
+   VFX_NODE_TOKEN=<token> ./scripts/vbtc-v2-balances.py node after.json --node http://<node>:<port> --token-env VFX_NODE_TOKEN
+   ```
+   It compares every holder balance with the node's `vbtcapi/VBTC/GetVBTCBalance/{address}/{scUID}`. A balance that matched the node before the backfill and does not after it is a defect in the backfill. Known owner-formula differences on Core's side are listed in the 2026-09-25 notes (`reviews/remediation-audit-2026-09-25` in the platform-context repo); on mainnet they are the owners of `4bb6f099`, `76c995d5`, `8234b371` and `d11a9ef3`, and holder `RNiQ` on `d11a9ef3`.
 
-**Mainnet specifics.** `VBTC_NETWORK` defaults to the mainnet height table whenever `ENVIRONMENT` is not `testnet` (`project/settings/rbx.py`), so mainnet needs no new env var. The escrow gate on mainnet is block 7,296,200 and the multi-transfer gate 7,281,000; both are already below the tip, so the backfill will re-derive every escrowed request. **Do not skip step 3 on mainnet**: until it runs, every holder with a stalled or cancelled-but-unapproved withdrawal request is overstated, which is the SG-01 defect this code exists to fix. The mainnet backfill has not been run as of 2026-09-25.
+**What went wrong on 2026-09-28.** The first mainnet backfill replayed each ownership transfer against the present-day ledger and wrote three settlement rows that handed the former owner's current balance to the new owner (contracts `3de79275`, `6fc51819`, `b8f0d376`). The rows were deleted and `apply_ownership_transfer` now settles from the ledger as it stood at the transfer (`before=tx`). Anything else that derives a row from the ledger during a replay needs the same cut-off.
+
+**Mainnet specifics.** `VBTC_NETWORK` defaults to the mainnet height table whenever `ENVIRONMENT` is not `testnet` (`project/settings/rbx.py`), so mainnet needs no new env var. The escrow gate on mainnet is block 7,296,200 and the multi-transfer gate 7,281,000; both are already below the tip, so the backfill will re-derive every escrowed request. **Do not skip step 3 on mainnet**: until it runs, every holder with a stalled or cancelled-but-unapproved withdrawal request is overstated, which is the SG-01 defect this code exists to fix. The mainnet backfill ran on 2026-09-28 and, once the three settlement rows were removed, left every balance as it was.
 
 **Testnet specifics.** The escrow binary reached the testnet fleet between blocks 926,211 and 927,986, so `VBTC_WITHDRAWAL_ESCROW_HEIGHT=927986` is pinned in the testnet Porter app env to match the live nodes' history (the code's testnet default is 1). Remove the pin only after the testnet nodes have resynced from genesis on a binary that escrows from height 1.
