@@ -70,6 +70,7 @@ class Command(BaseCommand):
         # functions the node routes to the vBTC ledger. Filtered in Python
         # because the payload is a JSON string inside the JSON column.
         envelope_hashes = []
+        ownership_transfers = set()
         if not skip_envelopes and not tx_type:
             v2_ids = set(VbtcV2Token.objects.values_list("sc_identifier", flat=True))
             candidates = Transaction.objects.filter(
@@ -77,15 +78,24 @@ class Command(BaseCommand):
             ).only("hash", "data")
             for tx in candidates.iterator():
                 payload, _ = parse_envelope(tx.data)
-                if net_string(field(payload, "Function")) not in ENVELOPE_FUNCTIONS:
+                function = net_string(field(payload, "Function"))
+                if function not in ENVELOPE_FUNCTIONS:
                     continue
                 if net_string(field(payload, "ContractUID")) in v2_ids:
                     envelope_hashes.append(tx.hash)
+                    if function == OWNERSHIP_TRANSFER_FUNCTION:
+                        ownership_transfers.add(tx.hash)
             if envelope_hashes:
                 selected |= Q(hash__in=envelope_hashes)
 
-        txs = Transaction.objects.filter(selected).order_by("height", "date_crafted", "hash")
-        count = txs.count()
+        # Block by block. The order inside a block is not stored, so an
+        # ownership transfer goes last in its block: the rows it has to see
+        # to know that it shares the block are back in the table by then.
+        txs = sorted(
+            Transaction.objects.filter(selected),
+            key=lambda tx: (tx.height, tx.hash in ownership_transfers, tx.hash),
+        )
+        count = len(txs)
 
         self.stdout.write(
             f"Found {count} transaction(s) to reprocess "
@@ -104,7 +114,7 @@ class Command(BaseCommand):
         errors = 0
 
         with replaying():
-            for tx in txs.iterator():
+            for tx in txs:
                 try:
                     self.stdout.write(
                         f"Processing {tx.hash} (type={tx.type}, height={tx.height})..."
@@ -123,11 +133,13 @@ class Command(BaseCommand):
         """The settlement rows the run would write, change or remove, and
         the ones it would leave because the order is not stored.
 
-        Each is read from the table as it is now. The run applies them
-        block by block, so where one settlement feeds the next on the same
-        contract the run can end on a different row than the one named here,
-        and a transaction the run fails on keeps its row. The balances and
-        owners before and after the run are the check on the result.
+        Each is read from the table as it is now. The run rebuilds the
+        table as it goes, so it can end on a different row than the one
+        named here: where one settlement feeds the next on the same
+        contract, and where a row of the transfer's block is missing until
+        the run writes it, which makes the run leave the settlement. A
+        transaction the run fails on keeps its row. The balances and owners
+        before and after the run are the check on the result.
         """
         tokens = {t.sc_identifier: t for t in VbtcV2Token.objects.all()}
         changes = 0

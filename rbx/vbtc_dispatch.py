@@ -309,7 +309,7 @@ def planned_settlement(token, tx):
     if not old_owner or old_owner == new_owner:
         return None
     stored = VbtcV2TokenTransfer.objects.filter(token=token, transaction=tx).exists()
-    if (stored or _replaying.get()) and token.has_unordered_activity(old_owner, tx):
+    if (stored or _replaying.get()) and token.has_unordered_activity(tx):
         return KEEP_STORED
     residual = token.settlement_amount_for(old_owner, before=tx)
     if not residual:
@@ -331,9 +331,8 @@ def apply_ownership_transfer(token, tx):
     if plan is KEEP_STORED:
         logging.warning(
             f"V2 ownership transfer {tx.hash} ({token.sc_identifier}): the order "
-            f"of this transfer and other activity of {tx.from_address} on the "
-            f"contract around block {tx.height} is not stored; the settlement is "
-            f"left as it is stored."
+            f"of this transfer and other activity on the contract around block "
+            f"{tx.height} is not stored; the settlement is left as it is stored."
         )
     elif plan is None:
         VbtcV2TokenTransfer.objects.filter(token=token, transaction=tx).delete()
