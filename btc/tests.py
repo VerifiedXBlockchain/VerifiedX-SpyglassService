@@ -171,18 +171,27 @@ def _address(funded, tx_count):
     BLOCKDAEMON_API_KEY="",
 )
 class VfxNodeBalanceTests(SimpleTestCase):
-    def _serve(self, address_body, pages):
+    def _serve(self, address_body, pages, others=None):
         """requests.get stub: /address/:a returns address_body, /txs returns
-        pages[after_txid] (None key for the first page)."""
+        pages[after_txid] (None key for the first page). Any other provider
+        returns `others` when given, otherwise fails to connect."""
 
         def get(url, params=None, headers=None, timeout=None):
             if url == f"{NODE}/address/{ADDR}":
                 return _response(200, json_body=address_body)
             if url == f"{NODE}/address/{ADDR}/txs":
                 return _response(200, json_body=pages[(params or {}).get("after_txid")])
-            raise AssertionError(f"unexpected url {url}")
+            if url.startswith(NODE):
+                raise AssertionError(f"unexpected node url {url}")
+            if others is not None:
+                return others
+            raise requests.ConnectionError(f"[Errno 101] Network is unreachable: {url}")
 
         return patch("btc.btc_client.requests.get", side_effect=get)
+
+    @staticmethod
+    def _node_calls(get):
+        return [c for c in get.call_args_list if c.args[0].startswith(NODE)]
 
     @override_settings(BTC_NODE_API_URL="")
     def test_rung_skipped_when_url_unset(self):
@@ -232,7 +241,7 @@ class VfxNodeBalanceTests(SimpleTestCase):
         with self._serve(_address(15_000, 15), {None: page1, "r9": page1}) as get:
             result = BtcClient().get_balance(ADDR)
         self.assertEqual(result, {"balance": Decimal("0.00015"), "partial": True})
-        self.assertEqual(get.call_count, 3)
+        self.assertEqual(len(self._node_calls(get)), 3)
 
     def test_short_history_returns_partial(self):
         page1 = [_tx(f"r{i}", outs=[(ADDR, 1000)]) for i in range(10)]
@@ -245,7 +254,42 @@ class VfxNodeBalanceTests(SimpleTestCase):
         with self._serve(_address(5_000, 201), {}) as get:
             result = BtcClient().get_balance(ADDR)
         self.assertEqual(result, {"balance": Decimal("0.00005"), "partial": True})
-        self.assertEqual(get.call_count, 1)
+        self.assertEqual(len(self._node_calls(get)), 1)
+
+    def test_partial_gives_way_to_full_totals_from_a_later_provider(self):
+        mempool = _response(200, json_body={
+            "chain_stats": {"funded_txo_sum": 9_000, "spent_txo_sum": 4_000, "tx_count": 201},
+        })
+        with self._serve(_address(5_000, 201), {}, others=mempool):
+            result = BtcClient().get_balance(ADDR)
+        self.assertEqual(result, {
+            "total_received": Decimal("0.00009"),
+            "total_sent": Decimal("0.00004"),
+            "balance": Decimal("0.00005"),
+            "tx_count": 201,
+        })
+
+    def test_spend_without_prevout_returns_partial(self):
+        # The address's own spend comes back with a null prevout, so the walk
+        # would undercount total_sent; received - sent no longer equals the
+        # balance the node reports.
+        page = [
+            _tx("r0", outs=[(ADDR, 5000)]),
+            _tx("s0", outs=[(OTHER, 2900)], ins=[None]),
+        ]
+        with self._serve(_address(2000, 2), {None: page}):
+            result = BtcClient().get_balance(ADDR)
+        self.assertEqual(result, {"balance": Decimal("0.00002"), "partial": True})
+
+    def test_walk_over_time_budget_returns_partial(self):
+        page1 = [_tx(f"r{i}", outs=[(ADDR, 1000)]) for i in range(10)]
+        page2 = [_tx("r10", outs=[(ADDR, 1000)])]
+        clock = iter([0, 0, 25])  # deadline set, page 1 in budget, page 2 over
+        with self._serve(_address(11_000, 11), {None: page1, "r9": page2}) as get, \
+                patch("btc.btc_client.time.monotonic", side_effect=lambda: next(clock)):
+            result = BtcClient().get_balance(ADDR)
+        self.assertEqual(result, {"balance": Decimal("0.00011"), "partial": True})
+        self.assertEqual(len(self._node_calls(get)), 2)
 
     def test_node_failure_falls_through_to_mempool_space(self):
         mempool = _response(200, json_body={

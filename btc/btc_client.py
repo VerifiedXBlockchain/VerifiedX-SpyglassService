@@ -1,6 +1,7 @@
 import hashlib
 import logging
 import re
+import time
 from decimal import Decimal
 
 import requests
@@ -15,6 +16,9 @@ _SATS = Decimal(100_000_000)
 # get a partial (balance-only) result.
 _VFX_NODE_MAX_TXS = 200
 _VFX_NODE_PAGE_SIZE = 10
+# Wall-clock budget for one address's walk, so a slow node can't hold up the
+# rest of the 10-minute sweep; over budget, the result is partial.
+_VFX_NODE_WALK_SECONDS = 20
 
 
 # Bitcoin Core reports a duplicate submission as RPC error -27 ("Transaction
@@ -128,7 +132,9 @@ class BtcClient:
         The Blockdaemon rung returns `{"balance": ..., "partial": True}` —
         its API has no total_received/total_sent/tx_count, so callers must
         only update the balance field from a partial result. The VFX node
-        rung does the same when it cannot rebuild the totals.
+        rung does the same when it cannot rebuild the totals. A partial result
+        doesn't end the ladder: later providers still get a chance to return
+        full totals, and the first partial is returned only if none does.
         """
         if self.is_testnet:
             return self._balance_blockbook(address)
@@ -140,6 +146,7 @@ class BtcClient:
             ("blockdaemon", self._balance_blockdaemon, None),
             ("blockchain.info", self._balance_blockchain_info, None),
         ]
+        partial = None
         for name, fetch, base in providers:
             if name == "blockdaemon" and not settings.BLOCKDAEMON_API_KEY:
                 continue
@@ -147,12 +154,17 @@ class BtcClient:
                 continue
             try:
                 result = fetch(address, base) if base else fetch(address)
-                if result is not None:
+                if result is None:
+                    continue
+                if not result.get("partial"):
                     return result
+                partial = partial or result
             except Exception as e:
                 logger.warning(
                     f"BtcClient.get_balance() provider {name} failed for {address}: {e}"
                 )
+        if partial:
+            return partial
         logger.error(f"BtcClient.get_balance(): all providers failed for {address}")
         return None
 
@@ -182,7 +194,10 @@ class BtcClient:
         `chain_stats.funded_txo_sum` with `spent_txo_sum` 0, so funded - spent
         is the right balance but neither figure is a lifetime total.
         `tx_count` is the confirmed history length and is right. The totals
-        are rebuilt by walking `/address/:a/txs`, confirmed transactions only.
+        are rebuilt by walking `/address/:a/txs`, confirmed transactions only,
+        and trusted only when they account for every confirmed tx and
+        received - sent equals the balance (a spend served without its
+        prevout would otherwise undercount total_sent).
         """
         headers = {**self.headers, "X-API-Key": settings.BTC_NODE_API_KEY}
         base_url = base_url.rstrip("/")
@@ -192,9 +207,8 @@ class BtcClient:
         )
         response.raise_for_status()
         stats = response.json()["chain_stats"]
-        balance = (
-            Decimal(int(stats["funded_txo_sum"])) - Decimal(int(stats["spent_txo_sum"]))
-        ) / _SATS
+        balance_sats = int(stats["funded_txo_sum"]) - int(stats["spent_txo_sum"])
+        balance = Decimal(balance_sats) / _SATS
         tx_count = int(stats.get("tx_count", 0))
         partial = {"balance": balance, "partial": True}
         if tx_count > _VFX_NODE_MAX_TXS:
@@ -208,7 +222,14 @@ class BtcClient:
         confirmed = 0
         seen = set()
         after_txid = None
+        deadline = time.monotonic() + _VFX_NODE_WALK_SECONDS
         for _ in range(tx_count // _VFX_NODE_PAGE_SIZE + 3):
+            if time.monotonic() > deadline:
+                logger.warning(
+                    f"BtcClient vfx-node walk for {address} ran past "
+                    f"{_VFX_NODE_WALK_SECONDS}s; returning balance only"
+                )
+                return partial
             response = requests.get(
                 f"{base_url}/address/{address}/txs",
                 params={"after_txid": after_txid} if after_txid else None,
@@ -240,6 +261,13 @@ class BtcClient:
             logger.warning(
                 f"BtcClient vfx-node walked {confirmed} confirmed txs for {address}, "
                 f"expected {tx_count}; returning balance only"
+            )
+            return partial
+        if received - sent != balance_sats:
+            logger.warning(
+                f"BtcClient vfx-node totals for {address} don't match its balance "
+                f"(received {received} - sent {sent} != {balance_sats} sats); "
+                f"returning balance only"
             )
             return partial
 
