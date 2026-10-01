@@ -10,6 +10,12 @@ logger = logging.getLogger(__name__)
 
 _SATS = Decimal(100_000_000)
 
+# The VFX node rebuilds totals by walking an address's history, so it only
+# does so for addresses short enough to walk in a few requests. Busier ones
+# get a partial (balance-only) result.
+_VFX_NODE_MAX_TXS = 200
+_VFX_NODE_PAGE_SIZE = 10
+
 
 # Bitcoin Core reports a duplicate submission as RPC error -27 ("Transaction
 # already in block chain") or as a txn-already-in-mempool / txn-already-known
@@ -82,12 +88,15 @@ class BtcClient:
     10-minute vBTC balance sweep was failing most calls (2026-06-12: V2
     deposits stayed invisible until a call got lucky):
 
-        1. mempool.space   (Esplora — full data, no key)
-        2. blockstream.info (Esplora — full data, no key, independent infra)
-        3. Blockdaemon      (paid + keyed backstop — CURRENT BALANCE ONLY;
+        1. VFX node         (own mempool backend over Fulcrum — keyed;
+                             skipped when BTC_NODE_API_URL is unset; partial
+                             for addresses with more than 200 txs)
+        2. mempool.space    (Esplora — full data, no key)
+        3. blockstream.info (Esplora — full data, no key, independent infra)
+        4. Blockdaemon      (paid + keyed backstop — CURRENT BALANCE ONLY;
                              returns `partial: True` so callers must not
                              overwrite total_received/total_sent/tx_count)
-        4. blockchain.info  (legacy last resort)
+        5. blockchain.info  (legacy last resort)
 
     Any single success wins. Testnet keeps the Blockbook endpoint.
     """
@@ -118,12 +127,14 @@ class BtcClient:
 
         The Blockdaemon rung returns `{"balance": ..., "partial": True}` —
         its API has no total_received/total_sent/tx_count, so callers must
-        only update the balance field from a partial result.
+        only update the balance field from a partial result. The VFX node
+        rung does the same when it cannot rebuild the totals.
         """
         if self.is_testnet:
             return self._balance_blockbook(address)
 
         providers = [
+            ("vfx-node", self._balance_vfx_node, settings.BTC_NODE_API_URL),
             ("mempool.space", self._balance_esplora, "https://mempool.space/api"),
             ("blockstream.info", self._balance_esplora, "https://blockstream.info/api"),
             ("blockdaemon", self._balance_blockdaemon, None),
@@ -131,6 +142,8 @@ class BtcClient:
         ]
         for name, fetch, base in providers:
             if name == "blockdaemon" and not settings.BLOCKDAEMON_API_KEY:
+                continue
+            if name == "vfx-node" and not base:
                 continue
             try:
                 result = fetch(address, base) if base else fetch(address)
@@ -160,6 +173,81 @@ class BtcClient:
             "total_sent": total_sent,
             "balance": total_received - total_sent,
             "tx_count": stats.get("tx_count", 0),
+        }
+
+    def _balance_vfx_node(self, address: str, base_url: str):
+        """VFX's own mempool backend, which runs in Electrum mode over Fulcrum.
+
+        In that mode `/address/:a` reports the confirmed balance as
+        `chain_stats.funded_txo_sum` with `spent_txo_sum` 0, so funded - spent
+        is the right balance but neither figure is a lifetime total.
+        `tx_count` is the confirmed history length and is right. The totals
+        are rebuilt by walking `/address/:a/txs`, confirmed transactions only.
+        """
+        headers = {**self.headers, "X-API-Key": settings.BTC_NODE_API_KEY}
+        base_url = base_url.rstrip("/")
+
+        response = requests.get(
+            f"{base_url}/address/{address}", headers=headers, timeout=(5, 10)
+        )
+        response.raise_for_status()
+        stats = response.json()["chain_stats"]
+        balance = (
+            Decimal(int(stats["funded_txo_sum"])) - Decimal(int(stats["spent_txo_sum"]))
+        ) / _SATS
+        tx_count = int(stats.get("tx_count", 0))
+        partial = {"balance": balance, "partial": True}
+        if tx_count > _VFX_NODE_MAX_TXS:
+            return partial
+
+        # Pages are newest first, unconfirmed first, 10 per page, continued
+        # with ?after_txid=<last txid>. When after_txid is not found the
+        # backend starts again from the top, so a page with nothing new ends
+        # the walk.
+        received = sent = 0
+        confirmed = 0
+        seen = set()
+        after_txid = None
+        for _ in range(tx_count // _VFX_NODE_PAGE_SIZE + 3):
+            response = requests.get(
+                f"{base_url}/address/{address}/txs",
+                params={"after_txid": after_txid} if after_txid else None,
+                headers=headers,
+                timeout=(5, 10),
+            )
+            response.raise_for_status()
+            page = response.json()
+            new_txs = [tx for tx in page if tx["txid"] not in seen]
+            if not new_txs:
+                break
+            for tx in new_txs:
+                seen.add(tx["txid"])
+                if not (tx.get("status") or {}).get("confirmed"):
+                    continue
+                confirmed += 1
+                for vout in tx.get("vout", []):
+                    if vout.get("scriptpubkey_address") == address:
+                        received += int(vout["value"])
+                for vin in tx.get("vin", []):
+                    prevout = vin.get("prevout") or {}
+                    if prevout.get("scriptpubkey_address") == address:
+                        sent += int(prevout["value"])
+            if len(page) < _VFX_NODE_PAGE_SIZE:
+                break
+            after_txid = page[-1]["txid"]
+
+        if confirmed != tx_count:
+            logger.warning(
+                f"BtcClient vfx-node walked {confirmed} confirmed txs for {address}, "
+                f"expected {tx_count}; returning balance only"
+            )
+            return partial
+
+        return {
+            "total_received": Decimal(received) / _SATS,
+            "total_sent": Decimal(sent) / _SATS,
+            "balance": balance,
+            "tx_count": tx_count,
         }
 
     def _balance_blockdaemon(self, address: str):

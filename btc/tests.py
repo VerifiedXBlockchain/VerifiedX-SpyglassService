@@ -1,3 +1,4 @@
+from decimal import Decimal
 from unittest.mock import MagicMock, patch
 
 import requests
@@ -140,3 +141,127 @@ class BroadcastTransactionTests(SimpleTestCase):
             result = BtcClient().broadcast_transaction("deadbeef")
         self.assertEqual(result, {"success": False, "message": "Transaction decode failed"})
         get.assert_not_called()
+
+
+NODE = "https://btc-api.example/api"
+ADDR = "bc1qdeposit"
+OTHER = "bc1qother"
+
+
+def _tx(txid, confirmed=True, outs=(), ins=()):
+    """Esplora-shaped tx. `ins` entries are (address, sats) or None for a
+    null prevout."""
+    return {
+        "txid": txid,
+        "status": {"confirmed": confirmed},
+        "vout": [{"scriptpubkey_address": a, "value": v} for a, v in outs],
+        "vin": [{"prevout": None if i is None else {"scriptpubkey_address": i[0], "value": i[1]}} for i in ins],
+    }
+
+
+def _address(funded, tx_count):
+    # Electrum mode: funded is the confirmed balance, spent is always 0.
+    return {"chain_stats": {"funded_txo_sum": funded, "spent_txo_sum": 0, "tx_count": tx_count}}
+
+
+@override_settings(
+    ENVIRONMENT="mainnet",
+    BTC_NODE_API_URL=NODE,
+    BTC_NODE_API_KEY="node-key",
+    BLOCKDAEMON_API_KEY="",
+)
+class VfxNodeBalanceTests(SimpleTestCase):
+    def _serve(self, address_body, pages):
+        """requests.get stub: /address/:a returns address_body, /txs returns
+        pages[after_txid] (None key for the first page)."""
+
+        def get(url, params=None, headers=None, timeout=None):
+            if url == f"{NODE}/address/{ADDR}":
+                return _response(200, json_body=address_body)
+            if url == f"{NODE}/address/{ADDR}/txs":
+                return _response(200, json_body=pages[(params or {}).get("after_txid")])
+            raise AssertionError(f"unexpected url {url}")
+
+        return patch("btc.btc_client.requests.get", side_effect=get)
+
+    @override_settings(BTC_NODE_API_URL="")
+    def test_rung_skipped_when_url_unset(self):
+        with patch("btc.btc_client.requests.get") as get:
+            get.return_value = _response(200, json_body={
+                "chain_stats": {"funded_txo_sum": 300, "spent_txo_sum": 100, "tx_count": 2},
+            })
+            result = BtcClient().get_balance(ADDR)
+        self.assertEqual(get.call_args_list[0].args[0], f"https://mempool.space/api/address/{ADDR}")
+        self.assertEqual(result["balance"], Decimal("0.000002"))
+
+    def test_totals_rebuilt_across_pages(self):
+        # Page 1: one unconfirmed tx (ignored) + 9 confirmed; page 2: 2 more.
+        page1 = [_tx("u0", confirmed=False, outs=[(ADDR, 999_999)])]
+        page1 += [_tx(f"r{i}", outs=[(ADDR, 1000), (OTHER, 5)]) for i in range(8)]
+        page1 += [_tx("s0", outs=[(OTHER, 2500), (ADDR, 400)], ins=[(ADDR, 3000), None])]
+        page2 = [
+            _tx("r8", outs=[(ADDR, 1000)], ins=[None]),
+            _tx("s1", outs=[(OTHER, 900)], ins=[(ADDR, 1000), (OTHER, 50)]),
+        ]
+        received = 8 * 1000 + 400 + 1000  # 9400
+        sent = 3000 + 1000  # 4000
+        with self._serve(_address(received - sent, 11), {None: page1, "s0": page2}) as get:
+            result = BtcClient().get_balance(ADDR)
+
+        self.assertEqual(result, {
+            "total_received": Decimal(received) / Decimal(100_000_000),
+            "total_sent": Decimal(sent) / Decimal(100_000_000),
+            "balance": Decimal(received - sent) / Decimal(100_000_000),
+            "tx_count": 11,
+        })
+        self.assertEqual(get.call_args_list[2].kwargs["params"], {"after_txid": "s0"})
+
+    def test_api_key_header_sent(self):
+        page = [_tx("r0", outs=[(ADDR, 1000)])]
+        with self._serve(_address(1000, 1), {None: page}) as get:
+            BtcClient().get_balance(ADDR)
+        self.assertEqual(get.call_count, 2)
+        for call in get.call_args_list:
+            self.assertEqual(call.kwargs["headers"]["X-API-Key"], "node-key")
+            self.assertEqual(call.kwargs["headers"]["User-Agent"], BtcClient.headers["User-Agent"])
+
+    def test_restarted_page_returns_partial(self):
+        # after_txid not found -> backend restarts from the top; the walk
+        # stops on a page with nothing new and is short of tx_count.
+        page1 = [_tx(f"r{i}", outs=[(ADDR, 1000)]) for i in range(10)]
+        with self._serve(_address(15_000, 15), {None: page1, "r9": page1}) as get:
+            result = BtcClient().get_balance(ADDR)
+        self.assertEqual(result, {"balance": Decimal("0.00015"), "partial": True})
+        self.assertEqual(get.call_count, 3)
+
+    def test_short_history_returns_partial(self):
+        page1 = [_tx(f"r{i}", outs=[(ADDR, 1000)]) for i in range(10)]
+        page2 = [_tx("r10", outs=[(ADDR, 1000)])]
+        with self._serve(_address(12_000, 12), {None: page1, "r9": page2}):
+            result = BtcClient().get_balance(ADDR)
+        self.assertEqual(result, {"balance": Decimal("0.00012"), "partial": True})
+
+    def test_busy_address_returns_partial_without_walking(self):
+        with self._serve(_address(5_000, 201), {}) as get:
+            result = BtcClient().get_balance(ADDR)
+        self.assertEqual(result, {"balance": Decimal("0.00005"), "partial": True})
+        self.assertEqual(get.call_count, 1)
+
+    def test_node_failure_falls_through_to_mempool_space(self):
+        mempool = _response(200, json_body={
+            "chain_stats": {"funded_txo_sum": 300, "spent_txo_sum": 100, "tx_count": 2},
+        })
+        for failure in ("5xx", "exception"):
+            node = _response(503)
+            node.raise_for_status.side_effect = requests.HTTPError("503 Server Error")
+            first = requests.ConnectionError("refused") if failure == "exception" else node
+            with patch("btc.btc_client.requests.get") as get:
+                get.side_effect = [first, mempool]
+                result = BtcClient().get_balance(ADDR)
+            self.assertEqual(get.call_args_list[1].args[0], f"https://mempool.space/api/address/{ADDR}", failure)
+            self.assertEqual(result, {
+                "total_received": Decimal("0.000003"),
+                "total_sent": Decimal("0.000001"),
+                "balance": Decimal("0.000002"),
+                "tx_count": 2,
+            }, failure)
