@@ -26,6 +26,16 @@ WARNING_NUMBERS = [
     "+14169974264",
 ]
 
+# ENVIRONMENT values on Porter, mapped to the network name people recognise.
+NETWORK_LABELS = {
+    "prod": "MAINNET",
+    "testnet": "TESTNET",
+}
+
+
+def network_label():
+    return NETWORK_LABELS.get(settings.ENVIRONMENT, settings.ENVIRONMENT.upper())
+
 
 class Command(BaseCommand):
     def handle(self, *args, **options):
@@ -75,7 +85,7 @@ class Command(BaseCommand):
         print(f"PROBLEM. Last block is {height}")
 
         lines = [
-            "🚨 VFX Issue Detected! 🚨",
+            f"🚨 VFX {network_label()} Issue Detected! 🚨",
             f"It's been {round(delta)} seconds since the last block.",
             f"Man your battle stations.",
         ]
@@ -89,7 +99,7 @@ class Command(BaseCommand):
 
     def handle_exception(self, exception):
         lines = [
-            "⚠️ VFX Issue Detected! ⚠️",
+            f"⚠️ VFX {network_label()} Issue Detected! ⚠️",
             f"Explorer Wallet is Unreachable",
         ]
         body = "\n".join(lines)
@@ -100,9 +110,12 @@ class Command(BaseCommand):
         """Send an alert on every channel; one failing channel never blocks another.
 
         Discord goes first so an SMS outage (e.g. a lapsed Twilio account)
-        can't stop it. SMS failures are logged to Sentry, not raised.
+        can't stop it. SMS failures are logged to Sentry, not raised. Only
+        mainnet pages phones; other networks alert on Discord alone.
         """
-        send_discord_alert(f"[{settings.ENVIRONMENT}] {body}")
+        send_discord_alert(body)
+        if network_label() != "MAINNET":
+            return
         for number in numbers:
             try:
                 send_sms(number, body)

@@ -2237,7 +2237,7 @@ class HealthCheckAlertTests(TestCase):
 
         return Command()
 
-    @override_settings(DISCORD_ALERT_WEBHOOK_URL="https://discord.test/hook", ENVIRONMENT="mainnet")
+    @override_settings(DISCORD_ALERT_WEBHOOK_URL="https://discord.test/hook", ENVIRONMENT="prod")
     def test_stall_alert_reaches_discord_even_when_sms_fails(self):
         with patch("rbx.discord_alerts.requests.post") as post, patch(
             "rbx.management.commands.health_check.send_sms", side_effect=RuntimeError("twilio 401")
@@ -2245,7 +2245,7 @@ class HealthCheckAlertTests(TestCase):
             self._command().handle_problem(7387081, 4000)
         post.assert_called_once()
         content = post.call_args.kwargs["json"]["content"]
-        self.assertTrue(content.startswith("[mainnet] "))
+        self.assertTrue(content.startswith("🚨 VFX MAINNET Issue Detected!"))
         self.assertIn("4000 seconds since the last block", content)
         self.assertEqual(sms.call_count, 2)  # every number is still attempted
 
@@ -2255,10 +2255,12 @@ class HealthCheckAlertTests(TestCase):
             "rbx.management.commands.health_check.send_sms"
         ) as sms:
             self._command().handle_exception(Exception("down"))
-        self.assertIn("Explorer Wallet is Unreachable", post.call_args.kwargs["json"]["content"])
-        sms.assert_called_once()
+        content = post.call_args.kwargs["json"]["content"]
+        self.assertTrue(content.startswith("⚠️ VFX TESTNET Issue Detected!"))
+        self.assertIn("Explorer Wallet is Unreachable", content)
+        sms.assert_not_called()  # only mainnet pages phones
 
-    @override_settings(DISCORD_ALERT_WEBHOOK_URL="")
+    @override_settings(DISCORD_ALERT_WEBHOOK_URL="", ENVIRONMENT="prod")
     def test_no_webhook_means_sms_only(self):
         with patch("rbx.discord_alerts.requests.post") as post, patch(
             "rbx.management.commands.health_check.send_sms"
