@@ -237,21 +237,9 @@ def sync_block(height: int, data: Optional[dict] = None, notify: bool = True) ->
                     to_address, _ = Address.objects.get_or_create(
                         address=tx.to_address
                     )
-                    b = to_address.balance + tx.total_amount
-
-                    # ADNR Transfer In
-                    if (
-                        tx.type == Transaction.Type.ADDRESS
-                        and tx.to_address != "Adnr_Base"
-                    ):
-                        if block.height > 832000 or settings.ENVIRONMENT == "testnet":
-                            b -= Decimal(5.0)
-                        else:
-                            b -= Decimal(1.0)
-
-                    to_address.balance = b
-
-                    to_address.save()
+                    if tx.type in Transaction.RECIPIENT_CREDIT_TYPES:
+                        to_address.balance = to_address.balance + tx.total_amount
+                        to_address.save()
 
                     if (
                         tx.from_address != "Coinbase_TrxFees"
@@ -319,8 +307,9 @@ def resync_balances() -> None:
     with tqdm(total=len(transactions), desc="Processing Tx") as progress:
         for tx in transactions:
             to_address, _ = Address.objects.get_or_create(address=tx.to_address)
-            to_address.balance = to_address.balance + tx.total_amount
-            to_address.save()
+            if tx.type in Transaction.RECIPIENT_CREDIT_TYPES:
+                to_address.balance = to_address.balance + tx.total_amount
+                to_address.save()
 
             if (
                 tx.from_address != "Coinbase_TrxFees"

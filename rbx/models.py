@@ -192,6 +192,10 @@ class Transaction(models.Model):
         VBTC_BRIDGE_EXIT_TO_BTC_COMPLETE = 41
         VBTC_BRIDGE_EXIT_TO_BTC_FAIL = 42
 
+    # The types whose Amount Core credits to the recipient (StateData for TX, PrivateTxLedgerService for a VFX
+    # unshield). Every other type's Amount leaves the sender and is credited to no one.
+    RECIPIENT_CREDIT_TYPES = (Type.TX, Type.VFX_UNSHIELD)
+
     hash = models.CharField(_("Hash"), primary_key=True, max_length=255, db_index=True)
     block = models.ForeignKey(
         Block,
@@ -516,7 +520,7 @@ class Address(models.Model):
                     )
                 )
             )
-            .exclude(type=Transaction.Type.NFT_SALE)
+            .filter(type__in=Transaction.RECIPIENT_CREDIT_TYPES)
             .aggregate(Sum("total_amount"))
         )
         inbound_locked_amount = inbound_locked["total_amount__sum"] or Decimal(0)
@@ -554,7 +558,7 @@ class Address(models.Model):
 
         inbound = (
             Transaction.objects.filter(to_address=address)
-            .exclude(type=Transaction.Type.NFT_SALE)
+            .filter(type__in=Transaction.RECIPIENT_CREDIT_TYPES)
             .aggregate(Sum("total_amount"))
         )
 
@@ -569,17 +573,6 @@ class Address(models.Model):
         outbound_amount = (outbound["total_amount__sum"] or Decimal(0)) + (
             outbound["total_fee__sum"] or Decimal(0)
         )
-
-        if settings.ENVIRONMENT == "testnet":
-            adnrs_in_1rbx = 0
-        else:
-            adnrs_in_1rbx = Transaction.objects.filter(
-                to_address=address, type=Transaction.Type.ADDRESS, height__lte=832000
-            ).count()
-
-        adnrs_in_5rbx = Transaction.objects.filter(
-            to_address=address, type=Transaction.Type.ADDRESS, height__gt=832000
-        ).count()
 
         nft_sales = Transaction.objects.filter(
             Q(Q(to_address=address) | Q(from_address=address))
@@ -637,8 +630,6 @@ class Address(models.Model):
         available_balance = (
             (inbound_amount or Decimal(0))
             - (outbound_amount or Decimal(0))
-            - Decimal(adnrs_in_1rbx)
-            - Decimal(adnrs_in_5rbx * 5)
             + sales_balance_diff
             + callbacks_from_amount
             - callbacks_to_amount
