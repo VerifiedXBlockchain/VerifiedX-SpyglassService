@@ -823,7 +823,9 @@ def process_transaction(tx: Transaction):
             a = Address(address=original_address)
             existing_balance, _, _ = a.get_balance()
 
-            Address.objects.create(address=new_address)
+            # The recovery address may already be on record (any earlier transaction to or from it); a plain create
+            # raised, and the block sync skipped the whole recovery.
+            Address.objects.get_or_create(address=new_address)
 
             outstanding_transactions = Transaction.objects.filter(
                 Q(

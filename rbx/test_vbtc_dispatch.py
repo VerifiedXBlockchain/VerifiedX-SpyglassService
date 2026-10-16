@@ -10,7 +10,7 @@ from django.test import TestCase, override_settings
 from django.utils import timezone
 
 from api.btc.views import _mark_withdrawal_signed
-from rbx.models import Transaction, VbtcV2TokenTransfer, VbtcV2WithdrawalRequest
+from rbx.models import Address, Recovery, Transaction, VbtcV2TokenTransfer, VbtcV2WithdrawalRequest
 from rbx.tasks import process_transaction
 from rbx.tests import add_transfer, add_withdrawal, make_block, make_token, make_tx
 from rbx.vbtc_dispatch import (
@@ -570,6 +570,17 @@ class ReserveTransferTests(TestCase):
         )
         process_transaction(recovery)
         self.tx.refresh_from_db()
+
+    def test_recovery_to_an_address_already_on_record_is_still_indexed(self):
+        # The recovery address has been seen before (an earlier deposit to it).
+        Address.objects.create(address="Recovered")
+
+        self.recover()
+
+        recovery = Recovery.objects.get(transaction__hash="rc1")
+        self.assertEqual(recovery.new_address, "Recovered")
+        self.assertEqual(self.token.addresses["Recovered"], Decimal("0.002"))
+        self.assertEqual(Address.objects.filter(address="Recovered").count(), 1)
 
     def test_recovery_transaction_routes_to_the_redirect(self):
         self.recover()
