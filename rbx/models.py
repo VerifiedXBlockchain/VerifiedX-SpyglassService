@@ -616,9 +616,9 @@ class Address(models.Model):
 
         callbacks_from_amount = callbacks_from["amount__sum"] or Decimal(0)
 
-        callbacks_to = Callback.objects.filter(to_address=address).aggregate(
-            Sum("amount")
-        )
+        callbacks_to = Callback.objects.filter(
+            to_address=address, recipient_keeps=False
+        ).aggregate(Sum("amount"))
 
         callbacks_to_amount = callbacks_to["amount__sum"] or Decimal(0)
 
@@ -863,6 +863,9 @@ class Callback(models.Model):
     )
 
     from_recovery = models.BooleanField(default=False)
+    # A listed historical reversal (rbx.historical_reserve_reversals): the sender is credited and the recipient keeps
+    # the transfer, as Core applied it.
+    recipient_keeps = models.BooleanField(default=False)
 
     def __str__(self):
         return f"{self.amount} ({self.from_address} <- {self.to_address})"

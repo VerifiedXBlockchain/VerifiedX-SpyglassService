@@ -23,7 +23,7 @@ from rbx.chain_contract import smart_contract_from_chain
 from rbx.client import get_master_nodes, get_block, get_nft, get_topics
 from shop.media import scp_down_folder, upload_to_s3
 from rbx.exceptions import RBXException
-from rbx import vbtc_dispatch
+from rbx import historical_reserve_reversals, vbtc_dispatch
 from rbx.models import (
     FungibleToken,
     FungibleTokenTx,
@@ -778,6 +778,7 @@ def process_transaction(tx: Transaction):
     elif tx.type == Transaction.Type.RESERVE:
         parsed = json.loads(tx.data)
         func = parsed["Function"]
+        recipient_keeps = historical_reserve_reversals.recipient_keeps_transfer(tx)
         if func == "CallBack()":
             original_tx_hash = parsed["Hash"]
             try:
@@ -794,10 +795,12 @@ def process_transaction(tx: Transaction):
                         "amount": original_tx.total_amount,
                         "to_address": original_tx.to_address,
                         "from_address": original_tx.from_address,
+                        "recipient_keeps": recipient_keeps,
                     },
                 )
-                original_tx.voided_from_callback = True
-                original_tx.save()
+                if not recipient_keeps:
+                    original_tx.voided_from_callback = True
+                    original_tx.save()
 
             elif original_tx.type == Transaction.Type.VBTC_V2_TRANSFER:
                 vbtc_dispatch.void_reserve_transfer(original_tx)
@@ -852,11 +855,13 @@ def process_transaction(tx: Transaction):
                         to_address=transaction.to_address,
                         from_address=new_address,
                         from_recovery=True,
+                        recipient_keeps=recipient_keeps,
                     )
                     callback.save()
 
-                    transaction.voided_from_callback = True
-                    transaction.save()
+                    if not recipient_keeps:
+                        transaction.voided_from_callback = True
+                        transaction.save()
 
                 elif transaction.type == Transaction.Type.VBTC_V2_TRANSFER:
                     vbtc_dispatch.redirect_reserve_transfer(
