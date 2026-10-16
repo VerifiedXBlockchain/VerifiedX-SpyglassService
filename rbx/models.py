@@ -14,6 +14,7 @@ import uuid
 from phonenumber_field.modelfields import PhoneNumberField
 from django.contrib.postgres.fields import ArrayField
 from rbx.vbtc_gates import escrow_applies
+from rbx import forged_vfx_burn
 
 # class MasterNodeManager(models.Manager):
 #     def get_queryset(self):
@@ -635,6 +636,7 @@ class Address(models.Model):
             - callbacks_to_amount
             + recoveries_inbound_amount
             - recoveries_outbound_amount
+            - forged_vfx_burn.burned_from(address)
             - (total_locked if not address.startswith("xRBX") else 0)
         )
 
@@ -860,6 +862,14 @@ class Callback(models.Model):
 
     def __str__(self):
         return f"{self.amount} ({self.from_address} <- {self.to_address})"
+
+
+class ForgedVfxBurn(models.Model):
+    """The forged VFX Core burned from an address at the burn block (rbx.forged_vfx_burn); one row per address."""
+
+    address = models.CharField(max_length=64, unique=True)
+    height = models.IntegerField()
+    amount = models.DecimalField(decimal_places=16, max_digits=32)
 
 
 class Recovery(models.Model):

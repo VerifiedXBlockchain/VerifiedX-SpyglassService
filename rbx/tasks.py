@@ -23,7 +23,7 @@ from rbx.chain_contract import smart_contract_from_chain
 from rbx.client import get_master_nodes, get_block, get_nft, get_topics
 from shop.media import scp_down_folder, upload_to_s3
 from rbx.exceptions import RBXException
-from rbx import historical_reserve_reversals, vbtc_dispatch
+from rbx import forged_vfx_burn, historical_reserve_reversals, vbtc_dispatch
 from rbx.models import (
     FungibleToken,
     FungibleTokenTx,
@@ -198,6 +198,9 @@ def sync_block(height: int, data: Optional[dict] = None, notify: bool = True) ->
             block.master_node = master_node
             block.save()
 
+        # Core burns the forged VFX before the burn block's transactions apply.
+        forged_vfx_burn.apply_at(height)
+
         for transaction in data["Transactions"]:
             if transaction.get("TransactionStatus") == 999:
                 continue
@@ -322,6 +325,14 @@ def resync_balances() -> None:
                 from_address.save()
 
             progress.update()
+
+    # The forged-VFX burn has no transaction; take the recorded amounts off again.
+    from rbx.models import ForgedVfxBurn
+
+    for burn in ForgedVfxBurn.objects.all():
+        row, _ = Address.objects.get_or_create(address=burn.address)
+        row.balance = row.balance - burn.amount
+        row.save()
 
 
 # @app.task(autoretry_for=[RBXException])
@@ -1313,7 +1324,7 @@ def sync_circulation():
     stake = active_master_nodes * 5000
     total_addresses = Address.objects.all().count()
 
-    total_burned = fees + adnr_burned_sum + dst_burned_sum + vault_burned_sum
+    total_burned = fees + adnr_burned_sum + dst_burned_sum + vault_burned_sum + forged_vfx_burn.total_burned()
 
     circulating_supply = Decimal(200000000) - total_burned
     lifetime_supply = Decimal(200000000) - total_burned
