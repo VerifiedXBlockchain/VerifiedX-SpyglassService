@@ -1271,6 +1271,44 @@ def _latest_rewind_height():
     )
 
 
+# A rewind is held this many indexed blocks without a pass that succeeded
+# for every vault and exit before it is logged as an error: deeper than the
+# chain's reorganisations, so a report that is still to come has come by
+# then, and what is left is a fork or a node fault for an operator.
+REWIND_HOLD_ALERT_BLOCKS = 20
+
+
+def rewind_hold():
+    """The rewind Spyglass is still holding for, or None: the latest
+    rewind block, the latest one reconciled, and how many indexed blocks
+    have passed since the rewind."""
+    latest = _latest_rewind_height()
+    mark = VbtcV2RewindMark.objects.first()
+    reconciled = mark.reconciled_height if mark else 0
+    if latest <= reconciled:
+        return None
+    indexed = Block.objects.aggregate(h=Max("height"))["h"] or latest
+    return {
+        "rewind_height": latest,
+        "reconciled_height": reconciled,
+        "blocks_held": max(0, indexed - latest),
+    }
+
+
+def _report_long_hold(mark):
+    hold = rewind_hold()
+    if hold is None or hold["blocks_held"] < REWIND_HOLD_ALERT_BLOCKS:
+        return
+    if mark.alerted_height >= hold["rewind_height"]:
+        return
+    logging.error(
+        f"vBTC V2 rewind at block {hold['rewind_height']} is still not reconciled after "
+        f"{hold['blocks_held']} blocks: a paid row the node lists again waits for a report "
+        f"that is not indexed, or the node does not answer"
+    )
+    VbtcV2RewindMark.objects.filter(pk=mark.pk).update(alerted_height=hold["rewind_height"])
+
+
 def reconcile_all_watched_vaults(after_rewind=False):
     """Every watched vault with an open request (and, after a Bitcoin
     rewind, with a completed one). A rewind is read on every pass, the
@@ -1311,6 +1349,8 @@ def reconcile_all_watched_vaults(after_rewind=False):
         ok = False
     if after_rewind and ok and latest > mark.reconciled_height:
         VbtcV2RewindMark.objects.filter(pk=mark.pk).update(reconciled_height=latest)
+    elif latest > mark.reconciled_height:
+        _report_long_hold(mark)
     return settled
 
 

@@ -10,6 +10,7 @@ from unittest.mock import patch
 import requests
 from django.core.management import call_command
 from django.test import TestCase, TransactionTestCase, override_settings
+from django.utils import timezone
 
 from rbx.models import Block, Transaction, VbtcV2BridgeExit, VbtcV2BridgeLock, VbtcV2WithdrawalRequest
 from rbx.tasks import process_transaction, sync_block
@@ -927,6 +928,54 @@ class RewindRetryTests(RewindTests):
         self.token.recompute_pending_withdrawal(current_height=10 + WITHDRAWAL_EXPIRY_BLOCKS + 100)
         self.token.refresh_from_db()
         self.assertTrue(self.token.is_pending_withdrawal)
+
+    # A rewind listing a payment whose report never comes (a fork, a node fault).
+    NEVER_INDEXED = {"RequestHash": "r1", "CompletionHash": "t999-0", "BTCTransactionHash": "T2"}
+
+    def test_a_hold_past_the_alert_depth_is_logged_once(self):
+        from rbx.vbtc_dispatch import REWIND_HOLD_ALERT_BLOCKS
+
+        held = history(paid=[self.NEVER_INDEXED])
+        self.sync(70, [T.VBTC_V2_BTC_REORG], held)
+        with self.assertNoLogs("root", level="ERROR"):
+            for height in range(71, 70 + REWIND_HOLD_ALERT_BLOCKS):
+                self.sync(height, [T.VBTC_V2_BTC_REPORT], held)
+        with self.assertLogs("root", level="ERROR") as logs:
+            self.sync(70 + REWIND_HOLD_ALERT_BLOCKS, [T.VBTC_V2_BTC_REPORT], held)
+        self.assertEqual(len([r for r in logs.records if r.levelname == "ERROR"]), 1)
+        self.assertIn("rewind at block 70", logs.output[-1])
+        with self.assertNoLogs("root", level="ERROR"):
+            self.sync(71 + REWIND_HOLD_ALERT_BLOCKS, [T.VBTC_V2_BTC_REPORT], held)
+
+    def test_a_later_rewind_held_as_long_is_logged_again(self):
+        from rbx.vbtc_dispatch import REWIND_HOLD_ALERT_BLOCKS
+
+        held = history(paid=[self.NEVER_INDEXED])
+        self.sync(70, [T.VBTC_V2_BTC_REORG], held)
+        with self.assertLogs("root", level="ERROR"):
+            self.sync(70 + REWIND_HOLD_ALERT_BLOCKS, [T.VBTC_V2_BTC_REPORT], held)
+        self.sync(100, [T.VBTC_V2_BTC_REORG], held)
+        with self.assertLogs("root", level="ERROR") as logs:
+            self.sync(100 + REWIND_HOLD_ALERT_BLOCKS, [T.VBTC_V2_BTC_REPORT], held)
+        self.assertIn("rewind at block 100", logs.output[-1])
+
+    def test_the_hold_is_served_with_the_network_metrics(self):
+        from rest_framework.test import APIClient
+
+        from rbx.models import NetworkMetrics
+
+        def metrics():
+            with patch("api.views.NetworkMetrics.load", return_value=NetworkMetrics(created_at=timezone.now())), \
+                    patch("api.views.sync_network_metrics"):
+                return APIClient().get("/api/network-metrics/").json()["vbtc_v2_rewind_hold"]
+
+        self.assertIsNone(metrics())
+        held = history(paid=[self.NEVER_INDEXED])
+        self.sync(70, [T.VBTC_V2_BTC_REORG], held)
+        self.sync(73, [T.VBTC_V2_BTC_REPORT], held)
+        self.assertEqual(metrics(), {"rewind_height": 70, "reconciled_height": 0, "blocks_held": 3})
+        self.sync(74, [T.VBTC_V2_BTC_REPORT], history(paid=[self.PAID]))
+        self.assertIsNone(metrics())
 
 
 @override_settings(VBTC_NETWORK="testnet", VBTC_FUND_LOSS_AUDIT_HEIGHT=1000)

@@ -1707,6 +1707,9 @@ class VbtcV2RewindMark(models.Model):
     longer lists as paid."""
 
     reconciled_height = models.BigIntegerField(default=0)
+    # The rewind height whose long hold has been logged as an error, so it
+    # is logged once (vbtc_dispatch.REWIND_HOLD_ALERT_BLOCKS).
+    alerted_height = models.BigIntegerField(default=0)
 
 
 class VbtcV2BridgeLock(models.Model):
