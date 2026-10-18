@@ -85,7 +85,9 @@ class WatchedSettlementTests(WatchedVaultCase):
         self.assertEqual(row.cancelled_at, closing.date_crafted)
         self.assertEqual(self.addresses()["U"], Decimal("0.004"))
 
-    def test_iv_a_handover_since_the_owners_request_is_planned_again(self):
+    def test_iv_a_refund_after_the_owners_handover_is_the_former_owners(self):
+        # The owner's escrow moved to P at the handover (CarryOwnerPosition,
+        # StateData.cs:2266); the refund is O's to keep.
         own = request_tx(make_block(height=11), "r2", "O", "sc:w", 0.002)
         process_transaction(own)
         process_transaction(make_tx(make_block(height=12), "ot1", T.TKNZ_TX, from_address="O", to_address="P",
@@ -94,8 +96,8 @@ class WatchedSettlementTests(WatchedVaultCase):
         self.reconcile(history(refunded=[{"RequestHash": "r2", "Amount": 0.002, "Refunded": 0.002,
                                           "Outcome": "Expired", "ClosedAtBlock": 30}]))
         addresses = self.addresses()
-        self.assertNotIn("O", addresses)
-        self.assertEqual(addresses["P"], Decimal("0.006"))
+        self.assertEqual(addresses["O"], Decimal("0.002"))
+        self.assertEqual(addresses["P"], Decimal("0.004"))
 
     def test_v_a_release_keeps_its_bitcoin_fee_on_the_requestor(self):
         make_block(height=30)

@@ -1464,6 +1464,7 @@ class VbtcV2Token(models.Model):
                 pending += w.amount
             elif (
                 before is not None
+                and not self.is_watched
                 and w.refunded_after(before)
                 and self.owner_before(w.request_transaction) == address
             ):
@@ -1473,6 +1474,10 @@ class VbtcV2Token(models.Model):
                 # owner's balance is the backing less every other holder's
                 # entry. The handover settles as if it had never been placed,
                 # less a release's Bitcoin fee, which stays the requestor's.
+                # On a vault the chain watches the outgoing owner's position
+                # moves to the incoming owner at the handover
+                # (CarryOwnerPosition), and the refund is the requestor's to
+                # keep: the settlement stands as planned at the handover.
                 pending -= w.amount - w.release_fee
         return self.ledger_entries(before).get(address, Decimal(0)) - pending
 

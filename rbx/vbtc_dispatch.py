@@ -1353,11 +1353,31 @@ def _settle(withdrawal, result):
 def _replan_settlements_since(token, request_tx):
     """A refund changes what a handover since the request had to settle
     (VbtcV2Token.settlement_amount_for), and each handover's row feeds the
-    next one's, so every one since is planned again, in order."""
-    for tx in token.ownership_transfers(since_height=request_tx.height):
-        if tx.pk == request_tx.pk:
-            continue
-        _write_settlement(token, tx, planned_settlement(token, tx), "V2 ownership transfer")
+    next one's, so every one since is planned again, in order: each
+    Transfer() and each Recover() that gave the contract to the recovery
+    address."""
+    handovers = [
+        (tx, None, None) for tx in token.ownership_transfers(since_height=request_tx.height) if tx.pk != request_tx.pk
+    ]
+    for tx in _recoveries_of(token, since_height=request_tx.height):
+        handovers.append((tx, tx.from_address, recovery_address_of(tx)))
+    for tx, old_owner, new_owner in sorted(handovers, key=lambda h: (h[0].height, h[0].hash)):
+        what = "Recover()" if old_owner else "V2 ownership transfer"
+        _write_settlement(token, tx, planned_settlement(token, tx, old_owner=old_owner, new_owner=new_owner), what)
+
+
+def _recoveries_of(token, since_height):
+    """The Recover()s from since_height on that gave token to their recovery
+    address: those of the reserve that owned it then (apply_recovery)."""
+    found = []
+    candidates = Transaction.objects.filter(
+        type=Transaction.Type.RESERVE, height__gte=since_height, from_address__startswith=RESERVE_ADDRESS_PREFIX
+    ).order_by("height", "hash")
+    for tx in candidates:
+        recovery_address = recovery_address_of(tx)
+        if recovery_address and recovery_address != tx.from_address and token.owner_before(tx) == tx.from_address:
+            found.append(tx)
+    return found
 
 
 def cancellation_uid_for(withdrawal):

@@ -343,3 +343,116 @@ class LegacyVoteRefundAfterHandoverTests(RefundAfterHandoverTests):
         self.assertEqual(self.token.addresses, {"O": Decimal("0.01")})
         self.hand_over(1900, "ot1", "O", "P")
         self.assertEqual(self.token.addresses, {"P": Decimal("0.01")})
+
+
+@RULES
+class RecoveryThenRefundTests(TestCase):
+    """A reserve owns the vault, escrows a withdrawal as owner, is recovered
+    to Y, and a vote then refunds the escrow. On a legacy vault the node
+    carries nothing at the recovery: the refund cancels the reserve's debit
+    and Y, as owner, shows the whole backing. On a vault the chain watches
+    the reserve's position moved to Y at the recovery (CarryOwnerPosition,
+    StateData.cs:1693), so the refund is the reserve's to keep."""
+
+    RESERVE = "xRBXres"
+
+    def setUp(self):
+        self.token = make_token(owner=self.RESERVE, global_balance="0.01", sc_identifier="sc:a")
+        self.token.validator_snapshot = ["V1", "V2", "V3", "V4"]
+        self.token.save(update_fields=["validator_snapshot"])
+        for v in ("V1", "V2", "V3", "V4"):
+            lifecycle_tx(1990, f"h-{v}", v)
+        process_transaction(request_tx(block_at(1500), "r1", self.RESERVE, "sc:a", 0.003))
+
+    def recover(self):
+        process_transaction(make_tx(
+            block_at(1600), "rc1", Transaction.Type.RESERVE, from_address=self.RESERVE,
+            data={"Function": "Recover()", "RecoveryAddress": "Y"},
+        ))
+        self.token.refresh_from_db()
+
+    def refund(self):
+        process_transaction(cancel_tx(block_at(2001), "x1", self.RESERVE, "sc:a", "r1"))
+        for i, v in enumerate(("V1", "V2", "V3")):
+            process_transaction(vote_tx(block_at(2002), f"v{i}", v, "CANCEL_x1"))
+        self.assertEqual(
+            VbtcV2WithdrawalRequest.objects.get(request_transaction__hash="r1").status, Status.CANCELLED
+        )
+        self.token.refresh_from_db()
+
+    def test_on_a_legacy_vault_the_refund_leaves_the_reserve_at_zero(self):
+        self.recover()
+        self.assertEqual(self.token.owner_address, "Y")
+        self.assertEqual(self.token.addresses, {"Y": Decimal("0.007")})
+        self.refund()
+        self.assertEqual(self.token.addresses, {"Y": Decimal("0.01")})
+        self.assertFalse(Transaction.objects.get(hash="rc1").vbtcv2tokentransfer_set.exists())
+
+    def test_on_a_legacy_vault_a_transfer_after_the_recovery_is_planned_again_too(self):
+        self.recover()
+        process_transaction(make_tx(
+            block_at(1700), "ot1", Transaction.Type.TKNZ_TX, from_address="Y", to_address="Z",
+            data={"Function": "Transfer()", "ContractUID": "sc:a"},
+        ))
+        self.refund()
+        self.assertEqual(self.token.addresses, {"Z": Decimal("0.01")})
+
+    def test_on_a_legacy_vault_the_backfill_plans_the_recovery_without_the_refunded_escrow(self):
+        self.recover()
+        self.refund()
+        call_command("reprocess_vbtc_v2", stdout=StringIO())
+        self.token.refresh_from_db()
+        self.assertEqual(self.token.addresses, {"Y": Decimal("0.01")})
+
+    def watch(self):
+        mint = make_tx(block_at(5), "mint", Transaction.Type.VBTC_V2_MINT, from_address=self.RESERVE)
+        self.token.nft.mint_transaction = mint
+        self.token.nft.save(update_fields=["mint_transaction"])
+        self.assertTrue(self.token.is_watched)
+
+    @override_settings(VBTC_FUND_LOSS_AUDIT_HEIGHT=1)
+    def test_on_a_watched_vault_the_carried_escrow_stays_with_the_recovery_address(self):
+        self.watch()
+        self.recover()
+        self.assertEqual(self.token.addresses, {"Y": Decimal("0.007")})
+        process_transaction(cancel_tx(block_at(2001), "x1", self.RESERVE, "sc:a", "r1"))
+        self.token.refresh_from_db()
+        self.assertEqual(
+            VbtcV2WithdrawalRequest.objects.get(request_transaction__hash="r1").status, Status.CANCELLED
+        )
+        self.assertEqual(self.token.addresses, {self.RESERVE: Decimal("0.003"), "Y": Decimal("0.007")})
+
+
+@RULES
+@override_settings(VBTC_FUND_LOSS_AUDIT_HEIGHT=1)
+class WatchedRefundAfterHandoverTests(TestCase):
+    """The owner escrows, hands the watched vault on, and the request is then
+    cancelled: the owner's position moved to the new owner at the handover
+    (CarryOwnerPosition, StateData.cs:1126), so the refund is the former
+    owner's to keep and the handover's settlement stands."""
+
+    def setUp(self):
+        self.token = make_token(owner="O", global_balance="0.01", sc_identifier="sc:a")
+        mint = make_tx(block_at(5), "mint", Transaction.Type.VBTC_V2_MINT, from_address="O")
+        self.token.nft.mint_transaction = mint
+        self.token.nft.save(update_fields=["mint_transaction"])
+        process_transaction(request_tx(block_at(1500), "r1", "O", "sc:a", 0.003))
+        process_transaction(make_tx(
+            block_at(1600), "ot1", Transaction.Type.TKNZ_TX, from_address="O", to_address="P",
+            data={"Function": "Transfer()", "ContractUID": "sc:a"},
+        ))
+        self.token.refresh_from_db()
+
+    def test_the_refund_stays_with_the_former_owner(self):
+        self.assertEqual(self.token.addresses, {"P": Decimal("0.007")})
+        process_transaction(cancel_tx(block_at(2001), "x1", "O", "sc:a", "r1"))
+        self.token.refresh_from_db()
+        self.assertEqual(self.token.addresses, {"O": Decimal("0.003"), "P": Decimal("0.007")})
+        row = Transaction.objects.get(hash="ot1").vbtcv2tokentransfer_set.get()
+        self.assertEqual((row.from_address, row.to_address, row.amount), ("P", "O", Decimal("0.003")))
+
+    def test_the_backfill_plans_the_same(self):
+        process_transaction(cancel_tx(block_at(2001), "x1", "O", "sc:a", "r1"))
+        call_command("reprocess_vbtc_v2", stdout=StringIO())
+        self.token.refresh_from_db()
+        self.assertEqual(self.token.addresses, {"O": Decimal("0.003"), "P": Decimal("0.007")})
