@@ -13,8 +13,7 @@ from decimal import Decimal
 from typing import Optional
 import pytz
 from django.db import InterfaceError, InternalError, OperationalError
-from django.db.models import Q, Sum, F, Max, TextField
-from django.db.models.functions import Cast
+from django.db.models import Q, Sum, F, Max
 from django.db.transaction import atomic as atomic_transaction, on_commit
 from django.utils import timezone
 from api.block.serializers import BlockSerializer
@@ -513,19 +512,15 @@ def token_function_of(tx: Transaction):
 
 
 def pause_calls_through(token, tx):
-    """The TokenPause() calls the node applied to token up to tx, tx
-    included: object payloads under a contract-call type, in block order
-    (by hash inside a block, as no order is stored)."""
-    candidates = (
-        Transaction.objects.filter(type__in=list(vbtc_dispatch.SC_ENVELOPE_TYPES), height__lte=tx.height)
-        .annotate(data_text=Cast("data", TextField()))
-        .filter(data_text__contains=token.sc_identifier)
-        .filter(data_text__contains="TokenPause()")
-    )
+    """The TokenPause() calls the node applied to token in blocks up to tx's,
+    tx's whole block included: object payloads under a contract-call type.
+    Inside a block no order is stored, so the state is right once the block
+    has been processed (each call of the block counts them all)."""
     count = 0
-    for call in candidates.only("hash", "height", "data"):
-        if (call.height, call.hash) > (tx.height, tx.hash):
-            continue
+    candidates = Transaction.objects.filter(
+        type__in=list(vbtc_dispatch.SC_ENVELOPE_TYPES), height__lte=tx.height
+    ).only("data")
+    for call in candidates.iterator():
         payload = parse_object(call.data)
         if (
             net_string(field(payload, "Function")) == "TokenPause()"

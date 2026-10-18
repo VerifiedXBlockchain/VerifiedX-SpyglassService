@@ -162,3 +162,22 @@ class TokenPauseTests(TokenFunctionCase):
         call_command("reindex_token_functions", stdout=StringIO(), stderr=StringIO())
         self.token.refresh_from_db()
         self.assertTrue(self.token.is_paused)
+
+    def test_two_calls_in_one_block_leave_the_token_unpaused(self):
+        block = make_block(height=9)
+        calls = []
+        for tx_hash in ("pz", "pa"):
+            calls.append(make_tx(block, tx_hash, T.SC_TX, from_address="O",
+                                 data={"Function": "TokenPause()", "ContractUID": "ft:1", "FromAddress": "O", "Pause": True}))
+        for call in calls:
+            process_transaction(call)
+        self.token.refresh_from_db()
+        self.assertFalse(self.token.is_paused)
+
+    def test_an_escaped_payload_counts(self):
+        tx = make_tx(make_block(height=9), "pe", T.SC_TX, from_address="O")
+        tx.data = '{"Function": "Token\\u0050ause()", "ContractUID": "ft:1", "FromAddress": "O", "Pause": true}'
+        tx.save(update_fields=["data"])
+        process_transaction(tx)
+        self.token.refresh_from_db()
+        self.assertTrue(self.token.is_paused)
