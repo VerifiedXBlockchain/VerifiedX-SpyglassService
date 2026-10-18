@@ -283,9 +283,12 @@ def sync_block(height: int, data: Optional[dict] = None, notify: bool = True) ->
         rewound = any(t.get("TransactionType") == Transaction.Type.VBTC_V2_BTC_REORG for t in data["Transactions"])
         try:
             vbtc_dispatch.reconcile_all_watched_vaults(after_rewind=rewound)
-            vbtc_dispatch.refresh_all_watched_backings()
         except Exception:
             logging.exception(f"Reading the watched vaults' outcomes after block {height} failed")
+        try:
+            vbtc_dispatch.refresh_all_watched_backings()
+        except Exception:
+            logging.exception(f"Reading the watched vaults' backing after block {height} failed")
 
     if block_created and notify:
         b = None
@@ -855,7 +858,11 @@ def process_transaction(tx: Transaction):
                         v2_token.name = nft.name
                         v2_token.description = nft.description
                         v2_token.image_base64 = v2_info.get("ImageBase", "default")
-                        v2_token.deposit_address = v2_info["DepositAddress"]
+                        # A watched vault's current address comes from the
+                        # chain (a rekey moves it); a reprocessed mint must
+                        # not put the mint-time one back.
+                        if is_new_v2_token or not v2_token.is_watched:
+                            v2_token.deposit_address = v2_info["DepositAddress"]
                         v2_token.frost_group_public_key = v2_info.get("FrostGroupPublicKey", "")
                         v2_token.dkg_proof = v2_info.get("DKGProof", "")
                         v2_token.validator_snapshot = v2_info.get(

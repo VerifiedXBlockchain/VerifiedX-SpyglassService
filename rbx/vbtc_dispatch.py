@@ -1145,6 +1145,8 @@ def refresh_watched_backing(token):
     if not isinstance(held, int) or isinstance(held, bool) or not isinstance(address, str) or not address:
         logging.error(f"Watched vault {token.sc_identifier}: the node's Bitcoin view has no HeldSats or DepositAddress.")
         return None
+    # total_received, total_sent and tx_count are the providers' and are
+    # not kept for a watched vault (see VbtcV2TokenSerializer).
     VbtcV2Token.objects.filter(pk=token.pk).update(
         global_balance=Decimal(held) / Decimal(100_000_000), deposit_address=address
     )

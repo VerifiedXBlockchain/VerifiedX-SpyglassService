@@ -125,6 +125,9 @@ class VbtcV2TokenSerializer(serializers.ModelSerializer):
             "required_threshold",
             "proof_block_height",
             "global_balance",
+            # From the Bitcoin providers at the deposit address: kept up to
+            # date for vaults the chain does not watch only. A watched vault's
+            # backing is global_balance, read from the chain.
             "total_received",
             "total_sent",
             "tx_count",

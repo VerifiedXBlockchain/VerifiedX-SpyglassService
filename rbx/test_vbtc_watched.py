@@ -360,8 +360,13 @@ class WatchedBackingTests(WatchedVaultCase):
 
     def test_a_rekey_sweep_keeps_every_holders_figure(self):
         before = self.addresses()
+        # What a provider shows at the old key's address after the sweep.
+        self.token.global_balance = Decimal(0)
+        self.token.save(update_fields=["global_balance"])
         self.refresh(self.status(held_sats=1000000, address="bc1second-key"))
         self.assertEqual(self.addresses(), before)
+        self.assertEqual(self.token.deposit_address, "bc1second-key")
+
 
     def test_a_vault_core_does_not_watch_uses_the_providers(self):
         client = self.refresh(self.status(attested=False))
@@ -519,3 +524,35 @@ class ReconcileAfterCommitTests(TransactionTestCase):
                 patch("rbx.vbtc_dispatch.refresh_all_watched_backings"):
             sync_block(80, data=data, notify=False)
         self.assertEqual(seen, [(False, True)])
+
+
+class MintReprocessAddressTests(TestCase):
+    """A reprocessed mint must not put a watched vault's mint-time deposit
+    address back over the current key's."""
+
+    MINT_DATA = [{"Function": "Mint()", "ContractUID": "sc:mint"}]
+    PAYLOAD = {"SmartContractMain": {
+        "Name": "t", "Description": "", "MinterName": "m", "IsPublished": True,
+        "SmartContractAsset": {"Name": "a", "FileSize": 0},
+        "Features": [{"FeatureName": 14, "FeatureFeatures": {"DepositAddress": "bc1mint", "ValidatorAddressesSnapshot": ["V1"]}}],
+    }}
+
+    def reprocess(self):
+        from rbx.models import VbtcV2Token
+
+        tx = make_tx(make_block(height=5), "mint1", T.VBTC_V2_MINT, from_address="O", data=self.MINT_DATA)
+        with patch("rbx.tasks.get_nft", return_value=self.PAYLOAD):
+            process_transaction(tx)
+            VbtcV2Token.objects.filter(sc_identifier="sc:mint").update(deposit_address="bc1second-key")
+            process_transaction(tx)
+        return VbtcV2Token.objects.get(sc_identifier="sc:mint")
+
+    @WATCHING
+    def test_a_watched_vault_keeps_its_current_address(self):
+        token = self.reprocess()
+        self.assertTrue(token.is_watched)
+        self.assertEqual(token.deposit_address, "bc1second-key")
+
+    @override_settings(VBTC_NETWORK="testnet", VBTC_FUND_LOSS_AUDIT_HEIGHT=1000)
+    def test_a_legacy_vault_takes_the_mint_address_as_before(self):
+        self.assertEqual(self.reprocess().deposit_address, "bc1mint")
