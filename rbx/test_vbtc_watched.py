@@ -302,3 +302,92 @@ class LegacyExitTests(WatchedExitTests):
     test_an_exit_expired_by_rule_gives_its_locks_back = None
     test_a_voided_part_takes_its_locks_out_of_use_once = None
     test_a_node_that_does_not_answer_changes_nothing = None
+
+
+@WATCHING
+class WatchedBackingTests(WatchedVaultCase):
+    """A watched vault's backing is the chain's (Bitcoin.HeldSats) and its
+    deposit address the current key's, from GetWithdrawalStatus."""
+
+    def status(self, held_sats=1000000, address="bc1new", attested=True):
+        return {"Success": True, "Attested": attested,
+                "Bitcoin": {"HeldSats": held_sats, "DepositAddress": address}}
+
+    def refresh(self, status, provider_balance="0.5"):
+        from unittest.mock import MagicMock
+
+        from rbx.vbtc_dispatch import refresh_backing
+
+        client = MagicMock()
+        client.get_balance.return_value = {"balance": Decimal(provider_balance), "partial": True}
+        with patch(STATUS, return_value=status):
+            refresh_backing(self.token, client)
+        self.token.refresh_from_db()
+        return client
+
+    def test_the_backing_and_address_come_from_the_chain(self):
+        client = self.refresh(self.status(held_sats=900000))
+        self.assertEqual(self.token.global_balance, Decimal("0.009"))
+        self.assertEqual(self.token.deposit_address, "bc1new")
+        client.get_balance.assert_not_called()
+
+    def test_a_rekey_sweep_keeps_every_holders_figure(self):
+        before = self.addresses()
+        self.refresh(self.status(held_sats=1000000, address="bc1second-key"))
+        self.assertEqual(self.addresses(), before)
+
+    def test_a_vault_core_does_not_watch_uses_the_providers(self):
+        client = self.refresh(self.status(attested=False))
+        client.get_balance.assert_called_once()
+        self.assertEqual(self.token.global_balance, Decimal("0.5"))
+
+    def test_a_node_that_does_not_answer_leaves_the_backing(self):
+        client = self.refresh({"Success": False, "Message": "down"})
+        client.get_balance.assert_not_called()
+        self.assertEqual(self.token.global_balance, Decimal("0.01"))
+
+    def test_a_block_with_a_report_refreshes_the_backing(self):
+        from rbx.tasks import sync_block
+
+        data = WatchedSettlementTests.block_data(self, 60, ["rep9"])
+        with patch(STATUS, return_value=self.status(held_sats=700000)), patch(HISTORY, return_value=history()):
+            sync_block(60, data=data, notify=False)
+        self.token.refresh_from_db()
+        self.assertEqual(self.token.global_balance, Decimal("0.007"))
+
+    def test_the_detail_view_refreshes_the_same_way(self):
+        from django.core.cache import cache
+        from rest_framework.test import APIRequestFactory, force_authenticate
+
+        from access.models import User
+        from api.btc.views import VbtcV2DetailView
+
+        cache.clear()
+        request = APIRequestFactory().get("/api/btc/vbtc-v2/detail/sc:w/")
+        force_authenticate(request, user=User.objects.create_user(email="d@example.com", password="x"))
+        with patch(STATUS, return_value=self.status(held_sats=800000)), patch("api.btc.views.BtcClient") as client:
+            response = VbtcV2DetailView.as_view()(request, sc_identifier="sc:w")
+        client.return_value.get_balance.assert_not_called()
+        self.assertEqual(Decimal(str(response.data["global_balance"])), Decimal("0.008"))
+
+
+@override_settings(VBTC_NETWORK="testnet", VBTC_FUND_LOSS_AUDIT_HEIGHT=1000)
+class LegacyBackingTests(WatchedBackingTests):
+    def test_a_legacy_vault_uses_the_providers_without_asking_the_node(self):
+        from unittest.mock import MagicMock
+
+        from rbx.vbtc_dispatch import refresh_backing
+
+        client = MagicMock()
+        client.get_balance.return_value = {"balance": Decimal("0.5"), "partial": True}
+        with patch(STATUS, return_value=self.status()) as node:
+            refresh_backing(self.token, client)
+        node.assert_not_called()
+        client.get_balance.assert_called_once()
+
+    test_the_backing_and_address_come_from_the_chain = None
+    test_a_rekey_sweep_keeps_every_holders_figure = None
+    test_a_vault_core_does_not_watch_uses_the_providers = None
+    test_a_node_that_does_not_answer_leaves_the_backing = None
+    test_the_detail_view_refreshes_the_same_way = None
+    test_a_block_with_a_report_refreshes_the_backing = None

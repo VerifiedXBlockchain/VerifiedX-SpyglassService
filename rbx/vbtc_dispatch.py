@@ -1081,6 +1081,68 @@ def _log_unknown(token, entry):
         _log_once(token, entry, "is listed by the node but not held by Spyglass", logging.ERROR)
 
 
+def refresh_watched_backing(token):
+    """For a vault the chain watches, the backing is what the chain records,
+    not what a Bitcoin explorer shows at the mint-time address: the node's
+    GetWithdrawalStatus gives Bitcoin.HeldSats (unspent and pinned coins,
+    Core's DepositBtc) and the current key's DepositAddress, which a rekey
+    moves. Returns True when the node answered for a vault it watches;
+    False sends the caller to the Bitcoin providers (a vault Core does not
+    watch keeps the earlier rules), or leaves the row as it is when the node
+    did not answer."""
+    from rbx.client import get_vbtc_v2_withdrawal_status
+
+    data = get_vbtc_v2_withdrawal_status(token.sc_identifier)
+    if not isinstance(data, dict) or not data.get("Success"):
+        return None
+    bitcoin = data.get("Bitcoin")
+    if not data.get("Attested") or not isinstance(bitcoin, dict):
+        return False
+    held = bitcoin.get("HeldSats")
+    address = bitcoin.get("DepositAddress")
+    if not isinstance(held, int) or isinstance(held, bool) or not isinstance(address, str) or not address:
+        logging.error(f"Watched vault {token.sc_identifier}: the node's Bitcoin view has no HeldSats or DepositAddress.")
+        return None
+    VbtcV2Token.objects.filter(pk=token.pk).update(
+        global_balance=Decimal(held) / Decimal(100_000_000), deposit_address=address
+    )
+    return True
+
+
+def refresh_all_watched_backings():
+    """Every watched vault's backing from the node: after a block holding a
+    report, a rewind or a rekey, the transactions that change it on Core."""
+    for token in VbtcV2Token.objects.select_related("nft__mint_transaction"):
+        if token.is_watched:
+            refresh_watched_backing(token)
+
+
+def refresh_backing(token, client):
+    """The vault's backing: from the node for a vault the chain watches,
+    from the Bitcoin providers otherwise. A watched vault whose node does
+    not answer is left as it is: a provider figure counts deposits before
+    the chain does, and loses the coins a rekey moved."""
+    if token.is_watched:
+        watched = refresh_watched_backing(token)
+        if watched is not False:
+            return
+    balance_info = client.get_balance(token.deposit_address)
+    if not balance_info:
+        return
+    update_fields = {"global_balance": balance_info["balance"]}
+    if not balance_info.get("partial"):
+        # The Blockdaemon rung only knows the current balance; never zero the
+        # historical fields from a partial result.
+        update_fields.update(
+            total_received=balance_info["total_received"],
+            total_sent=balance_info["total_sent"],
+            tx_count=balance_info["tx_count"],
+        )
+    # Targeted update: a full save() would clobber fields written by the
+    # vbtc-worker between read and save.
+    VbtcV2Token.objects.filter(pk=token.pk).update(**update_fields)
+
+
 def reconcile_all_watched_vaults():
     """Every watched vault with an open request."""
     settled = 0
