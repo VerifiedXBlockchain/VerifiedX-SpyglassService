@@ -454,8 +454,8 @@ def _sender_covers(row, cutoff, held, owner, pending):
     """DeferredVbtcTransferStillCovered: the owner of a vault the chain does
     not watch (`owner`, as the pass has it when it reaches the row) is
     covered; anyone else must hold the amount on the ledger as it stood at
-    `cutoff`. `held` carries the running figure per (contract, sender)
-    through one judging pass; `pending` is what to add back to the ledger's
+    `cutoff`. `held` carries the running figure per (contract, address)
+    through one judging pass; `pending` is what to add to the ledger's
     figure (sends the ledger already counts but that are judged in this
     pass)."""
     token = row.token
@@ -550,17 +550,29 @@ def settle_matured_reserve_sends(block):
             transaction__recovery_outstanding_transactions__isnull=True,
         ).select_related("transaction", "token")
     )
-    # The ledger at the end of the block already counts these sends (their
-    # unlock is before the cut-off); each is added back and applied in turn.
+    # The ledger at the end of the block already counts both sides of these
+    # sends (their unlock is before the cut-off); each is taken back out and
+    # applied in turn, so a send sorted first does not see the credit of one
+    # sorted after it. Every address is read before any refusal is saved:
+    # ledger_entries leaves a refused send out.
     pending = {}
     for row in due:
-        key = (row.token_id, row.from_address)
-        pending[key] = pending.get(key, Decimal(0)) + row.amount
+        if row.transaction.unlock_time < rules_from:
+            continue
+        sender, recipient = (row.token_id, row.from_address), (row.token_id, row.to_address)
+        pending[sender] = pending.get(sender, Decimal(0)) + row.amount
+        pending[recipient] = pending.get(recipient, Decimal(0)) - row.amount
     # Core settles the block's due ownership transfers and vBTC sends in one
     # pass, in (unlock, height, hash) order: a handover due earlier in the
     # pass has changed the owner when a send is reached.
     cutoff = _end_of(block)
     held, base, handovers = {}, {}, {}
+    entries = {}
+    for token_id, address in pending:
+        if token_id not in entries:
+            token = next(row.token for row in due if row.token_id == token_id)
+            entries[token_id] = token.ledger_entries(before=cutoff)
+        held[(token_id, address)] = entries[token_id].get(address, Decimal(0)) + pending[(token_id, address)]
     for row in sorted(due, key=_pass_order):
         tx = row.transaction
         if tx.unlock_time < rules_from:
@@ -571,6 +583,8 @@ def settle_matured_reserve_sends(block):
             handovers[token.pk] = _pending_handovers(token, previous, block.date_crafted)
         owner = _owner_in_pass(token, base[token.pk], handovers[token.pk], row)
         if _sender_covers(row, cutoff, held, owner, pending):
+            # Applied to the live state: a later send of the recipient sees it.
+            held[(row.token_id, row.to_address)] += row.amount
             continue
         logging.warning(
             f"Reserve vBTC send {tx.hash} of {row.amount} on {row.token.sc_identifier}: not covered by "
@@ -1001,9 +1015,12 @@ def reconcile_watched_withdrawals(token, after_rewind=False):
     # sweep do not settle or re-plan the same vault at once.
     with atomic():
         VbtcV2Token.objects.select_for_update().filter(pk=token.pk).first()
-        if after_rewind:
-            _reopen_unpaid(token, data)
-        return _apply_withdrawal_history(token, data)
+        caught_up = _reopen_unpaid(token, data) if after_rewind else True
+        settled = _apply_withdrawal_history(token, data)
+    # A payment made again whose report is not indexed yet: None, as for a
+    # node that did not answer, so the rewind mark holds and the next pass
+    # reads the paid rows again.
+    return settled if caught_up else None
 
 
 def _usable_history(token, data):
@@ -1020,15 +1037,19 @@ def _usable_history(token, data):
 
 
 def _reopen_unpaid(token, data):
+    """False when a row paid again waits for its report to be indexed."""
     paid = data.get("WithdrawalHistory") if isinstance(data, dict) and data.get("Success") else None
     if not isinstance(paid, list):
-        return
-    listed = {entry.get("RequestHash") for entry in paid if isinstance(entry, dict)}
+        return True
+    listed = {entry.get("RequestHash"): entry for entry in paid if isinstance(entry, dict)}
     reopened = []
+    caught_up = True
     for withdrawal in token.withdrawal_requests.filter(status=VbtcV2WithdrawalRequest.Status.COMPLETED).select_related(
         "request_transaction"
     ):
         if withdrawal.request_transaction_id in listed:
+            if not _repaid(token, withdrawal, listed[withdrawal.request_transaction_id]):
+                caught_up = False
             continue
         logging.warning(
             f"Watched vault {token.sc_identifier}: withdrawal {withdrawal.request_transaction_id} is no longer paid "
@@ -1043,6 +1064,34 @@ def _reopen_unpaid(token, data):
     if reopened:
         token.recompute_pending_withdrawal()
         _replan_settlements_since(token, min((w.request_transaction for w in reopened), key=lambda t: t.height))
+    return caught_up
+
+
+def _repaid(token, withdrawal, entry):
+    """A paid row the node still lists after a rewind may have been paid
+    again since, by another of its pinned transactions (Unsettle keeps the
+    pins, BtcWithdrawals.Rewind.cs:116-121) with a later report: the txid
+    and the completing report are the node's. The amount and the status do
+    not change. False when the report is not indexed yet."""
+    txid = entry.get("BTCTransactionHash")
+    completion = entry.get("CompletionHash")
+    if not txid or not completion:
+        return True
+    if withdrawal.btc_transaction_hash == txid and withdrawal.completion_transaction_id == completion:
+        return True
+    report = Transaction.objects.filter(hash=completion).first()
+    if report is None:
+        _log_once(token, entry, f"was paid again; waits for report {completion} to be indexed")
+        return False
+    logging.warning(
+        f"Watched vault {token.sc_identifier}: withdrawal {withdrawal.request_transaction_id} was paid again after a "
+        f"Bitcoin rewind, by {txid} (report {completion})."
+    )
+    withdrawal.btc_transaction_hash = txid
+    withdrawal.completion_transaction = report
+    withdrawal.completed_at = report.date_crafted
+    withdrawal.save(update_fields=["btc_transaction_hash", "completion_transaction", "completed_at"])
+    return True
 
 
 def _apply_withdrawal_history(token, data):
@@ -1157,14 +1206,27 @@ def refresh_watched_backing(token):
     if not data.get("Attested") or not isinstance(bitcoin, dict):
         return False
     held = bitcoin.get("HeldSats")
+    paid = bitcoin.get("PaidOutForBridgeExitsSats")
     address = bitcoin.get("DepositAddress")
-    if not isinstance(held, int) or isinstance(held, bool) or not isinstance(address, str) or not address:
-        logging.error(f"Watched vault {token.sc_identifier}: the node's Bitcoin view has no HeldSats or DepositAddress.")
+    if (
+        not all(isinstance(sats, int) and not isinstance(sats, bool) for sats in (held, paid))
+        or not isinstance(address, str)
+        or not address
+    ):
+        logging.error(
+            f"Watched vault {token.sc_identifier}: the node's Bitcoin view has no HeldSats, "
+            f"PaidOutForBridgeExitsSats or DepositAddress."
+        )
         return None
     # total_received, total_sent and tx_count are the providers' and are
-    # not kept for a watched vault (see VbtcV2TokenSerializer).
+    # not kept for a watched vault (see VbtcV2TokenSerializer). Core moves
+    # HeldSats and SettledExitSats in one apply (BtcAttestBalance.cs:52-56):
+    # the owner anchor adds the second to the first, so they are written
+    # together, or a payout seen in one and not the other shrinks the owner.
     VbtcV2Token.objects.filter(pk=token.pk).update(
-        global_balance=Decimal(held) / Decimal(100_000_000), deposit_address=address
+        global_balance=Decimal(held) / Decimal(100_000_000),
+        settled_exit_btc=Decimal(paid) / Decimal(100_000_000),
+        deposit_address=address,
     )
     return True
 
@@ -1339,11 +1401,31 @@ def _settle(withdrawal, result):
 def _replan_settlements_since(token, request_tx):
     """A refund changes what a handover since the request had to settle
     (VbtcV2Token.settlement_amount_for), and each handover's row feeds the
-    next one's, so every one since is planned again, in order."""
-    for tx in token.ownership_transfers(since_height=request_tx.height):
-        if tx.pk == request_tx.pk:
-            continue
-        _write_settlement(token, tx, planned_settlement(token, tx), "V2 ownership transfer")
+    next one's, so every one since is planned again, in order: each
+    Transfer() and each Recover() that gave the contract to the recovery
+    address."""
+    handovers = [
+        (tx, None, None) for tx in token.ownership_transfers(since_height=request_tx.height) if tx.pk != request_tx.pk
+    ]
+    for tx in _recoveries_of(token, since_height=request_tx.height):
+        handovers.append((tx, tx.from_address, recovery_address_of(tx)))
+    for tx, old_owner, new_owner in sorted(handovers, key=lambda h: (h[0].height, h[0].hash)):
+        what = "Recover()" if old_owner else "V2 ownership transfer"
+        _write_settlement(token, tx, planned_settlement(token, tx, old_owner=old_owner, new_owner=new_owner), what)
+
+
+def _recoveries_of(token, since_height):
+    """The Recover()s from since_height on that gave token to their recovery
+    address: those of the reserve that owned it then (apply_recovery)."""
+    found = []
+    candidates = Transaction.objects.filter(
+        type=Transaction.Type.RESERVE, height__gte=since_height, from_address__startswith=RESERVE_ADDRESS_PREFIX
+    ).order_by("height", "hash")
+    for tx in candidates:
+        recovery_address = recovery_address_of(tx)
+        if recovery_address and recovery_address != tx.from_address and token.owner_before(tx) == tx.from_address:
+            found.append(tx)
+    return found
 
 
 def cancellation_uid_for(withdrawal):

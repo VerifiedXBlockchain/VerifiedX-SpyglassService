@@ -24,8 +24,10 @@ from rbx.vbtc_dispatch import (
 from rbx.vbtc_bridge import (
     BRIDGE_TYPES,
     SHIELD_TYPES,
+    expire_exits,
     in_chain_order,
     lock_bridge_state,
+    read_exit_expiries,
     reset_bridge_state,
     shared_bridge_blocks,
 )
@@ -176,10 +178,18 @@ class Command(BaseCommand):
                 with atomic():
                     settle_matured_reserve_sends(Block.objects.get(height=maturities.pop(0)))
 
+        # Exits on watched vaults the node failed by rule give their locks
+        # back at the start of that block, before its transactions.
+        expiries = {}
+
         with replaying():
             for tx in txs:
                 # A block's sends fall due at its end, after its transactions.
                 judge_through(tx.height - 1)
+                if not tx_type:
+                    read_exit_expiries(tx.height, expiries)
+                    with atomic():
+                        expire_exits(tx.height, expiries)
                 try:
                     self.stdout.write(
                         f"Processing {tx.hash} (type={tx.type}, height={tx.height})..."

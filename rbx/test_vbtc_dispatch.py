@@ -908,6 +908,34 @@ class ReserveOwnershipTransferTests(TestCase):
         self.assertEqual(data["owner_address"], "P")
         self.assertIsNone(data["pending_owner_address"])
 
+    def test_unlock_passed_by_the_clock_but_by_no_block_still_reads_as_the_senders(self):
+        # The node moves the owner after the first block stamped past the
+        # unlock and admits a callback until then (ReserveService.cs:17-21).
+        mined = timezone.now() - timedelta(hours=1)
+        Block.objects.filter(pk=self.block.pk).update(date_crafted=mined)
+        unlock = mined + timedelta(seconds=30)
+        self.tx.unlock_time = unlock
+        self.tx.save(update_fields=["unlock_time"])
+        self.assertLess(unlock, timezone.now())
+        self.assertEqual(self.token.current_owner(), self.OWNER)
+        # The ledger takes the same cut-off: the settlement row waits too.
+        self.assertEqual(self.token.addresses, {self.OWNER: Decimal("0.008"), "H": Decimal("0.002")})
+        data = VbtcV2TokenSerializer(self.token).data
+        self.assertEqual(data["owner_address"], self.OWNER)
+        self.assertEqual(data["pending_owner_address"], "P")
+        # Once a block stamped past the unlock is indexed, it is the recipient's.
+        later = make_block(height=2)
+        Block.objects.filter(pk=later.pk).update(date_crafted=unlock + timedelta(seconds=1))
+        self.assertEqual(self.token.current_owner(), "P")
+        self.assertEqual(self.token.addresses, {"P": Decimal("0.008"), "H": Decimal("0.002")})
+        self.assertIsNone(VbtcV2TokenSerializer(self.token).data["pending_owner_address"])
+
+    def test_block_stamped_at_the_unlock_does_not_pass_it(self):
+        later = make_block(height=2)
+        self.tx.unlock_time = later.date_crafted
+        self.tx.save(update_fields=["unlock_time"])
+        self.assertEqual(self.token.current_owner(), self.OWNER)
+
     def test_block_after_the_unlock_moves_the_owner(self):
         self.unlock()
         settle_pending_owners(self.block_after_unlock())
@@ -1507,3 +1535,97 @@ class MaturedReserveSendTests(TestCase):
         self.recover_owner(timedelta(seconds=1))
         send.refresh_from_db()
         self.assertFalse(send.voided_from_callback)
+
+
+@override_settings(VBTC_NETWORK="testnet", VBTC_FUND_LOSS_AUDIT_HEIGHT=1)
+class SendsDueTogetherTests(TestCase):
+    """Two reserve sends due in one block, A (holding 0.004) sending 0.003 to
+    B and B sending 0.002 on: Core judges them in (unlock, height, hash)
+    order against the live state (StateData.cs:1003, :3634), so B's send is
+    covered only when A's sorts before it."""
+
+    def setUp(self):
+        rules = make_block(height=1)
+        Block.objects.filter(pk=rules.pk).update(date_crafted=timezone.now() - timedelta(hours=1))
+        self.token = make_token(owner="O", global_balance="0.01", sc_identifier="sc:a")
+        add_transfer(self.token, make_tx(rules, "s1", Transaction.Type.VBTC_V2_TRANSFER), "O", "xRBXa", "0.004")
+        self.sent = make_block(height=2)
+        self.sent_at = timezone.now() - timedelta(minutes=10)
+        Block.objects.filter(pk=self.sent.pk).update(date_crafted=self.sent_at)
+        self.unlock = self.sent_at + timedelta(seconds=30)
+
+    def send(self, tx_hash, sender, recipient, amount):
+        tx = single_transfer_tx(self.sent, tx_hash, sender, recipient, "sc:a", amount)
+        tx.date_crafted = self.sent_at
+        tx.unlock_time = self.unlock
+        tx.save(update_fields=["date_crafted", "unlock_time"])
+        process_transaction(tx)
+        return tx
+
+    def settle(self):
+        due = make_block(height=3)
+        Block.objects.filter(pk=due.pk).update(date_crafted=self.unlock + timedelta(seconds=1))
+        due.refresh_from_db()
+        settle_matured_reserve_sends(due)
+
+    def refused(self, tx):
+        tx.refused_at_maturity = False
+        tx.refresh_from_db()
+        return tx.refused_at_maturity
+
+    def test_a_send_sorted_first_is_not_funded_by_a_credit_sorted_after_it(self):
+        b_send = self.send("rs0", "xRBXb", "R", 0.002)
+        a_send = self.send("rs1", "xRBXa", "xRBXb", 0.003)
+        self.settle()
+        self.assertFalse(self.refused(a_send))
+        self.assertTrue(self.refused(b_send))
+        entries = self.token.ledger_entries()
+        self.assertNotIn("R", entries)
+        self.assertEqual(entries["xRBXb"], Decimal("0.003"))
+        self.assertEqual(entries["xRBXa"], Decimal("0.001"))
+
+    def test_a_send_sorted_after_a_credit_is_funded_by_it(self):
+        a_send = self.send("rs0", "xRBXa", "xRBXb", 0.003)
+        b_send = self.send("rs1", "xRBXb", "R", 0.002)
+        self.settle()
+        self.assertFalse(self.refused(a_send))
+        self.assertFalse(self.refused(b_send))
+        entries = self.token.ledger_entries()
+        self.assertEqual(entries["R"], Decimal("0.002"))
+        self.assertEqual(entries["xRBXb"], Decimal("0.001"))
+
+    def test_a_refused_credit_does_not_fund_a_send_after_it(self):
+        # C holds nothing: its send to B is refused, and B's send after it
+        # has nothing to draw on.
+        c_send = self.send("rs0", "xRBXc", "xRBXb", 0.003)
+        b_send = self.send("rs1", "xRBXb", "R", 0.002)
+        self.settle()
+        self.assertTrue(self.refused(c_send))
+        self.assertTrue(self.refused(b_send))
+        self.assertNotIn("R", self.token.ledger_entries())
+
+    def test_a_credit_settled_in_an_earlier_block_stays_in_the_seed(self):
+        # A's send to B falls due at block 3, B's on at block 4: B holds the
+        # credit by then.
+        a_send = self.send("rs1", "xRBXa", "xRBXb", 0.003)
+        b_send = self.send("rs0", "xRBXb", "R", 0.002)
+        b_send.unlock_time = self.unlock + timedelta(seconds=10)
+        b_send.save(update_fields=["unlock_time"])
+        self.settle()
+        later = make_block(height=4)
+        Block.objects.filter(pk=later.pk).update(date_crafted=b_send.unlock_time + timedelta(seconds=1))
+        later.refresh_from_db()
+        settle_matured_reserve_sends(later)
+        self.assertFalse(self.refused(a_send))
+        self.assertFalse(self.refused(b_send))
+        self.assertEqual(self.token.ledger_entries()["R"], Decimal("0.002"))
+
+    def test_a_sender_spending_a_credit_then_its_own_holding(self):
+        # B holds 0.001 already; A's 0.003 sorts first, so B's 0.004 is covered.
+        add_transfer(self.token, make_tx(self.sent, "s2", Transaction.Type.VBTC_V2_TRANSFER), "O", "xRBXb", "0.001")
+        a_send = self.send("rs0", "xRBXa", "xRBXb", 0.003)
+        b_send = self.send("rs1", "xRBXb", "R", 0.004)
+        self.settle()
+        self.assertFalse(self.refused(a_send))
+        self.assertFalse(self.refused(b_send))
+        self.assertEqual(self.token.ledger_entries()["R"], Decimal("0.004"))

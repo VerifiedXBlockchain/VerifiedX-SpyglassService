@@ -1218,10 +1218,16 @@ def _vbtc_v2_request(method, path, payload=None, timeout=30):
             response = _http.get(url, timeout=timeout)
         else:
             response = _http.post(url, json=payload, timeout=timeout)
+        if not response.ok:
+            # The node answers a refusal with HTTP 200; anything else is from
+            # something in between (a proxy's error page), not an answer.
+            raise ValueError(f"HTTP {response.status_code}")
         result = response.json()
     except Exception as e:
         logger.error(f"Error in vBTC V2 request {path}: {e}")
-        return {"Success": False, "Message": str(e)}
+        # No answer at all (a timeout, a refused connection, a body that is
+        # not JSON), told apart from a refusal the node answered with.
+        return {"Success": False, "Message": str(e), "Unreachable": True}
 
     # The CLI reports a refusal in the body with HTTP 200, and logs nothing of
     # its own on several of these paths. Unless the reason is recorded here it
