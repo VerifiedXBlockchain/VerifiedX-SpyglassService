@@ -360,6 +360,11 @@ def apply_ownership_transfer(token, tx):
         if tx.voided_from_callback:
             if token.pending_owner_transaction_id == tx.pk:
                 _clear_pending_owner(token)
+            if _replaying.get():
+                # The sender owned the contract when the transfer was
+                # admitted, and the callback left it there; earlier indexing
+                # had moved it to the recipient.
+                _move_owner(token, tx.from_address, tx)
             return
         token.pending_owner_address = new_owner
         token.pending_owner_transaction = tx
@@ -372,15 +377,15 @@ def apply_ownership_transfer(token, tx):
 
 def _called_back_on_chain(tx):
     """Whether the chain holds a CallBack() of tx that the node applied: one
-    mined by the end of the first block stamped at or after the unlock, when
-    the node applies the transfer instead. Earlier indexing did not mark a
+    mined by the end of the first block stamped after the unlock, when the
+    node applies the transfer instead. Earlier indexing did not mark a
     called-back ownership transfer, so a backfill reads the chain."""
     callbacks = Transaction.objects.filter(
         type=Transaction.Type.RESERVE, from_address=tx.from_address, height__gte=tx.height
     )
     if tx.unlock_time is not None:
         applied = (
-            Block.objects.filter(height__gte=tx.height, date_crafted__gte=tx.unlock_time)
+            Block.objects.filter(height__gte=tx.height, date_crafted__gt=tx.unlock_time)
             .order_by("height")
             .values_list("height", flat=True)
             .first()
@@ -419,9 +424,10 @@ def _move_owner(token, new_owner, tx):
 
 
 def settle_pending_owners(block):
-    """End of a block: a reserve owner's Transfer() that has unlocked by the
-    block's time and was not called back takes effect, as the node's
-    ReserveService applies it after the block (UpdateTreiFromReserve)."""
+    """End of a block: a reserve owner's Transfer() whose unlock time is
+    before the block's time and that was not called back takes effect, as
+    the node's ReserveService applies it after the block
+    (ReserveTransactions.DueRows, UpdateTreiFromReserve)."""
     pending = VbtcV2Token.objects.filter(
         pending_owner_transaction__isnull=False
     ).select_related("pending_owner_transaction")
@@ -439,6 +445,10 @@ def call_back_ownership_transfer(original_tx):
     the callback voids it: the owner never moved and the settlement row is
     never counted. Once it has taken effect the node skips the callback (its
     reserve row is no longer Pending), and so does this."""
+    if original_tx.type not in OWNERSHIP_TRANSFER_TYPES:
+        # A vBTC send (type 26) applies by ContractUID and Amount whatever
+        # its Function says.
+        return False
     token = VbtcV2Token.objects.filter(pending_owner_transaction=original_tx).first()
     if token is None:
         payload, _ = parse_envelope(original_tx.data)

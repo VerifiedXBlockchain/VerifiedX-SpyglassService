@@ -930,10 +930,16 @@ class ReserveOwnershipTransferTests(TestCase):
         self.assertIsNone(self.token.pending_owner_address)
 
     def test_replay_reads_a_callback_earlier_indexing_did_not_mark(self):
+        # What earlier indexing left: the owners moved to the recipient when
+        # the transfer was mined, and the callback marked nothing.
         make_tx(
             self.block, "cb1", Transaction.Type.RESERVE, from_address=self.OWNER,
             data={"Function": "CallBack()", "Hash": "ot1"},
         )
+        type(self.token).objects.filter(pk=self.token.pk).update(
+            owner_address="P", pending_owner_address=None, pending_owner_transaction=None
+        )
+        type(self.token.nft).objects.filter(pk=self.token.nft_id).update(owner_address="P")
         self.unlock()
         with replaying():
             process_transaction(self.tx)
@@ -954,6 +960,37 @@ class ReserveOwnershipTransferTests(TestCase):
         with replaying():
             process_transaction(self.tx)
         self.assertOwner("P")
+
+    def test_block_stamped_at_the_unlock_leaves_the_owner(self):
+        # The node settles a reserve row in the first block stamped after
+        # its unlock time.
+        block = self.block_after_unlock()
+        self.tx.unlock_time = block.date_crafted
+        self.tx.save(update_fields=["unlock_time"])
+        settle_pending_owners(block)
+        self.token.refresh_from_db()
+        self.assertEqual(self.token.owner_address, self.OWNER)
+        self.assertEqual(self.token.nft.owner_address, self.OWNER)
+        self.assertFalse(self.token.pending_owner_settled(as_of=block.date_crafted))
+        self.assertEqual(self.token.pending_owner_address, "P")
+
+    def test_callback_of_a_vbtc_send_naming_transfer_still_voids_the_send(self):
+        # A type 26 send applies by ContractUID and Amount whatever its
+        # Function says, so its callback is a send's callback.
+        add_transfer(self.token, make_tx(self.block, "s2", Transaction.Type.VBTC_V2_TRANSFER), self.OWNER, "xRBXsender", "0.003")
+        send = single_transfer_tx(self.block, "rs1", "xRBXsender", "R", "sc:a", 0.001, function="Transfer()")
+        send.unlock_time = timezone.now() + timedelta(hours=1)
+        send.save(update_fields=["unlock_time"])
+        process_transaction(send)
+        process_transaction(make_tx(
+            self.block, "cb2", Transaction.Type.RESERVE, from_address="xRBXsender",
+            data={"Function": "CallBack()", "Hash": "rs1"},
+        ))
+        send.refresh_from_db()
+        self.assertTrue(send.voided_from_callback)
+        send.unlock_time = timezone.now() - timedelta(minutes=1)
+        send.save(update_fields=["unlock_time"])
+        self.assertNotIn("R", self.token.addresses)
 
     def test_ordinary_owner_transfer_moves_at_once(self):
         tx = make_tx(
