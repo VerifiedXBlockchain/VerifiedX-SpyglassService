@@ -1271,6 +1271,44 @@ def _latest_rewind_height():
     )
 
 
+# A rewind is held this many indexed blocks without a pass that succeeded
+# for every vault and exit before it is logged as an error: deeper than the
+# chain's reorganisations, so a report that is still to come has come by
+# then, and what is left is a fork or a node fault for an operator.
+REWIND_HOLD_ALERT_BLOCKS = 20
+
+
+def rewind_hold():
+    """The rewind Spyglass is still holding for, or None: the latest
+    rewind block, the latest one reconciled, and how many indexed blocks
+    have passed since the rewind."""
+    latest = _latest_rewind_height()
+    mark = VbtcV2RewindMark.objects.first()
+    reconciled = mark.reconciled_height if mark else 0
+    if latest <= reconciled:
+        return None
+    indexed = Block.objects.aggregate(h=Max("height"))["h"] or latest
+    return {
+        "rewind_height": latest,
+        "reconciled_height": reconciled,
+        "blocks_held": max(0, indexed - latest),
+    }
+
+
+def _report_long_hold(mark):
+    hold = rewind_hold()
+    if hold is None or hold["blocks_held"] < REWIND_HOLD_ALERT_BLOCKS:
+        return
+    if mark.alerted_height >= hold["rewind_height"]:
+        return
+    logging.error(
+        f"vBTC V2 rewind at block {hold['rewind_height']} is still not reconciled after "
+        f"{hold['blocks_held']} blocks: a paid row the node lists again waits for a report "
+        f"that is not indexed, or the node does not answer"
+    )
+    VbtcV2RewindMark.objects.filter(pk=mark.pk).update(alerted_height=hold["rewind_height"])
+
+
 def reconcile_all_watched_vaults(after_rewind=False):
     """Every watched vault with an open request (and, after a Bitcoin
     rewind, with a completed one). A rewind is read on every pass, the
@@ -1311,6 +1349,8 @@ def reconcile_all_watched_vaults(after_rewind=False):
         ok = False
     if after_rewind and ok and latest > mark.reconciled_height:
         VbtcV2RewindMark.objects.filter(pk=mark.pk).update(reconciled_height=latest)
+    elif latest > mark.reconciled_height:
+        _report_long_hold(mark)
     return settled
 
 
@@ -1404,28 +1444,38 @@ def _replan_settlements_since(token, request_tx):
     next one's, so every one since is planned again, in order: each
     Transfer() and each Recover() that gave the contract to the recovery
     address."""
-    handovers = [
-        (tx, None, None) for tx in token.ownership_transfers(since_height=request_tx.height) if tx.pk != request_tx.pk
-    ]
-    for tx in _recoveries_of(token, since_height=request_tx.height):
+    transfers = [tx for tx in token.ownership_transfers(since_height=request_tx.height) if tx.pk != request_tx.pk]
+    handovers = [(tx, None, None) for tx in transfers]
+    for tx in _recoveries_of(token, request_tx, transfers):
         handovers.append((tx, tx.from_address, recovery_address_of(tx)))
     for tx, old_owner, new_owner in sorted(handovers, key=lambda h: (h[0].height, h[0].hash)):
         what = "Recover()" if old_owner else "V2 ownership transfer"
         _write_settlement(token, tx, planned_settlement(token, tx, old_owner=old_owner, new_owner=new_owner), what)
 
 
-def _recoveries_of(token, since_height):
-    """The Recover()s from since_height on that gave token to their recovery
-    address: those of the reserve that owned it then (apply_recovery)."""
+def _recoveries_of(token, request_tx, transfers):
+    """The Recover()s since request_tx that gave token to their recovery
+    address: those of the reserve that owned it then (apply_recovery). Only
+    a reserve that could have owned it since is read: the owner at the
+    request, a Transfer() recipient since (transfers), or the recovery
+    address of an earlier such recovery."""
+    owners = {token.owner_before(request_tx)} | {tx.to_address for tx in transfers}
+    read = set()
     found = []
-    candidates = Transaction.objects.filter(
-        type=Transaction.Type.RESERVE, height__gte=since_height, from_address__startswith=RESERVE_ADDRESS_PREFIX
-    ).order_by("height", "hash")
-    for tx in candidates:
-        recovery_address = recovery_address_of(tx)
-        if recovery_address and recovery_address != tx.from_address and token.owner_before(tx) == tx.from_address:
-            found.append(tx)
-    return found
+    while True:
+        reserves = {address for address in owners if is_reserve_address(address)} - read
+        if not reserves:
+            break
+        read |= reserves
+        candidates = Transaction.objects.filter(
+            type=Transaction.Type.RESERVE, height__gte=request_tx.height, from_address__in=reserves
+        )
+        for tx in candidates:
+            recovery_address = recovery_address_of(tx)
+            if recovery_address and recovery_address != tx.from_address and token.owner_before(tx) == tx.from_address:
+                found.append(tx)
+                owners.add(recovery_address)
+    return sorted(found, key=lambda tx: (tx.height, tx.hash))
 
 
 def cancellation_uid_for(withdrawal):

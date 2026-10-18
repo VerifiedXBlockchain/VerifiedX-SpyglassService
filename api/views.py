@@ -6,6 +6,7 @@ from rest_framework.decorators import api_view
 from rest_framework.response import Response
 from rbx.models import Circulation, NetworkMetrics
 from rbx.tasks import sync_circulation, sync_network_metrics
+from rbx.vbtc_dispatch import rewind_hold
 from django.conf import settings
 
 
@@ -46,6 +47,7 @@ def network_metrics(request):
         "block_last_delay": nm.block_last_delay,
         "time_since_last_block": nm.time_since_last_block,
         "blocks_averages": nm.blocks_averages,
+        "vbtc_v2_rewind_hold": rewind_hold(),
     }
     return Response(data, status=status.HTTP_200_OK)
 
