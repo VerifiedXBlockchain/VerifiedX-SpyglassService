@@ -826,9 +826,20 @@ def _settle(withdrawal, result):
         withdrawal.cancelled_at = result.decided_by.date_crafted
         withdrawal.save(update_fields=["status", "cancelled_at"])
         withdrawal.token.recompute_pending_withdrawal()
+        _replan_settlements_since(withdrawal.token, withdrawal.request_transaction)
     elif result.outcome is vbtc_cancellation.Outcome.REJECTED:
         if _reopen(withdrawal):
             withdrawal.token.recompute_pending_withdrawal()
+
+
+def _replan_settlements_since(token, request_tx):
+    """A refund changes what a handover since the request had to settle
+    (VbtcV2Token.settlement_amount_for), and each handover's row feeds the
+    next one's, so every one since is planned again, in order."""
+    for tx in token.ownership_transfers(since_height=request_tx.height):
+        if tx.pk == request_tx.pk:
+            continue
+        _write_settlement(token, tx, planned_settlement(token, tx), "V2 ownership transfer")
 
 
 def cancellation_uid_for(withdrawal):

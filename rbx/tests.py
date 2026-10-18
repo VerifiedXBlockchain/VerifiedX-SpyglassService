@@ -699,7 +699,9 @@ class OwnershipTransferReplayTests(TestCase):
 
     @override_settings(VBTC_WITHDRAWAL_ESCROW_HEIGHT=1)
     def test_escrow_refunded_afterwards_was_still_held(self):
-        # An escrowed request is a debit until a vote refunds it.
+        # An escrowed request is a debit until a vote refunds it. The owner's
+        # own escrow refunded after the handover is not the new owner's to
+        # cover, so the handover settles without it.
         token = make_token(owner="O", global_balance="0.001")
         request = self.request(
             token, 5, "w1", "O", "0.0003", VbtcV2WithdrawalRequest.Status.CANCELLED
@@ -708,10 +710,26 @@ class OwnershipTransferReplayTests(TestCase):
         request.save(update_fields=["cancelled_at"])
         handover = self.handover(token, 10, "h1", "O", "P")
 
-        self.assertEqual(
-            token.settlement_amount_for("O", before=handover), Decimal("-0.0003")
-        )
+        self.assertEqual(token.ledger_entries(before=handover)["O"], Decimal("-0.0003"))
+        self.assertEqual(token.settlement_amount_for("O", before=handover), Decimal(0))
         self.assertEqual(token.settlement_amount_for("O"), Decimal(0))
+
+    @override_settings(VBTC_WITHDRAWAL_ESCROW_HEIGHT=1)
+    def test_escrow_placed_before_becoming_owner_is_still_settled(self):
+        # The requestor held vBTC, not the vault, when it escrowed; it became
+        # owner later and handed the vault on before the refund.
+        token = make_token(owner="O", global_balance="0.001")
+        request = self.request(
+            token, 5, "w1", "U", "0.0003", VbtcV2WithdrawalRequest.Status.CANCELLED
+        )
+        request.cancelled_at = self.block_time(20)
+        request.save(update_fields=["cancelled_at"])
+        self.handover(token, 7, "h0", "O", "U")
+        handover = self.handover(token, 10, "h1", "U", "P")
+
+        self.assertEqual(
+            token.settlement_amount_for("U", before=handover), Decimal("-0.0003")
+        )
 
     def test_legacy_request_refunded_afterwards_was_still_open(self):
         token = make_token(owner="O", global_balance="0.001")

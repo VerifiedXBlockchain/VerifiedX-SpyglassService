@@ -13,7 +13,7 @@ import json
 import uuid
 from phonenumber_field.modelfields import PhoneNumberField
 from django.contrib.postgres.fields import ArrayField
-from rbx.vbtc_gates import escrow_applies
+from rbx.vbtc_gates import escrow_applies, field, net_string, parse_envelope
 from rbx import forged_vfx_burn
 
 # class MasterNodeManager(models.Manager):
@@ -1395,7 +1395,41 @@ class VbtcV2Token(models.Model):
                 continue
             if not escrow_applies(w.request_transaction.height):
                 pending += w.amount
+            elif before is not None and w.refunded_after(before) and not self._became_owner_between(
+                address, w.request_transaction, before
+            ):
+                # An escrow the outgoing owner placed as owner and a vote
+                # refunds after the handover is not the incoming owner's to
+                # cover: the node credits the refund to the requestor, and the
+                # owner's balance is the backing less every other holder's
+                # entry. The handover settles as if it had never been placed.
+                pending -= w.amount
         return self.ledger_entries(before).get(address, Decimal(0)) - pending
+
+    def ownership_transfers(self, since_height=0):
+        """The Transfer() transactions of this contract from since_height on,
+        in (height, hash) order, under any envelope type the node routes it
+        through."""
+        from rbx.vbtc_dispatch import OWNERSHIP_TRANSFER_FUNCTION, OWNERSHIP_TRANSFER_TYPES
+
+        found = []
+        candidates = Transaction.objects.filter(
+            type__in=list(OWNERSHIP_TRANSFER_TYPES), height__gte=since_height
+        ).order_by("height", "hash")
+        for tx in candidates:
+            payload, _ = parse_envelope(tx.data)
+            if (
+                net_string(field(payload, "Function")) == OWNERSHIP_TRANSFER_FUNCTION
+                and net_string(field(payload, "ContractUID")) == self.sc_identifier
+            ):
+                found.append(tx)
+        return found
+
+    def _became_owner_between(self, address, since_tx, before):
+        return any(
+            tx.to_address == address and tx.pk != before.pk and tx.height <= before.height
+            for tx in self.ownership_transfers(since_height=since_tx.height)
+        )
 
     @property
     def addresses(self):
