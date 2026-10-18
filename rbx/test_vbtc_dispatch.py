@@ -1302,3 +1302,64 @@ class MaturedReserveSendTests(TestCase):
         self.send.refresh_from_db()
         self.assertTrue(self.send.refused_at_maturity)
         self.assertNotIn("R", self.token.ledger_entries())
+
+    def test_a_send_by_the_owner_of_the_day_is_judged_as_the_owners(self):
+        # The reserve owned the vault when the send fell due; the stored
+        # owner is a later one.
+        token = make_token(owner="xRBXowner", global_balance="0.01", sc_identifier="sc:o")
+        send = single_transfer_tx(self.sent, "rs2", "xRBXowner", "R2", "sc:o", 0.004)
+        send.date_crafted = self.send.date_crafted
+        send.unlock_time = self.send.unlock_time
+        send.save(update_fields=["date_crafted", "unlock_time"])
+        process_transaction(send)
+        type(token).objects.filter(pk=token.pk).update(owner_address="Later")
+        settle_matured_reserve_sends(self.due_block())
+        send.refresh_from_db()
+        self.assertFalse(send.refused_at_maturity)
+
+    def test_two_backfills_write_the_same_rows(self):
+        # A refused send, then a recovery of the sender: the sweep reads the
+        # refusal, so it has to be decided before the recovery replays.
+        request = make_tx(self.sent, "w1", Transaction.Type.VBTC_V2_WITHDRAWAL_REQUEST)
+        add_withdrawal(self.token, request, "xRBXreserve", "0.003", VbtcV2WithdrawalRequest.Status.REQUESTED)
+        due = self.due_block()
+        later = make_block(height=4)
+        Block.objects.filter(pk=later.pk).update(date_crafted=due.date_crafted + timedelta(seconds=10))
+        recovery = make_tx(later, "rc1", Transaction.Type.RESERVE, from_address="xRBXreserve",
+                           data={"Function": "Recover()", "RecoveryAddress": "Y"})
+        Transaction.objects.filter(pk=recovery.pk).update(date_crafted=due.date_crafted + timedelta(seconds=10))
+
+        def rows():
+            return sorted(VbtcV2TokenTransfer.objects.values_list("transaction__hash", "from_address", "to_address", "amount"))
+
+        call_command("reprocess_vbtc_v2", stdout=StringIO(), stderr=StringIO())
+        first = rows()
+        call_command("reprocess_vbtc_v2", stdout=StringIO(), stderr=StringIO())
+        self.assertEqual(rows(), first)
+        self.assertIn(("rc1", "xRBXreserve", "Y", Decimal("0.0020000000000000")), first)
+
+    def test_a_redirected_send_is_not_judged_at_maturity(self):
+        recovery = make_tx(self.sent, "rc1", Transaction.Type.RESERVE, from_address="xRBXreserve",
+                           data={"Function": "Recover()", "RecoveryAddress": "Y"})
+        Transaction.objects.filter(pk=recovery.pk).update(date_crafted=self.send.date_crafted)
+        recovery.refresh_from_db()
+        process_transaction(recovery)
+        request = make_tx(self.sent, "w1", Transaction.Type.VBTC_V2_WITHDRAWAL_REQUEST)
+        add_withdrawal(self.token, request, "xRBXreserve", "0.003", VbtcV2WithdrawalRequest.Status.REQUESTED)
+        settle_matured_reserve_sends(self.due_block())
+        self.send.refresh_from_db()
+        self.assertFalse(self.send.refused_at_maturity)
+        self.assertEqual(VbtcV2TokenTransfer.objects.get(transaction=self.send).to_address, "Y")
+
+    def test_a_send_not_covered_at_the_recovery_is_taken_back(self):
+        request = make_tx(self.rules, "w0", Transaction.Type.VBTC_V2_WITHDRAWAL_REQUEST)
+        add_withdrawal(self.token, request, "xRBXreserve", "0.003", VbtcV2WithdrawalRequest.Status.REQUESTED)
+        recovery = make_tx(self.sent, "rc1", Transaction.Type.RESERVE, from_address="xRBXreserve",
+                           data={"Function": "Recover()", "RecoveryAddress": "Y"})
+        Transaction.objects.filter(pk=recovery.pk).update(date_crafted=self.send.date_crafted)
+        recovery.refresh_from_db()
+        process_transaction(recovery)
+        self.send.refresh_from_db()
+        self.assertTrue(self.send.voided_from_callback)
+        self.assertEqual(VbtcV2TokenTransfer.objects.get(transaction=self.send).to_address, "R")
+        self.assertNotIn("R", self.token.ledger_entries())

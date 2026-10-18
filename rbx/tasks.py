@@ -1018,6 +1018,7 @@ def process_transaction(tx: Transaction):
             # Materialised: the redirect below moves a transaction's unlock time,
             # which would otherwise drop it from this lazily re-evaluated set.
             outstanding_transactions = list(outstanding_transactions)
+            vbtc_sends = []
             for transaction in outstanding_transactions:
                 # additional_balance += tx.total_amount
 
@@ -1038,9 +1039,7 @@ def process_transaction(tx: Transaction):
                         transaction.save()
 
                 elif transaction.type == Transaction.Type.VBTC_V2_TRANSFER:
-                    vbtc_dispatch.redirect_reserve_transfer(
-                        transaction, new_address, tx.date_crafted
-                    )
+                    vbtc_sends.append(transaction)
 
                 elif transaction.type == Transaction.Type.NFT_TX:
                     parsed = json.loads(transaction.data)[0]
@@ -1054,6 +1053,8 @@ def process_transaction(tx: Transaction):
                     nft.owner_address = new_address
                     nft.save()
 
+            # Judged together, in Core's order, before the sweep reads them.
+            vbtc_dispatch.redirect_reserve_sends(tx, vbtc_sends, new_address)
             vbtc_dispatch.apply_recovery(tx, new_address)
 
             recovery = Recovery(

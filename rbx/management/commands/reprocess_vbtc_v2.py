@@ -3,7 +3,7 @@ from django.db import InterfaceError, InternalError, OperationalError
 from django.db.models import Q
 from django.db.transaction import atomic
 
-from rbx.models import Transaction, VbtcV2Token
+from rbx.models import Block, Transaction, VbtcV2Token
 from rbx.tasks import process_transaction
 from rbx.models import VbtcV2TokenTransfer
 from rbx.vbtc_dispatch import (
@@ -13,7 +13,9 @@ from rbx.vbtc_dispatch import (
     OWNERSHIP_TRANSFER_TYPES,
     SC_ENVELOPE_TYPES,
     apply_recovery,
-    judge_all_matured_reserve_sends,
+    clear_maturity_refusals,
+    maturity_heights,
+    settle_matured_reserve_sends,
     planned_settlement,
     recovery_address_of,
     replaying,
@@ -160,11 +162,23 @@ class Command(BaseCommand):
         processed = 0
         errors = 0
 
+        # Reserve sends are judged again as they fall due, inside the replay:
+        # what a later settlement or sweep reads must already be decided.
+        maturities = []
         if not tx_type:
             reset_bridge_state()
+            clear_maturity_refusals()
+            maturities = maturity_heights()
+
+        def judge_through(height):
+            while maturities and maturities[0] <= height:
+                with atomic():
+                    settle_matured_reserve_sends(Block.objects.get(height=maturities.pop(0)))
 
         with replaying():
             for tx in txs:
+                # A block's sends fall due at its end, after its transactions.
+                judge_through(tx.height - 1)
                 try:
                     self.stdout.write(
                         f"Processing {tx.hash} (type={tx.type}, height={tx.height})..."
@@ -185,8 +199,7 @@ class Command(BaseCommand):
                     errors += 1
                     self.stderr.write(f"  ERROR processing {tx.hash}: {e}")
 
-        if not tx_type:
-            judge_all_matured_reserve_sends()
+            judge_through(float("inf"))
 
         self.stdout.write(
             f"Done. Processed: {processed}, Errors: {errors}, Total: {count}"

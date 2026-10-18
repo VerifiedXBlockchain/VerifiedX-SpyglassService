@@ -67,6 +67,11 @@ class VbtcV2TokenTransferSerializer(serializers.ModelSerializer):
     transaction_hash = serializers.CharField(
         source="transaction.hash", read_only=True
     )
+    # A reserve send the node refused when it fell due moved nothing (the
+    # node marks it Failed).
+    refused_at_maturity = serializers.BooleanField(
+        source="transaction.refused_at_maturity", read_only=True
+    )
 
     class Meta:
         model = VbtcV2TokenTransfer
@@ -77,6 +82,7 @@ class VbtcV2TokenTransferSerializer(serializers.ModelSerializer):
             "amount",
             "is_multi",
             "transaction_hash",
+            "refused_at_maturity",
             "created_at",
         )
 

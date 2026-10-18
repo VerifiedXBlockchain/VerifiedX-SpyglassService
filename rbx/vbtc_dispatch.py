@@ -446,49 +446,81 @@ def settle_pending_owners(block):
             _move_owner(token, token.pending_owner_address, tx)
 
 
+def _sender_covers(row, cutoff, held, owners, pending):
+    """DeferredVbtcTransferStillCovered: the owner of a vault the chain does
+    not watch is covered; anyone else must hold the amount on the ledger as
+    it stood at `cutoff`. `held` carries the running figure per (contract,
+    sender) through one judging pass; `pending` is what to add back to the
+    ledger's figure (sends the ledger already counts but that are judged in
+    this pass)."""
+    token = row.token
+    if token.pk not in owners:
+        owners[token.pk] = token.owner_before(cutoff)
+    if owners[token.pk] == row.from_address:
+        return True
+    key = (token.pk, row.from_address)
+    if key not in held:
+        entries = token.ledger_entries(before=cutoff)
+        held[key] = entries.get(row.from_address, Decimal(0)) + pending.get(key, Decimal(0))
+    if held[key] >= row.amount:
+        held[key] -= row.amount
+        return True
+    return False
+
+
+def _pass_order(row):
+    """Core's order of reserve rows: (ConfirmTimestamp, Height, Hash)."""
+    return (row.transaction.unlock_time, row.transaction.height, row.transaction.hash)
+
+
+def _end_of(block):
+    """A cut-off after every transaction of block (owner_before compares
+    (height, hash); ledger_entries compares height and time)."""
+    return Transaction(hash="\uffff", height=block.height, date_crafted=block.date_crafted, type=-1)
+
+
 def settle_matured_reserve_sends(block):
     """End of a block: the node applies each reserve vBTC send whose unlock
-    time is before the block's and after the block before's, judging it
-    again first (UpdateTreiFromReserve). From the path-audit rules a send its
-    sender no longer covers is refused and moves nothing; ledger_entries
-    then leaves it out. The sends of one block are judged in unlock order,
-    each against the ledger with the ones before it applied.
+    time is before the block's and at or after the block before's, judging
+    it again first (UpdateTreiFromReserve). From the path-audit rules a send
+    its sender no longer covers is refused and moves nothing; ledger_entries
+    then leaves it out. The sends of one block are judged in Core's order,
+    each against the ledger with the ones before it applied. A send a
+    recovery redirected is no longer pending on the node and is not judged.
 
     Not mirrored: the holder limit and the attested owner balance of a vault
     the chain watches (#159); such a send is taken as covered."""
     previous = Block.objects.filter(height=block.height - 1).values_list("date_crafted", flat=True).first()
-    due = VbtcV2TokenTransfer.objects.filter(
-        from_address__startswith="xRBX",
-        is_multi=False,
-        transaction__type=Transaction.Type.VBTC_V2_TRANSFER,
-        transaction__voided_from_callback=False,
-        transaction__refused_at_maturity=False,
-        transaction__unlock_time__lt=block.date_crafted,
-    ).select_related("transaction", "token")
-    if previous is not None:
-        due = due.filter(transaction__unlock_time__gte=previous)
+    if previous is None:
+        return
     rules_from = (
         Block.objects.filter(height=fund_loss_audit_height()).values_list("date_crafted", flat=True).first()
     )
     if rules_from is None:
         return
-    end_of_block = Transaction(hash="", height=block.height, date_crafted=block.date_crafted, type=-1)
-    held = {}
-    for row in sorted(due, key=lambda r: (r.transaction.unlock_time, r.transaction.hash)):
-        tx = row.transaction
-        if tx.unlock_time < rules_from or row.token.owner_address == row.from_address:
-            continue
+    due = list(
+        VbtcV2TokenTransfer.objects.filter(
+            from_address__startswith="xRBX",
+            is_multi=False,
+            transaction__type=Transaction.Type.VBTC_V2_TRANSFER,
+            transaction__voided_from_callback=False,
+            transaction__refused_at_maturity=False,
+            transaction__unlock_time__lt=block.date_crafted,
+            transaction__unlock_time__gte=previous,
+            transaction__recovery_outstanding_transactions__isnull=True,
+        ).select_related("transaction", "token")
+    )
+    # The ledger at the end of the block already counts these sends (their
+    # unlock is before the cut-off); each is added back and applied in turn.
+    pending = {}
+    for row in due:
         key = (row.token_id, row.from_address)
-        if key not in held:
-            # The ledger as it stood at the end of this block (a catch-up
-            # sync must not count later blocks), with every send falling due
-            # here added back, then applied in order.
-            entries = row.token.ledger_entries(before=end_of_block)
-            held[key] = entries.get(row.from_address, Decimal(0)) + sum(
-                (r.amount for r in due if (r.token_id, r.from_address) == key), Decimal(0)
-            )
-        if held[key] >= row.amount:
-            held[key] -= row.amount
+        pending[key] = pending.get(key, Decimal(0)) + row.amount
+    cutoff = _end_of(block)
+    held, owners = {}, {}
+    for row in sorted(due, key=_pass_order):
+        tx = row.transaction
+        if tx.unlock_time < rules_from or _sender_covers(row, cutoff, held, owners, pending):
             continue
         logging.warning(
             f"Reserve vBTC send {tx.hash} of {row.amount} on {row.token.sc_identifier}: not covered by "
@@ -498,24 +530,51 @@ def settle_matured_reserve_sends(block):
         tx.save(update_fields=["refused_at_maturity"])
 
 
-def judge_all_matured_reserve_sends():
-    """For a backfill: every reserve vBTC send judged again at the block it
-    fell due in, in order, from a clean slate."""
+def maturity_heights():
+    """The blocks in which some reserve vBTC send falls due: for each, the
+    first block stamped after its unlock time."""
+    heights = set()
     sends = Transaction.objects.filter(
         type=Transaction.Type.VBTC_V2_TRANSFER, from_address__startswith="xRBX", unlock_time__isnull=False
-    )
-    sends.filter(refused_at_maturity=True).update(refused_at_maturity=False)
-    heights = set()
-    for tx in sends.only("height", "unlock_time"):
+    ).only("height", "unlock_time")
+    for tx in sends:
         due = (
             Block.objects.filter(height__gte=tx.height, date_crafted__gt=tx.unlock_time)
             .order_by("height")
+            .values_list("height", flat=True)
             .first()
         )
         if due is not None:
-            heights.add(due.height)
-    for height in sorted(heights):
-        settle_matured_reserve_sends(Block.objects.get(height=height))
+            heights.add(due)
+    return sorted(heights)
+
+
+def clear_maturity_refusals():
+    Transaction.objects.filter(
+        type=Transaction.Type.VBTC_V2_TRANSFER, refused_at_maturity=True
+    ).update(refused_at_maturity=False)
+
+
+def redirect_reserve_sends(recovery_tx, sends, recovery_address):
+    """Recover() with reserve vBTC sends in flight (RecoverReserveAccountTx,
+    StateData.cs:1704): from the path-audit rules each is judged in Core's
+    order; one its sender covers is applied to the recovery address at
+    once, and one it does not cover is taken back with the rest and never
+    applied (voided, as a called-back send)."""
+    rows = list(
+        VbtcV2TokenTransfer.objects.filter(transaction__in=sends, is_multi=False).select_related("transaction", "token")
+    )
+    judged = recovery_tx.height >= fund_loss_audit_height()
+    held, owners = {}, {}
+    for row in sorted(rows, key=_pass_order):
+        if judged and not _sender_covers(row, recovery_tx, held, owners, {}):
+            logging.warning(
+                f"Reserve vBTC send {row.transaction.hash} on {row.token.sc_identifier}: not covered by "
+                f"{row.from_address} at the recovery {recovery_tx.hash}; taken back, never applied."
+            )
+            void_reserve_transfer(row.transaction)
+            continue
+        redirect_reserve_transfer(row.transaction, recovery_address, recovery_tx.date_crafted)
 
 
 def call_back_ownership_transfer(original_tx):
