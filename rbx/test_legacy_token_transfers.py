@@ -182,3 +182,39 @@ class RecordRuleTests(LegacyTokenTransferCase):
         with patch("rbx.client.get_block", return_value={"Transactions": [{"Hash": "lt"}, {"Hash": "pay"}]}):
             process_transaction(tx)
         self.assertEqual(self.balance("Token_Base"), Decimal(1))
+
+    def test_an_m_sale_complete_payee_has_a_record(self):
+        make_tx(make_block(height=501), "msale", T.NFT_SALE, from_address="Buyer", to_address="Seller", data={
+            "Function": "M_Sale_Complete()", "ContractUID": "nft:1", "Royalty": False,
+            "Transactions": [{"ToAddress": "Rm"}],
+        })
+        self.assert_credited("Rm", "Rm")
+
+    def test_a_royalty_given_as_a_string_counts(self):
+        make_tx(make_block(height=501), "sale", T.NFT_SALE, from_address="Buyer", to_address="Seller", data={
+            "Function": "Sale_Complete()", "ContractUID": "nft:1", "Royalty": "true",
+            "Transactions": [{"ToAddress": "Rs", "Data": "1/2"}, {"ToAddress": "Rr", "Data": "2/2"}],
+        })
+        self.assert_credited("Rr", "Rr")
+
+    def test_a_new_style_transfer_on_a_tokenization_v2_contract_makes_a_record(self):
+        import json as json_module
+
+        deploy = make_tx(make_block(height=502), "dep2", T.TKNZ_MINT, from_address="X",
+                         data=[{"Function": "TokenDeploy()", "ContractUID": "tv2:1"}])
+        nft = make_token(owner="X", sc_identifier="tv2:1").nft
+        nft.mint_transaction = deploy
+        nft.smart_contract_data = json_module.dumps({"Features": [{"FeatureName": 14, "FeatureFeatures": {}}]})
+        nft.save(update_fields=["mint_transaction", "smart_contract_data"])
+        make_tx(make_block(height=503), "ns2", T.TKNZ_TX, from_address="X", to_address="Rtv2",
+                data={"Function": "TokenTransfer()", "ContractUID": "tv2:1", "ToAddress": "Rtv2"})
+        self.assert_credited("Rtv2", "Rtv2")
+
+    def test_reassign_lists_only_transfers_on_a_token(self):
+        self.legacy(7000000, "nt", "Rnotoken", "1")
+        Transaction.objects.filter(hash="nt").update(data={
+            "Function": "TokenTransfer()", "ContractUID": "not-a-token", "FromAddress": SENDER,
+            "ToAddress": "Rnotoken", "Amount": 1.0})
+        out = StringIO()
+        call_command("reassign_legacy_token_transfers", "--dry-run", stdout=out, stderr=StringIO())
+        self.assertNotIn("Rnotoken", out.getvalue())

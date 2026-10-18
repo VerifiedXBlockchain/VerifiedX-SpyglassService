@@ -47,6 +47,10 @@ class Command(BaseCommand):
             except InvalidOperation:
                 self.stderr.write(f"  ERROR {tx.hash}: amount does not parse; skipped.")
                 continue
+            if not FungibleToken.objects.filter(sc_identifier=sc_uid).exists():
+                # Core moves nothing on a contract without TokenDetails, and
+                # Spyglass indexes token rows only for its tokens.
+                continue
             credited = credited_address(tx, recipient)
             if credited == TOKEN_BASE:
                 stranded += 1
@@ -70,9 +74,8 @@ class Command(BaseCommand):
                     .first()
                 )
             if row is None:
-                if FungibleToken.objects.filter(sc_identifier=sc_uid).exists():
-                    missing += 1
-                    self.stderr.write(f"  MISSING {tx.hash}: no token row for this transfer.")
+                missing += 1
+                self.stderr.write(f"  MISSING {tx.hash}: no token row for this transfer.")
                 continue
             consumed.add(row.pk)
             if row.receiving_address != credited or row.transaction_id != tx.pk:

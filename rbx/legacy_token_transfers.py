@@ -15,21 +15,24 @@ f41b1ed7):
 - the recipient of a TX or a VFX unshield (UpdateTreis,
   PrivateTxLedgerService.CreditVfxUnshieldAsync) and of the genesis block;
 - the recipient of a new-style TokenTransfer() (ToAddress the recipient) on
-  a token contract;
-- the seller and royalty payee of a Sale_Complete() (CompleteSaleSmartContract);
+  a contract with TokenDetails: a token (feature 13) or a TokenizationV2
+  contract (feature 14) deployed by TokenDeploy() (DeployTokenContract);
+- the seller and royalty payee of a Sale_Complete() or M_Sale_Complete()
+  (CompleteSaleSmartContract);
 - the recovery address of a Recover() (RecoverReserveAccountTx).
 
 An old-style transfer to the recipient creates none. Inside a block the
 order is not stored: a record made in the transfer's own block counts when
 the node's order puts it first (rbx.vbtc_bridge.chain_order).
 """
+import json
 import logging
 
 from django.db.models import Q, TextField
 from django.db.models.functions import Cast
 
-from rbx.models import FungibleToken, Transaction
-from rbx.vbtc_gates import bound_field, field, fund_loss_audit_height, net_string, parse_object
+from rbx.models import FungibleToken, Nft, Transaction
+from rbx.vbtc_gates import bound_field, field, fund_loss_audit_height, net_string, parse_envelope, parse_object
 
 TOKEN_BASE = "Token_Base"
 
@@ -49,14 +52,49 @@ def _creates_record_for(tx, address):
     if (
         tx.to_address == address
         and function == "TokenTransfer()"
-        and FungibleToken.objects.filter(sc_identifier=net_string(field(payload, "ContractUID"))).exists()
+        and has_token_details(net_string(field(payload, "ContractUID")))
     ):
         return True
-    if tx.type == Transaction.Type.NFT_SALE and function == "Sale_Complete()":
+    if tx.type == Transaction.Type.NFT_SALE and function in SALE_COMPLETE_FUNCTIONS:
         return address in sale_payees(payload)
     if tx.type == Transaction.Type.RESERVE and function == "Recover()":
         return net_string(field(payload, "RecoveryAddress")) == address
     return False
+
+
+SALE_COMPLETE_FUNCTIONS = ("Sale_Complete()", "M_Sale_Complete()")
+TOKEN_FEATURE = 13
+TOKENIZATION_V2_FEATURE = 14
+
+
+def has_token_details(sc_uid):
+    """Whether Core's state record of the contract carries TokenDetails: a
+    TokenDeploy() of a contract with the Token feature (Spyglass's
+    FungibleToken) or the TokenizationV2 feature (DeployTokenContract)."""
+    if not sc_uid:
+        return False
+    if FungibleToken.objects.filter(sc_identifier=sc_uid).exists():
+        return True
+    nft = Nft.objects.filter(identifier=sc_uid).select_related("mint_transaction").first()
+    if nft is None or nft.mint_transaction is None:
+        return False
+    payload, _ = parse_envelope(nft.mint_transaction.data)
+    if net_string(field(payload, "Function")) != "TokenDeploy()":
+        return False
+    try:
+        contract = json.loads(nft.smart_contract_data or "{}")
+    except ValueError:
+        return False
+    features = contract.get("Features") if isinstance(contract, dict) else None
+    return any(
+        isinstance(f, dict) and f.get("FeatureName") in (TOKEN_FEATURE, TOKENIZATION_V2_FEATURE)
+        for f in features or []
+    )
+
+
+def _is_true(value):
+    """ToObject<bool?>(): a JSON true, or a string bool.Parse reads as true."""
+    return value is True or (isinstance(value, str) and value.strip().lower() == "true")
 
 
 def sale_payees(payload):
@@ -72,7 +110,7 @@ def sale_payees(payload):
     def to(t):
         return net_string(bound_field(t, "ToAddress"))
 
-    if field(payload, "Royalty") is True:
+    if _is_true(field(payload, "Royalty")):
         marked = [t for t in inner if "1/2" in str(bound_field(t, "Data") or "")][:1]
         marked += [t for t in inner if "2/2" in str(bound_field(t, "Data") or "")][:1]
         return {to(t) for t in marked if to(t)}
