@@ -676,6 +676,29 @@ class RewindTests(WatchedVaultCase):
             self.reconcile(history(paid=[self.PAID]))
             self.assertEqual(self.row().status, Status.COMPLETED)
 
+    def test_a_payment_made_again_after_a_rewind_takes_the_new_txid_and_report_in_either_order(self):
+        # Unsettle keeps the pins; a sibling confirms with a new report the
+        # node lists before Spyglass reads it. Status and amount stand.
+        for height, types, report in ((75, [T.VBTC_V2_BTC_REORG, T.VBTC_V2_BTC_REPORT], "t75-1"),
+                                      (76, [T.VBTC_V2_BTC_REPORT, T.VBTC_V2_BTC_REORG], "t76-0")):
+            txid = f"T{height}"
+            self.sync(height, types, history(paid=[{"RequestHash": "r1", "CompletionHash": report,
+                                                    "BTCTransactionHash": txid}]))
+            row = self.row()
+            self.assertEqual(row.status, Status.COMPLETED)
+            self.assertEqual(row.btc_transaction_hash, txid)
+            self.assertEqual(row.completion_transaction_id, report)
+            self.assertEqual(row.completed_at, row.completion_transaction.date_crafted)
+            self.assertEqual(row.amount, Decimal("0.003"))
+
+    def test_a_payment_made_again_whose_report_is_not_indexed_keeps_the_row(self):
+        self.sync(70, [T.VBTC_V2_BTC_REORG], history(paid=[{"RequestHash": "r1", "CompletionHash": "later",
+                                                            "BTCTransactionHash": "T2"}]))
+        row = self.row()
+        self.assertEqual(row.status, Status.COMPLETED)
+        self.assertEqual(row.btc_transaction_hash, "T")
+        self.assertEqual(row.completion_transaction_id, "rep1")
+
     def test_the_owner_add_back_is_removed_while_the_payment_is_unconfirmed(self):
         self.token.global_balance = Decimal("0.01")
         self.token.save(update_fields=["global_balance"])

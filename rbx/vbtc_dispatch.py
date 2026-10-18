@@ -1037,12 +1037,13 @@ def _reopen_unpaid(token, data):
     paid = data.get("WithdrawalHistory") if isinstance(data, dict) and data.get("Success") else None
     if not isinstance(paid, list):
         return
-    listed = {entry.get("RequestHash") for entry in paid if isinstance(entry, dict)}
+    listed = {entry.get("RequestHash"): entry for entry in paid if isinstance(entry, dict)}
     reopened = []
     for withdrawal in token.withdrawal_requests.filter(status=VbtcV2WithdrawalRequest.Status.COMPLETED).select_related(
         "request_transaction"
     ):
         if withdrawal.request_transaction_id in listed:
+            _repaid(token, withdrawal, listed[withdrawal.request_transaction_id])
             continue
         logging.warning(
             f"Watched vault {token.sc_identifier}: withdrawal {withdrawal.request_transaction_id} is no longer paid "
@@ -1057,6 +1058,32 @@ def _reopen_unpaid(token, data):
     if reopened:
         token.recompute_pending_withdrawal()
         _replan_settlements_since(token, min((w.request_transaction for w in reopened), key=lambda t: t.height))
+
+
+def _repaid(token, withdrawal, entry):
+    """A paid row the node still lists after a rewind may have been paid
+    again since, by another of its pinned transactions (Unsettle keeps the
+    pins, BtcWithdrawals.Rewind.cs:116-121) with a later report: the txid
+    and the completing report are the node's. The amount and the status do
+    not change."""
+    txid = entry.get("BTCTransactionHash")
+    completion = entry.get("CompletionHash")
+    if not txid or not completion:
+        return
+    if withdrawal.btc_transaction_hash == txid and withdrawal.completion_transaction_id == completion:
+        return
+    report = Transaction.objects.filter(hash=completion).first()
+    if report is None:
+        _log_once(token, entry, f"was paid again; waits for report {completion} to be indexed")
+        return
+    logging.warning(
+        f"Watched vault {token.sc_identifier}: withdrawal {withdrawal.request_transaction_id} was paid again after a "
+        f"Bitcoin rewind, by {txid} (report {completion})."
+    )
+    withdrawal.btc_transaction_hash = txid
+    withdrawal.completion_transaction = report
+    withdrawal.completed_at = report.date_crafted
+    withdrawal.save(update_fields=["btc_transaction_hash", "completion_transaction", "completed_at"])
 
 
 def _apply_withdrawal_history(token, data):

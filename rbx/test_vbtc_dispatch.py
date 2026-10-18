@@ -1601,6 +1601,22 @@ class SendsDueTogetherTests(TestCase):
         self.assertTrue(self.refused(b_send))
         self.assertNotIn("R", self.token.ledger_entries())
 
+    def test_a_credit_settled_in_an_earlier_block_stays_in_the_seed(self):
+        # A's send to B falls due at block 3, B's on at block 4: B holds the
+        # credit by then.
+        a_send = self.send("rs1", "xRBXa", "xRBXb", 0.003)
+        b_send = self.send("rs0", "xRBXb", "R", 0.002)
+        b_send.unlock_time = self.unlock + timedelta(seconds=10)
+        b_send.save(update_fields=["unlock_time"])
+        self.settle()
+        later = make_block(height=4)
+        Block.objects.filter(pk=later.pk).update(date_crafted=b_send.unlock_time + timedelta(seconds=1))
+        later.refresh_from_db()
+        settle_matured_reserve_sends(later)
+        self.assertFalse(self.refused(a_send))
+        self.assertFalse(self.refused(b_send))
+        self.assertEqual(self.token.ledger_entries()["R"], Decimal("0.002"))
+
     def test_a_sender_spending_a_credit_then_its_own_holding(self):
         # B holds 0.001 already; A's 0.003 sorts first, so B's 0.004 is covered.
         add_transfer(self.token, make_tx(self.sent, "s2", Transaction.Type.VBTC_V2_TRANSFER), "O", "xRBXb", "0.001")
