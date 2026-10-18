@@ -908,6 +908,31 @@ class ReserveOwnershipTransferTests(TestCase):
         self.assertEqual(data["owner_address"], "P")
         self.assertIsNone(data["pending_owner_address"])
 
+    def test_unlock_passed_by_the_clock_but_by_no_block_still_reads_as_the_senders(self):
+        # The node moves the owner after the first block stamped past the
+        # unlock and admits a callback until then (ReserveService.cs:17-21).
+        mined = timezone.now() - timedelta(hours=1)
+        Block.objects.filter(pk=self.block.pk).update(date_crafted=mined)
+        unlock = mined + timedelta(seconds=30)
+        self.tx.unlock_time = unlock
+        self.tx.save(update_fields=["unlock_time"])
+        self.assertLess(unlock, timezone.now())
+        self.assertEqual(self.token.current_owner(), self.OWNER)
+        data = VbtcV2TokenSerializer(self.token).data
+        self.assertEqual(data["owner_address"], self.OWNER)
+        self.assertEqual(data["pending_owner_address"], "P")
+        # Once a block stamped past the unlock is indexed, it is the recipient's.
+        later = make_block(height=2)
+        Block.objects.filter(pk=later.pk).update(date_crafted=unlock + timedelta(seconds=1))
+        self.assertEqual(self.token.current_owner(), "P")
+        self.assertIsNone(VbtcV2TokenSerializer(self.token).data["pending_owner_address"])
+
+    def test_block_stamped_at_the_unlock_does_not_pass_it(self):
+        later = make_block(height=2)
+        self.tx.unlock_time = later.date_crafted
+        self.tx.save(update_fields=["unlock_time"])
+        self.assertEqual(self.token.current_owner(), self.OWNER)
+
     def test_block_after_the_unlock_moves_the_owner(self):
         self.unlock()
         settle_pending_owners(self.block_after_unlock())

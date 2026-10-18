@@ -1229,14 +1229,21 @@ class VbtcV2Token(models.Model):
 
     def pending_owner_settled(self, as_of=None):
         """Whether the pending reserve transfer has taken effect at as_of
-        (default now): its unlock time is before as_of, as the node settles
-        a reserve row (ReserveTransactions.DueRows), and it was not called
-        back."""
+        (default the latest indexed block's time): its unlock time is before
+        as_of, as the node settles a reserve row (ReserveTransactions.DueRows)
+        after the first block stamped past it, and it was not called back.
+        Not the wall clock: until that block the node still names the sender
+        and admits a callback (ReserveService.cs:17-21)."""
         tx = self.pending_owner_transaction
         if tx is None or not self.pending_owner_address or tx.voided_from_callback:
             return False
-        as_of = timezone.now() if as_of is None else as_of
-        return tx.unlock_time is None or tx.unlock_time < as_of
+        if tx.unlock_time is None:
+            return True
+        if as_of is None:
+            as_of = Block.objects.order_by("-height").values_list("date_crafted", flat=True).first()
+            if as_of is None:
+                return False
+        return tx.unlock_time < as_of
 
     def current_owner(self, as_of=None):
         if self.pending_owner_settled(as_of):
