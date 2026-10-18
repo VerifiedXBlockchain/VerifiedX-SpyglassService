@@ -1001,6 +1001,10 @@ def reconcile_all_watched_vaults():
     for token in tokens:
         if token.is_watched:
             settled += reconcile_watched_withdrawals(token)
+    # Exits on watched vaults settle the same way.
+    from rbx.vbtc_bridge import reconcile_watched_exits
+
+    reconcile_watched_exits()
     return settled
 
 

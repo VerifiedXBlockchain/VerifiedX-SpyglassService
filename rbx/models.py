@@ -1206,6 +1206,10 @@ class VbtcV2Token(models.Model):
     # unlocks, and a callback before then undoes it (StateData.cs
     # TransferSmartContract, UpdateTreiFromReserve, CallBackReserveAccountTx).
     pending_owner_address = models.CharField(max_length=64, blank=True, null=True)
+    # A watched vault's Bitcoin paid out for bridge exits, as the node reports
+    # it (PaidOutForBridgeExitsSats): added back to the owner, as Core's
+    # SettledExitSats.
+    settled_exit_btc = models.DecimalField(decimal_places=16, max_digits=32, default=0)
     pending_owner_transaction = models.ForeignKey(
         "Transaction", blank=True, null=True, on_delete=models.SET_NULL, related_name="+"
     )
@@ -1530,8 +1534,10 @@ class VbtcV2Token(models.Model):
         total_withdrawn = VbtcV2WithdrawalRequest.objects.filter(
             token=self, status=VbtcV2WithdrawalRequest.Status.COMPLETED
         ).aggregate(total=Sum("amount"))["total"] or Decimal(0)
-        # The Bitcoin fee of a release left the vault and was charged to its
-        # requester (Core's ReleaseFeeSats in OwnerAddBackBtc).
+        # What bridge exits paid out of a watched vault (Core's SettledExitSats)
+        # and the Bitcoin fee of a release, charged to its requester (Core's
+        # ReleaseFeeSats), both in OwnerAddBackBtc.
+        total_withdrawn += self.settled_exit_btc
         for w in VbtcV2WithdrawalRequest.objects.filter(
             token=self, status=VbtcV2WithdrawalRequest.Status.CANCELLED, refunded_amount__isnull=False
         ):
@@ -1702,6 +1708,9 @@ class VbtcV2BridgeExit(models.Model):
     is_complete = models.BooleanField(default=False)
     # The Bitcoin transaction, or "FAILED:<fail tx hash>" as the node marks a failed exit.
     btc_tx_hash = models.CharField(max_length=128, blank=True)
+    # On vaults the chain watches: the parts whose outcome read from the node
+    # has been applied to the locks (vbtc_bridge.reconcile_watched_exit).
+    applied_parts = models.JSONField(default=list)
 
     @property
     def failed(self):

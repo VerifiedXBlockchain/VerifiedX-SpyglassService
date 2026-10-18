@@ -510,6 +510,11 @@ def apply_exit_complete(tx):
     btc_tx = net_string(field(payload, "BtcTxHash"))
     if not burn or not btc_tx:
         return None
+    if is_watched_exit(_exit(burn)):
+        # BtcWithdrawals.ExitRefusal: the chain completes it when Bitcoin
+        # shows its transactions.
+        logging.warning(f"VBTC_BRIDGE_EXIT_TO_BTC_COMPLETE {tx.hash}: exit on watched vaults; the node refuses it.")
+        return None
     # MarkComplete matches the stored hash trimmed and without regard to
     # case (LiteDB), not the normalised one.
     VbtcV2BridgeExit.objects.filter(burn_tx_hash__iexact=burn.strip()).update(
@@ -529,6 +534,9 @@ def apply_exit_fail(tx):
     failed = _allocations(payload, "FailedAllocations")
     if not burn or not failed:
         logging.error(f"{what} {tx.hash}: missing or empty FailedAllocations; the node applies nothing.")
+        return None
+    if is_watched_exit(_exit(burn)):
+        logging.warning(f"{what} {tx.hash}: exit on watched vaults; the node fails it by rule, not by a transaction.")
         return None
     burn = burn.strip()
 
@@ -565,6 +573,123 @@ def apply_exit_fail(tx):
     exit.btc_tx_hash = f"FAILED:{tx.hash}"
     exit.save(update_fields=["is_complete", "btc_tx_hash"])
     return None
+
+
+# --- exits on vaults the chain watches ---------------------------------------
+
+def _exit_tokens(exit):
+    """The vaults an exit's allocations draw on."""
+    lock_ids = [a.get("LockId", "") for a in exit.allocations if isinstance(a, dict)]
+    tokens = {}
+    for lock_id in lock_ids:
+        lock = _lock(lock_id)
+        if lock is not None:
+            tokens[lock.token_id] = lock.token
+    return list(tokens.values())
+
+
+def is_watched_exit(exit):
+    """BtcWithdrawals.IsWatchedExit: an exit on vaults the chain watches is
+    paid by pinned transactions and settled by the chain alone."""
+    if exit is None:
+        return False
+    tokens = _exit_tokens(exit)
+    return bool(tokens) and all(token.is_watched for token in tokens)
+
+
+def _restore(lock, amount, blacklist=False):
+    """RestoreUnlock, or BlacklistLock when the lock is taken out of use."""
+    lock.unlocked_amount = max(Decimal(0), lock.unlocked_amount - amount)
+    lock.unlocked_amount_sats = max(0, lock.unlocked_amount_sats - _sats(amount))
+    lock.is_unlocked = False
+    if blacklist:
+        lock.is_blacklisted = True
+    lock.save(update_fields=["unlocked_amount", "unlocked_amount_sats", "is_unlocked", "is_blacklisted"])
+
+
+def reconcile_watched_exit(exit):
+    """An open exit on watched vaults takes its outcome from the node's
+    GetBridgeExit (BtcWithdrawals: SettleExitPart, ExpireExit,
+    VoidExitPart). Complete: the exit is closed and its burn is spent.
+    Expired by rule: its locks are given back. A part voided: that vault's
+    locks are given back and taken out of use. Each outcome is applied once.
+    A node that does not answer changes nothing."""
+    from rbx.client import get_vbtc_v2_bridge_exit
+
+    data = get_vbtc_v2_bridge_exit(exit.burn_tx_hash)
+    view = data.get("Exit") if isinstance(data, dict) and data.get("Success") else None
+    if not isinstance(view, dict):
+        logging.error(f"Bridge exit {exit.burn_tx_hash}: no state from the node; left as it is.")
+        return False
+    lock_tokens = {}
+    for allocation in exit.allocations:
+        lock = _lock(allocation.get("LockId", ""))
+        if lock is not None:
+            lock_tokens.setdefault(lock.token.sc_identifier, []).append((lock, Decimal(str(allocation["UnlockAmount"]))))
+
+    applied = list(exit.applied_parts)
+    for part in view.get("Parts") or []:
+        if not isinstance(part, dict) or part.get("State") != "Void":
+            continue
+        ref = f"void:{part.get('SmartContractUID')}"
+        if ref in applied:
+            continue
+        for lock, amount in lock_tokens.get(part.get("SmartContractUID"), []):
+            _restore(lock, amount, blacklist=True)
+        applied.append(ref)
+
+    failure = view.get("FailureRecord") or ""
+    if view.get("IsComplete") and not view.get("Failed"):
+        exit.is_complete = True
+        exit.btc_tx_hash = (view.get("BitcoinTransactions") or "")[:128]
+        _mark_consumed(exit.burn_tx_hash, "BTC_EXIT_COMPLETE", exit.exit_transaction)
+    elif view.get("Failed"):
+        if "expired@" in failure and "expired" not in applied:
+            for pairs in lock_tokens.values():
+                for lock, amount in pairs:
+                    _restore(lock, amount)
+            applied.append("expired")
+        exit.is_complete = True
+        exit.btc_tx_hash = f"FAILED:{failure}"[:128]
+    exit.applied_parts = applied
+    exit.save(update_fields=["is_complete", "btc_tx_hash", "applied_parts"])
+    return True
+
+
+def refresh_watched_exit_payouts(token):
+    """PaidOutForBridgeExitsSats from the node's GetWithdrawalStatus."""
+    from rbx.client import get_vbtc_v2_withdrawal_status
+
+    data = get_vbtc_v2_withdrawal_status(token.sc_identifier)
+    bitcoin = data.get("Bitcoin") if isinstance(data, dict) and data.get("Success") else None
+    sats = bitcoin.get("PaidOutForBridgeExitsSats") if isinstance(bitcoin, dict) else None
+    if not isinstance(sats, int) or isinstance(sats, bool):
+        logging.error(f"Watched vault {token.sc_identifier}: no bridge payout figure from the node; left as it is.")
+        return False
+    paid = Decimal(sats) / SATS_PER_BTC
+    if token.settled_exit_btc != paid:
+        type(token).objects.filter(pk=token.pk).update(settled_exit_btc=paid)
+        token.settled_exit_btc = paid
+    return True
+
+
+def reconcile_watched_exits():
+    """Every open exit on watched vaults, then the payout figure of every
+    watched vault an exit has drawn on."""
+    with atomic():
+        lock_bridge_state()
+        drawn = {}
+        for exit in VbtcV2BridgeExit.objects.filter(is_complete=False).select_related("exit_transaction"):
+            if is_watched_exit(exit):
+                reconcile_watched_exit(exit)
+                for token in _exit_tokens(exit):
+                    drawn[token.pk] = token
+        for exit in VbtcV2BridgeExit.objects.filter(is_complete=True):
+            for token in _exit_tokens(exit):
+                if token.is_watched:
+                    drawn[token.pk] = token
+    for token in drawn.values():
+        refresh_watched_exit_payouts(token)
 
 
 # --- 34-35: shield and unshield ---------------------------------------------

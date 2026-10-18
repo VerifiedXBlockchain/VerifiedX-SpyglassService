@@ -1239,6 +1239,18 @@ def get_vbtc_v2_withdrawal_history(sc_uid: str):
     return _vbtc_v2_request("get", f"vbtcapi/vbtc/GetWithdrawalHistory/{sc_uid}")
 
 
+def get_vbtc_v2_withdrawal_status(sc_uid: str):
+    """A vault's withdrawal state and, for a watched vault, its Bitcoin as the
+    chain records it (Bitcoin.HeldBtc, PaidOutForBridgeExitsSats, ...)."""
+    return _vbtc_v2_request("get", f"vbtcapi/vbtc/GetWithdrawalStatus/{sc_uid}")
+
+
+def get_vbtc_v2_bridge_exit(base_burn_tx_hash: str):
+    """The bridge exit the chain holds for a Base burn, with each watched
+    vault's part."""
+    return _vbtc_v2_request("get", f"vbtcapi/vbtc/GetBridgeExit/{base_burn_tx_hash}")
+
+
 # MPC Ceremony (DKG)
 
 def prepare_vbtc_v2_ceremony(owner_address: str):
