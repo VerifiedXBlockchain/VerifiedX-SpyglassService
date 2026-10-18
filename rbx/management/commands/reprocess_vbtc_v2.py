@@ -11,6 +11,7 @@ from rbx.vbtc_dispatch import (
     OWNERSHIP_TRANSFER_TYPES,
     SC_ENVELOPE_TYPES,
     apply_recovery,
+    judge_all_matured_reserve_sends,
     planned_settlement,
     recovery_address_of,
     replaying,
@@ -156,6 +157,9 @@ class Command(BaseCommand):
                 except Exception as e:
                     errors += 1
                     self.stderr.write(f"  ERROR processing {tx.hash}: {e}")
+
+        if not tx_type:
+            judge_all_matured_reserve_sends()
 
         self.stdout.write(
             f"Done. Processed: {processed}, Errors: {errors}, Total: {count}"

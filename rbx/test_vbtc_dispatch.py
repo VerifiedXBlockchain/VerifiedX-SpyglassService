@@ -14,7 +14,7 @@ from api.btc.serializers import VbtcV2TokenSerializer
 from access.models import User
 from api.btc.views import VbtcV2ListView, _mark_withdrawal_signed
 from rest_framework.test import APIRequestFactory, force_authenticate
-from rbx.models import Address, Recovery, Transaction, VbtcV2TokenTransfer, VbtcV2WithdrawalRequest
+from rbx.models import Address, Block, Recovery, Transaction, VbtcV2TokenTransfer, VbtcV2WithdrawalRequest
 from rbx.tasks import process_transaction
 from rbx.tests import add_transfer, add_withdrawal, make_block, make_token, make_tx
 from rbx.vbtc_dispatch import (
@@ -23,6 +23,7 @@ from rbx.vbtc_dispatch import (
     apply_recovery,
     replaying,
     reserve_transfer_undone,
+    settle_matured_reserve_sends,
     settle_pending_owners,
     void_reserve_transfer,
 )
@@ -1215,3 +1216,89 @@ class ReserveCallbackWindowTests(TestCase):
     def test_callback_after_the_transfer_applied_does_not_count(self):
         self.call_back_in(self.later)
         self.assertFalse(reserve_transfer_undone(self.tx))
+
+
+@override_settings(VBTC_NETWORK="testnet", VBTC_FUND_LOSS_AUDIT_HEIGHT=1)
+class MaturedReserveSendTests(TestCase):
+    """A reserve vBTC send is judged again when it falls due: one its sender
+    no longer covers moves nothing (StateData.UpdateTreiFromReserve)."""
+
+    def setUp(self):
+        self.rules = make_block(height=1)
+        Block.objects.filter(pk=self.rules.pk).update(date_crafted=timezone.now() - timedelta(hours=1))
+        self.token = make_token(owner="O", global_balance="0.01", sc_identifier="sc:a")
+        add_transfer(self.token, make_tx(self.rules, "s1", Transaction.Type.VBTC_V2_TRANSFER), "O", "xRBXreserve", "0.005")
+        self.sent = make_block(height=2)
+        sent_at = timezone.now() - timedelta(minutes=10)
+        Block.objects.filter(pk=self.sent.pk).update(date_crafted=sent_at)
+        self.send = single_transfer_tx(self.sent, "rs1", "xRBXreserve", "R", "sc:a", 0.004)
+        self.send.date_crafted = sent_at
+        self.send.unlock_time = sent_at + timedelta(seconds=30)
+        self.send.save(update_fields=["date_crafted", "unlock_time"])
+        process_transaction(self.send)
+
+    def due_block(self):
+        block = make_block(height=3)
+        Block.objects.filter(pk=block.pk).update(date_crafted=self.send.unlock_time + timedelta(seconds=1))
+        block.refresh_from_db()
+        return block
+
+    def test_a_covered_send_moves_at_maturity(self):
+        settle_matured_reserve_sends(self.due_block())
+        self.send.refresh_from_db()
+        self.assertFalse(self.send.refused_at_maturity)
+        self.assertEqual(self.token.ledger_entries()["R"], Decimal("0.004"))
+
+    def test_a_send_no_longer_covered_is_refused_and_moves_nothing(self):
+        # The sender escrows a withdrawal before the send falls due.
+        request = make_tx(self.sent, "w1", Transaction.Type.VBTC_V2_WITHDRAWAL_REQUEST)
+        add_withdrawal(self.token, request, "xRBXreserve", "0.003", VbtcV2WithdrawalRequest.Status.REQUESTED)
+        settle_matured_reserve_sends(self.due_block())
+        self.send.refresh_from_db()
+        self.assertTrue(self.send.refused_at_maturity)
+        entries = self.token.ledger_entries()
+        self.assertNotIn("R", entries)
+        self.assertEqual(entries["xRBXreserve"], Decimal("0.002"))
+
+    @override_settings(VBTC_NETWORK="testnet", VBTC_FUND_LOSS_AUDIT_HEIGHT=1000)
+    def test_before_the_path_audit_rules_the_send_moves_regardless(self):
+        request = make_tx(self.sent, "w1", Transaction.Type.VBTC_V2_WITHDRAWAL_REQUEST)
+        add_withdrawal(self.token, request, "xRBXreserve", "0.003", VbtcV2WithdrawalRequest.Status.REQUESTED)
+        settle_matured_reserve_sends(self.due_block())
+        self.send.refresh_from_db()
+        self.assertFalse(self.send.refused_at_maturity)
+
+    def test_a_block_before_maturity_judges_nothing(self):
+        early = make_block(height=3)
+        Block.objects.filter(pk=early.pk).update(date_crafted=self.send.unlock_time)
+        early.refresh_from_db()
+        request = make_tx(self.sent, "w1", Transaction.Type.VBTC_V2_WITHDRAWAL_REQUEST)
+        add_withdrawal(self.token, request, "xRBXreserve", "0.003", VbtcV2WithdrawalRequest.Status.REQUESTED)
+        settle_matured_reserve_sends(early)
+        self.send.refresh_from_db()
+        self.assertFalse(self.send.refused_at_maturity)
+
+    def test_sync_block_judges_the_sends_falling_due(self):
+        from unittest.mock import patch as mock_patch
+
+        from rbx.tasks import sync_block
+
+        request = make_tx(self.sent, "w1", Transaction.Type.VBTC_V2_WITHDRAWAL_REQUEST)
+        add_withdrawal(self.token, request, "xRBXreserve", "0.003", VbtcV2WithdrawalRequest.Status.REQUESTED)
+        data = {"Height": 3, "Hash": "block-3", "PrevHash": "block-2", "Validator": "V", "ValidatorSignature": "",
+                "ValidatorAnswer": "", "ChainRefId": "", "MerkleRoot": "", "StateRoot": "", "TotalReward": 0,
+                "TotalAmount": 0, "TotalValidators": 0, "Version": 1, "Size": 0, "BCraftTime": 0, "Transactions": [],
+                "Timestamp": int((self.send.unlock_time + timedelta(seconds=1)).timestamp())}
+        with mock_patch("rbx.tasks.notify_socket_service"):
+            sync_block(3, data=data, notify=False)
+        self.send.refresh_from_db()
+        self.assertTrue(self.send.refused_at_maturity)
+
+    def test_backfill_judges_the_sends_again(self):
+        request = make_tx(self.sent, "w1", Transaction.Type.VBTC_V2_WITHDRAWAL_REQUEST)
+        add_withdrawal(self.token, request, "xRBXreserve", "0.003", VbtcV2WithdrawalRequest.Status.REQUESTED)
+        self.due_block()
+        call_command("reprocess_vbtc_v2", stdout=StringIO(), stderr=StringIO())
+        self.send.refresh_from_db()
+        self.assertTrue(self.send.refused_at_maturity)
+        self.assertNotIn("R", self.token.ledger_entries())

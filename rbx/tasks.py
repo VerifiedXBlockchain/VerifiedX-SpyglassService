@@ -268,6 +268,7 @@ def sync_block(height: int, data: Optional[dict] = None, notify: bool = True) ->
                 )
 
         vbtc_dispatch.settle_pending_owners(block)
+        vbtc_dispatch.settle_matured_reserve_sends(block)
 
         if block_created and master_node:
             MasterNode.objects.filter(address=master_node.address).update(

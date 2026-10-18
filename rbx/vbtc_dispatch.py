@@ -46,6 +46,7 @@ from rbx.vbtc_gates import (
     bound_field,
     decode_data,
     field,
+    fund_loss_audit_height,
     net_bool,
     net_decimal,
     net_int,
@@ -443,6 +444,78 @@ def settle_pending_owners(block):
             _clear_pending_owner(token)
         elif token.pending_owner_settled(as_of=block.date_crafted):
             _move_owner(token, token.pending_owner_address, tx)
+
+
+def settle_matured_reserve_sends(block):
+    """End of a block: the node applies each reserve vBTC send whose unlock
+    time is before the block's and after the block before's, judging it
+    again first (UpdateTreiFromReserve). From the path-audit rules a send its
+    sender no longer covers is refused and moves nothing; ledger_entries
+    then leaves it out. The sends of one block are judged in unlock order,
+    each against the ledger with the ones before it applied.
+
+    Not mirrored: the holder limit and the attested owner balance of a vault
+    the chain watches (#159); such a send is taken as covered."""
+    previous = Block.objects.filter(height=block.height - 1).values_list("date_crafted", flat=True).first()
+    due = VbtcV2TokenTransfer.objects.filter(
+        from_address__startswith="xRBX",
+        is_multi=False,
+        transaction__type=Transaction.Type.VBTC_V2_TRANSFER,
+        transaction__voided_from_callback=False,
+        transaction__refused_at_maturity=False,
+        transaction__unlock_time__lt=block.date_crafted,
+    ).select_related("transaction", "token")
+    if previous is not None:
+        due = due.filter(transaction__unlock_time__gte=previous)
+    rules_from = (
+        Block.objects.filter(height=fund_loss_audit_height()).values_list("date_crafted", flat=True).first()
+    )
+    if rules_from is None:
+        return
+    end_of_block = Transaction(hash="", height=block.height, date_crafted=block.date_crafted, type=-1)
+    held = {}
+    for row in sorted(due, key=lambda r: (r.transaction.unlock_time, r.transaction.hash)):
+        tx = row.transaction
+        if tx.unlock_time < rules_from or row.token.owner_address == row.from_address:
+            continue
+        key = (row.token_id, row.from_address)
+        if key not in held:
+            # The ledger as it stood at the end of this block (a catch-up
+            # sync must not count later blocks), with every send falling due
+            # here added back, then applied in order.
+            entries = row.token.ledger_entries(before=end_of_block)
+            held[key] = entries.get(row.from_address, Decimal(0)) + sum(
+                (r.amount for r in due if (r.token_id, r.from_address) == key), Decimal(0)
+            )
+        if held[key] >= row.amount:
+            held[key] -= row.amount
+            continue
+        logging.warning(
+            f"Reserve vBTC send {tx.hash} of {row.amount} on {row.token.sc_identifier}: not covered by "
+            f"{row.from_address} when it fell due; the node refuses it."
+        )
+        tx.refused_at_maturity = True
+        tx.save(update_fields=["refused_at_maturity"])
+
+
+def judge_all_matured_reserve_sends():
+    """For a backfill: every reserve vBTC send judged again at the block it
+    fell due in, in order, from a clean slate."""
+    sends = Transaction.objects.filter(
+        type=Transaction.Type.VBTC_V2_TRANSFER, from_address__startswith="xRBX", unlock_time__isnull=False
+    )
+    sends.filter(refused_at_maturity=True).update(refused_at_maturity=False)
+    heights = set()
+    for tx in sends.only("height", "unlock_time"):
+        due = (
+            Block.objects.filter(height__gte=tx.height, date_crafted__gt=tx.unlock_time)
+            .order_by("height")
+            .first()
+        )
+        if due is not None:
+            heights.add(due.height)
+    for height in sorted(heights):
+        settle_matured_reserve_sends(Block.objects.get(height=height))
 
 
 def call_back_ownership_transfer(original_tx):

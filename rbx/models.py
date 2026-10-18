@@ -229,6 +229,9 @@ class Transaction(models.Model):
     unlock_time = models.DateTimeField(_("Unlock Time"), blank=True, null=True)
 
     voided_from_callback = models.BooleanField(default=False)
+    # A reserve vBTC send the node refused when it fell due (no longer
+    # covered by its sender): it never moved (vbtc_dispatch.settle_matured_reserve_sends).
+    refused_at_maturity = models.BooleanField(default=False)
 
     @property
     def callback_details(self):
@@ -1302,7 +1305,7 @@ class VbtcV2Token(models.Model):
                 t.from_address.startswith("xRBX") or t.transaction.from_address.startswith("xRBX")
             ):
                 tx = t.transaction
-                if tx.voided_from_callback:
+                if tx.voided_from_callback or tx.refused_at_maturity:
                     continue
                 # The node applies a reserve send at the end of the first
                 # block stamped after its unlock time. A send a recovery
