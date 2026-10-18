@@ -50,6 +50,14 @@ class TokenFunctionUnderAnyEnvelopeTests(TokenFunctionCase):
         self.assertEqual(self.balance("R"), Decimal(0))
         self.assertFalse(FungibleTokenTx.objects.exists())
 
+    def test_reindex_removes_a_row_an_older_indexer_wrote_for_an_array_call(self):
+        tx = make_tx(self.block, "t1", T.FTKN_TX, from_address="O",
+                     data=[{"Function": "TokenTransfer()", "ContractUID": "ft:1", "FromAddress": "O", "ToAddress": "R", "Amount": 2}])
+        FungibleTokenTx.objects.create(type=FungibleTokenTx.Type.TRANSFER, sc_identifier="ft:1", token=self.token,
+                                       receiving_address="R", sending_address="O", amount=2, transaction=tx)
+        process_transaction(tx)
+        self.assertEqual(self.balance("R"), Decimal(0))
+
     def test_mint_and_burn_under_other_types_move_the_supply(self):
         self.call("m1", T.TKNZ_MINT, "TokenMint()", FromAddress="O", Amount=10)
         self.call("b1", T.SC_BURN, "TokenBurn()", FromAddress="O", Amount=4)

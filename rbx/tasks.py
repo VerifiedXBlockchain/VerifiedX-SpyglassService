@@ -517,6 +517,8 @@ def process_token_function(tx: Transaction):
     parsed = parse_object(tx.data)
     if parsed is None:
         logging.warning(f"Token call {tx.hash}: payload is not a JSON object; the node applies nothing.")
+        # An older indexer applied it: its row goes.
+        FungibleTokenTx.objects.filter(transaction=tx).delete()
         return
 
     func = parsed["Function"]
