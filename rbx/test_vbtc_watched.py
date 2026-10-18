@@ -391,3 +391,81 @@ class LegacyBackingTests(WatchedBackingTests):
     test_a_node_that_does_not_answer_leaves_the_backing = None
     test_the_detail_view_refreshes_the_same_way = None
     test_a_block_with_a_report_refreshes_the_backing = None
+
+
+@WATCHING
+class RewindTests(WatchedVaultCase):
+    """A Bitcoin rewind (type 45) re-opens a withdrawal whose payment it took
+    back (BtcWithdrawals.Unsettle); Spyglass re-reads the node after it."""
+
+    PAID = {"RequestHash": "r1", "CompletionHash": "rep1", "BTCTransactionHash": "T"}
+
+    def setUp(self):
+        super().setUp()
+        self.report()
+        self.reconcile(history(paid=[self.PAID]))
+        self.assertEqual(self.row().status, Status.COMPLETED)
+
+    def block(self, height, types):
+        txs = [{"Hash": f"t{height}-{i}", "TransactionType": int(t), "ToAddress": "BTC_Attestation",
+                "FromAddress": "BTC_Attestation", "Amount": 0, "Fee": 0, "Data": "{}", "Signature": ""}
+               for i, t in enumerate(types)]
+        data = WatchedSettlementTests.block_data(self, height, [])
+        data["Transactions"] = txs
+        return data
+
+    def sync(self, height, types, node_history):
+        from rbx.tasks import sync_block
+
+        with patch(HISTORY, return_value=node_history), \
+                patch(STATUS, return_value={"Success": False}), patch(EXIT, return_value={"Success": False}):
+            sync_block(height, data=self.block(height, types), notify=False)
+
+    def test_a_rewind_reopens_a_withdrawal_the_node_no_longer_lists_as_paid(self):
+        self.sync(70, [T.VBTC_V2_BTC_REORG], history())
+        row = self.row()
+        self.assertEqual(row.status, Status.REQUESTED)
+        self.assertEqual(row.btc_transaction_hash, "")
+        self.assertIsNone(row.completion_transaction)
+        self.assertIsNone(row.completed_at)
+
+    def test_a_report_alone_never_reopens(self):
+        self.sync(70, [T.VBTC_V2_BTC_REPORT], history())
+        self.assertEqual(self.row().status, Status.COMPLETED)
+
+    def test_a_rewind_and_a_report_in_one_block_follow_the_node_in_either_order(self):
+        for height, types in ((71, [T.VBTC_V2_BTC_REORG, T.VBTC_V2_BTC_REPORT]),
+                              (72, [T.VBTC_V2_BTC_REPORT, T.VBTC_V2_BTC_REORG])):
+            # The node still lists the payment after the block: it stands.
+            self.sync(height, types, history(paid=[self.PAID]))
+            self.assertEqual(self.row().status, Status.COMPLETED)
+        for height, types in ((73, [T.VBTC_V2_BTC_REORG, T.VBTC_V2_BTC_REPORT]),
+                              (74, [T.VBTC_V2_BTC_REPORT, T.VBTC_V2_BTC_REORG])):
+            self.sync(height, types, history())
+            self.assertEqual(self.row().status, Status.REQUESTED)
+            # Paid again by a later report.
+            self.reconcile(history(paid=[self.PAID]))
+            self.assertEqual(self.row().status, Status.COMPLETED)
+
+    def test_the_owner_add_back_is_removed_while_the_payment_is_unconfirmed(self):
+        self.token.global_balance = Decimal("0.01")
+        self.token.save(update_fields=["global_balance"])
+        self.sync(70, [T.VBTC_V2_BTC_REORG], history())
+        # The coin is held again and the request is escrowed: the owner holds
+        # the backing less every holder's entry.
+        self.assertEqual(self.addresses(), {"O": Decimal("0.006"), "U": Decimal("0.001")})
+
+
+@WATCHING
+class ExitRewindTests(WatchedExitTests):
+    def test_a_rewind_reopens_a_completed_exit_and_keeps_its_burn_spent(self):
+        from rbx.vbtc_dispatch import reconcile_all_watched_vaults
+
+        self.sweep({"Success": True, "Exit": {"IsComplete": True, "Failed": False, "BitcoinTransactions": "btcA", "Parts": []}})
+        self.assertTrue(self.exit().is_complete)
+        with patch(EXIT, return_value={"Success": True, "Exit": {"IsComplete": False, "Failed": False, "Parts": []}}), \
+                patch(STATUS, return_value={"Success": False}), patch(HISTORY, return_value=history()):
+            reconcile_all_watched_vaults(after_rewind=True)
+        self.assertFalse(self.exit().is_complete)
+        from rbx.models import VbtcV2BridgeConsumedBurn
+        self.assertTrue(VbtcV2BridgeConsumedBurn.objects.filter(burn_tx_hash="b1").exists())

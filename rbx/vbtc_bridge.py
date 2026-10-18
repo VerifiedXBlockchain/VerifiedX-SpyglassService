@@ -640,7 +640,13 @@ def reconcile_watched_exit(exit, data):
         applied.append(ref)
 
     failure = view.get("FailureRecord") or ""
-    if view.get("IsComplete") and not view.get("Failed"):
+    if exit.is_complete and not exit.failed and not view.get("IsComplete"):
+        # A Bitcoin rewind took the payment back (BtcWithdrawals.Unsettle):
+        # the exit is open again; its burn stays spent.
+        logging.warning(f"Bridge exit {exit.burn_tx_hash}: no longer paid after a Bitcoin rewind; open again.")
+        exit.is_complete = False
+        exit.btc_tx_hash = ""
+    elif view.get("IsComplete") and not view.get("Failed"):
         exit.is_complete = True
         exit.btc_tx_hash = (view.get("BitcoinTransactions") or "")[:128]
         _mark_consumed(exit.burn_tx_hash, "BTC_EXIT_COMPLETE", exit.exit_transaction)
@@ -677,20 +683,24 @@ def refresh_watched_exit_payouts(token):
     return True
 
 
-def reconcile_watched_exits():
+def reconcile_watched_exits(after_rewind=False):
     """Every open exit on watched vaults, then the payout figure of every
     watched vault an exit has drawn on. The node is asked first; each exit's
     outcome is then applied in its own transaction under the bridge lock,
     so the lock is never held across a node call."""
     from rbx.client import get_vbtc_v2_bridge_exit
 
-    open_exits = [e for e in VbtcV2BridgeExit.objects.filter(is_complete=False) if is_watched_exit(e)]
+    candidates = VbtcV2BridgeExit.objects.all() if after_rewind else VbtcV2BridgeExit.objects.filter(is_complete=False)
+    # After a rewind a completed exit may be open again; a failed one stays failed.
+    open_exits = [e for e in candidates if not e.failed and is_watched_exit(e)]
     answers = {exit.pk: get_vbtc_v2_bridge_exit(exit.burn_tx_hash) for exit in open_exits}
     drawn = {}
     for exit in open_exits:
         with atomic():
             lock_bridge_state()
-            current = VbtcV2BridgeExit.objects.select_related("exit_transaction").filter(pk=exit.pk, is_complete=False).first()
+            current = VbtcV2BridgeExit.objects.select_related("exit_transaction").filter(pk=exit.pk).first()
+            if current is not None and current.is_complete and not after_rewind:
+                current = None
             if current is not None:
                 reconcile_watched_exit(current, answers[exit.pk])
     for exit in VbtcV2BridgeExit.objects.all():

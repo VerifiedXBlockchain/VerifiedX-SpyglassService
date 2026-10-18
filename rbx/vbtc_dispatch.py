@@ -974,24 +974,59 @@ def _close_watched_on_cancel(tx, what, withdrawal):
     _replan_settlements_since(withdrawal.token, withdrawal.request_transaction)
 
 
-def reconcile_watched_withdrawals(token):
+def reconcile_watched_withdrawals(token, after_rewind=False):
     """A watched vault's open requests take their outcome from the node's
     GetWithdrawalHistory, which reads the tables every node writes from
     blocks. Paid: COMPLETED with the Bitcoin txid and the report that
     completed it. Closed without payment: CANCELLED at the closing block,
     with the refund the node gave. A row whose report or closing block is
     not indexed yet waits for the next pass. A node that does not answer
-    changes nothing. Returns the number of rows settled."""
+    changes nothing. Returns the number of rows settled.
+
+    After a Bitcoin rewind (after_rewind), a COMPLETED row the node no
+    longer lists as paid is open again first (BtcWithdrawals.Unsettle): the
+    one way a terminal row is walked back."""
     from rbx.client import get_vbtc_v2_withdrawal_history
 
-    if not token.withdrawal_requests.filter(status__in=VbtcV2WithdrawalRequest.ACTIVE_STATUSES).exists():
+    statuses = list(VbtcV2WithdrawalRequest.ACTIVE_STATUSES)
+    if after_rewind:
+        statuses.append(VbtcV2WithdrawalRequest.Status.COMPLETED)
+    if not token.withdrawal_requests.filter(status__in=statuses).exists():
         return 0
     data = get_vbtc_v2_withdrawal_history(token.sc_identifier)
     # One transaction per vault, the token row locked: a block sync and the
     # sweep do not settle or re-plan the same vault at once.
     with atomic():
         VbtcV2Token.objects.select_for_update().filter(pk=token.pk).first()
+        if after_rewind:
+            _reopen_unpaid(token, data)
         return _apply_withdrawal_history(token, data)
+
+
+def _reopen_unpaid(token, data):
+    paid = data.get("WithdrawalHistory") if isinstance(data, dict) and data.get("Success") else None
+    if not isinstance(paid, list):
+        return
+    listed = {entry.get("RequestHash") for entry in paid if isinstance(entry, dict)}
+    reopened = []
+    for withdrawal in token.withdrawal_requests.filter(status=VbtcV2WithdrawalRequest.Status.COMPLETED).select_related(
+        "request_transaction"
+    ):
+        if withdrawal.request_transaction_id in listed:
+            continue
+        logging.warning(
+            f"Watched vault {token.sc_identifier}: withdrawal {withdrawal.request_transaction_id} is no longer paid "
+            f"after a Bitcoin rewind; it is open again."
+        )
+        withdrawal.status = VbtcV2WithdrawalRequest.Status.REQUESTED
+        withdrawal.btc_transaction_hash = ""
+        withdrawal.completion_transaction = None
+        withdrawal.completed_at = None
+        withdrawal.save(update_fields=["status", "btc_transaction_hash", "completion_transaction", "completed_at"])
+        reopened.append(withdrawal)
+    if reopened:
+        token.recompute_pending_withdrawal()
+        _replan_settlements_since(token, min((w.request_transaction for w in reopened), key=lambda t: t.height))
 
 
 def _apply_withdrawal_history(token, data):
@@ -1150,19 +1185,21 @@ def refresh_backing(token, client):
     VbtcV2Token.objects.filter(pk=token.pk).update(**update_fields)
 
 
-def reconcile_all_watched_vaults():
-    """Every watched vault with an open request."""
+def reconcile_all_watched_vaults(after_rewind=False):
+    """Every watched vault with an open request (and, after a Bitcoin
+    rewind, with a completed one)."""
     settled = 0
-    tokens = VbtcV2Token.objects.filter(
-        withdrawal_requests__status__in=VbtcV2WithdrawalRequest.ACTIVE_STATUSES
-    ).distinct()
+    statuses = list(VbtcV2WithdrawalRequest.ACTIVE_STATUSES)
+    if after_rewind:
+        statuses.append(VbtcV2WithdrawalRequest.Status.COMPLETED)
+    tokens = VbtcV2Token.objects.filter(withdrawal_requests__status__in=statuses).distinct()
     for token in tokens:
         if token.is_watched:
-            settled += reconcile_watched_withdrawals(token)
+            settled += reconcile_watched_withdrawals(token, after_rewind=after_rewind)
     # Exits on watched vaults settle the same way.
     from rbx.vbtc_bridge import reconcile_watched_exits
 
-    reconcile_watched_exits()
+    reconcile_watched_exits(after_rewind=after_rewind)
     return settled
 
 

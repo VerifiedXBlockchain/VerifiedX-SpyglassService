@@ -280,8 +280,9 @@ def sync_block(height: int, data: Optional[dict] = None, notify: bool = True) ->
     # committed. A failure here is logged; the block and its transactions
     # stand, and the next pass (or the ten-minute sweep) reads them again.
     if any(t.get("TransactionType") in ATTESTATION_TYPES for t in data["Transactions"]):
+        rewound = any(t.get("TransactionType") == Transaction.Type.VBTC_V2_BTC_REORG for t in data["Transactions"])
         try:
-            vbtc_dispatch.reconcile_all_watched_vaults()
+            vbtc_dispatch.reconcile_all_watched_vaults(after_rewind=rewound)
             vbtc_dispatch.refresh_all_watched_backings()
         except Exception:
             logging.exception(f"Reading the watched vaults' outcomes after block {height} failed")
