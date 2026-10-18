@@ -1434,3 +1434,76 @@ class MaturedReserveSendTests(TestCase):
         with replaying():
             process_transaction(self.send)
         self.assertEqual(VbtcV2TokenTransfer.objects.get(transaction=self.send).to_address, "R")
+
+    def handover_before_due(self, sc_identifier, tx_type, unlock_delta, tx_hash="ho1", height=None):
+        handover_data = [{"Function": "Transfer()", "ContractUID": sc_identifier}]
+        if tx_type == Transaction.Type.TKNZ_TX:
+            handover_data = {"Function": "Transfer()", "ContractUID": sc_identifier}
+        block = self.sent if height is None else make_block(height=height)
+        handover = make_tx(block, tx_hash, tx_type, from_address="xRBXowner", to_address="P", data=handover_data)
+        handover.date_crafted = self.send.date_crafted
+        handover.unlock_time = self.send.unlock_time + unlock_delta
+        handover.save(update_fields=["date_crafted", "unlock_time"])
+        process_transaction(handover)
+        return handover
+
+    def test_a_handover_due_after_the_send_leaves_the_owner_covered(self):
+        token, send = self.owner_send("sc:h1", "xRBXowner", "xRBXowner", 0.004, "rs2")
+        self.handover_before_due("sc:h1", Transaction.Type.NFT_TX, timedelta(seconds=1))
+        settle_matured_reserve_sends(self.due_block())
+        send.refresh_from_db()
+        self.assertFalse(send.refused_at_maturity)
+
+    def test_same_unlock_is_decided_by_height_then_hash(self):
+        # Same unlock and height: the hash decides. "ho1" < "rs2", so the
+        # handover goes first and the send is a holder's (refused).
+        token, send = self.owner_send("sc:h2", "xRBXowner", "xRBXowner", 0.004, "rs2")
+        self.handover_before_due("sc:h2", Transaction.Type.NFT_TX, timedelta(0), tx_hash="ho1")
+        settle_matured_reserve_sends(self.due_block())
+        send.refresh_from_db()
+        self.assertTrue(send.refused_at_maturity)
+
+    def test_same_unlock_with_a_hash_that_sorts_after_the_send(self):
+        token, send = self.owner_send("sc:h3", "xRBXowner", "xRBXowner", 0.004, "rs2")
+        self.handover_before_due("sc:h3", Transaction.Type.NFT_TX, timedelta(0), tx_hash="zz9")
+        settle_matured_reserve_sends(self.due_block())
+        send.refresh_from_db()
+        self.assertFalse(send.refused_at_maturity)
+
+    def test_a_called_back_handover_leaves_the_vault_with_its_owner(self):
+        token, send = self.owner_send("sc:h4", "xRBXowner", "xRBXowner", 0.004, "rs2")
+        handover = self.handover_before_due("sc:h4", Transaction.Type.NFT_TX, -timedelta(seconds=1))
+        process_transaction(make_tx(self.sent, "cb9", Transaction.Type.RESERVE, from_address="xRBXowner",
+                                    data={"Function": "CallBack()", "Hash": handover.hash}))
+        settle_matured_reserve_sends(self.due_block())
+        send.refresh_from_db()
+        self.assertFalse(send.refused_at_maturity)
+
+    def recover_owner(self, recovery_offset):
+        recovery = make_tx(self.sent, "rc7", Transaction.Type.RESERVE, from_address="xRBXowner",
+                           data={"Function": "Recover()", "RecoveryAddress": "Y"})
+        Transaction.objects.filter(pk=recovery.pk).update(date_crafted=self.send.date_crafted + recovery_offset)
+        recovery.refresh_from_db()
+        process_transaction(recovery)
+
+    def test_recovery_an_nft_handover_sorting_first_moves_the_vault_before_the_send(self):
+        token, send = self.owner_send("sc:r1", "xRBXowner", "xRBXowner", 0.004, "rs2")
+        self.handover_before_due("sc:r1", Transaction.Type.NFT_TX, -timedelta(seconds=1))
+        self.recover_owner(timedelta(seconds=1))
+        send.refresh_from_db()
+        self.assertTrue(send.voided_from_callback)
+
+    def test_recovery_an_nft_handover_sorting_after_leaves_the_send_the_owners(self):
+        token, send = self.owner_send("sc:r2", "xRBXowner", "xRBXowner", 0.004, "rs2")
+        self.handover_before_due("sc:r2", Transaction.Type.NFT_TX, timedelta(seconds=1))
+        self.recover_owner(timedelta(seconds=1))
+        send.refresh_from_db()
+        self.assertFalse(send.voided_from_callback)
+        self.assertEqual(VbtcV2TokenTransfer.objects.get(transaction=send).to_address, "Y")
+
+    def test_recovery_a_tknz_handover_does_not_move_the_vault_mid_loop(self):
+        token, send = self.owner_send("sc:r3", "xRBXowner", "xRBXowner", 0.004, "rs2")
+        self.handover_before_due("sc:r3", Transaction.Type.TKNZ_TX, -timedelta(seconds=1))
+        self.recover_owner(timedelta(seconds=1))
+        send.refresh_from_db()
+        self.assertFalse(send.voided_from_callback)

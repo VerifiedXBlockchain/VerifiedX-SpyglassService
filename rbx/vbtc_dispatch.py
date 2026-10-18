@@ -384,7 +384,7 @@ def _write_settlement(token, tx, plan, what):
         )
 
 
-def reserve_transfer_undone(tx):
+def reserve_transfer_undone(tx, ignore=None):
     """Whether the chain holds a CallBack() of tx, or a Recover() of its
     sender, that the node applied before the transfer took effect: one mined
     by the end of the first block stamped after the unlock, when the node
@@ -407,7 +407,7 @@ def reserve_transfer_undone(tx):
         function = net_string(field(payload, "Function"))
         if function == "CallBack()" and net_string(field(payload, "Hash")) == tx.hash:
             return True
-        if function == "Recover()" and callback.pk != tx.pk:
+        if function == "Recover()" and callback.pk != tx.pk and (ignore is None or callback.pk != ignore.pk):
             return True
     return False
 
@@ -475,9 +475,10 @@ def _pass_order(row):
     return (row.transaction.unlock_time, row.transaction.height, row.transaction.hash)
 
 
-def _pending_handovers(token, unlock_from, unlock_before, sender=None):
+def _pending_handovers(token, unlock_from, unlock_before, sender=None, recovery=None):
     """A reserve owner's Transfer()s of token still waiting for the reserve
-    pass, unlocking in [unlock_from, unlock_before), in Core's order."""
+    pass, unlocking in [unlock_from, unlock_before), in Core's order. Inside
+    a recovery's own loop, that recovery does not count as undoing them."""
     rows = []
     for tx in token.ownership_transfers():
         if not is_reserve_address(tx.from_address) or tx.unlock_time is None:
@@ -486,7 +487,7 @@ def _pending_handovers(token, unlock_from, unlock_before, sender=None):
             continue
         if tx.voided_from_callback or not (unlock_from <= tx.unlock_time < unlock_before):
             continue
-        if reserve_transfer_undone(tx):
+        if reserve_transfer_undone(tx, ignore=recovery):
             continue
         rows.append(tx)
     return sorted(rows, key=lambda t: (t.unlock_time, t.height, t.hash))
@@ -501,6 +502,11 @@ def _owner_in_pass(token, base_owner, handovers, row, moves_to=None):
     for tx in handovers:
         if (tx.unlock_time, tx.height, tx.hash) >= key:
             break
+        # Core's recovery loop moves a contract mid-loop only for an NFT_TX
+        # row (StateData.cs:1649); a vBTC vault's Transfer() is usually a
+        # TKNZ_TX (VBTCService.cs:737), and the reserve stays its owner.
+        if moves_to is not None and tx.type != Transaction.Type.NFT_TX:
+            continue
         if tx.from_address == owner:
             owner = moves_to or tx.to_address
     return owner
@@ -618,7 +624,8 @@ def redirect_reserve_sends(recovery_tx, sends, recovery_address):
         if token.pk not in base:
             base[token.pk] = token.owner_before(recovery_tx)
             handovers[token.pk] = _pending_handovers(
-                token, recovery_tx.date_crafted, datetime.max.replace(tzinfo=timezone.utc), sender=reserve
+                token, recovery_tx.date_crafted, datetime.max.replace(tzinfo=timezone.utc),
+                sender=reserve, recovery=recovery_tx,
             )
         owner = _owner_in_pass(token, base[token.pk], handovers[token.pk], row, moves_to=recovery_address)
         if judged and not _sender_covers(row, recovery_tx, held, owner, {}):
