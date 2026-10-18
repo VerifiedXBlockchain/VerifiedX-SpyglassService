@@ -1414,8 +1414,10 @@ class VbtcV2Token(models.Model):
                 continue
             if not escrow_applies(w.request_transaction.height):
                 pending += w.amount
-            elif before is not None and w.refunded_after(before) and not self._became_owner_between(
-                address, w.request_transaction, before
+            elif (
+                before is not None
+                and w.refunded_after(before)
+                and self.owner_before(w.request_transaction) == address
             ):
                 # An escrow the outgoing owner placed as owner and a vote
                 # refunds after the handover is not the incoming owner's to
@@ -1486,12 +1488,6 @@ class VbtcV2Token(models.Model):
                     continue
             owner = event.to_address
         return owner
-
-    def _became_owner_between(self, address, since_tx, before):
-        return any(
-            tx.to_address == address and tx.pk != before.pk and tx.height <= before.height
-            for tx in self.ownership_transfers(since_height=since_tx.height)
-        )
 
     @property
     def addresses(self):

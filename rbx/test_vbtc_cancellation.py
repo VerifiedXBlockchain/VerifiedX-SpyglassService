@@ -312,3 +312,34 @@ class RefundAfterHandoverTests(TestCase):
         self.hand_over(1600, "ot1", "O", "P")
         row = Transaction.objects.get(hash="ot1").vbtcv2tokentransfer_set.get()
         self.assertEqual((row.from_address, row.to_address, row.amount), ("P", "O", Decimal("0.003")))
+
+    def test_owner_who_handed_the_vault_on_and_got_it_back_still_requested_as_owner(self):
+        # O escrows as owner, O -> P, P -> O, O -> C, then a vote refunds O.
+        self.hand_over(1600, "ot1", "O", "P")
+        self.hand_over(1650, "ot2", "P", "O")
+        self.hand_over(1700, "ot3", "O", "C")
+
+        self.refund()
+
+        self.assertEqual(self.token.addresses, {"C": Decimal("0.01")})
+
+
+@RULES
+class LegacyVoteRefundAfterHandoverTests(RefundAfterHandoverTests):
+    """Below the vote rules height the legacy vote path refunds the escrow
+    too, and the handover is planned again there as well."""
+
+    def refund(self, requestor="O"):
+        process_transaction(cancel_tx(block_at(1800), "x1", requestor, "sc:a", "r1"))
+        for i, v in enumerate(("V1", "V2", "V3")):
+            process_transaction(vote_tx(block_at(1801), f"v{i}", v, "CANCEL_x1"))
+        self.assertEqual(
+            VbtcV2WithdrawalRequest.objects.get(request_transaction__hash="r1").status, Status.CANCELLED
+        )
+        self.token.refresh_from_db()
+
+    def test_refund_before_the_handover_is_settled_as_it_was(self):
+        self.refund()
+        self.assertEqual(self.token.addresses, {"O": Decimal("0.01")})
+        self.hand_over(1900, "ot1", "O", "P")
+        self.assertEqual(self.token.addresses, {"P": Decimal("0.01")})

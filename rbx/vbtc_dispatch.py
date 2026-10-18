@@ -940,6 +940,7 @@ def apply_vote(tx):
     withdrawal.cancelled_at = tx.date_crafted
     withdrawal.save(update_fields=["status", "cancelled_at"])
     withdrawal.token.recompute_pending_withdrawal()
+    _replan_settlements_since(withdrawal.token, withdrawal.request_transaction)
 
 
 def _apply_vote_by_rules(tx, what, uid):
