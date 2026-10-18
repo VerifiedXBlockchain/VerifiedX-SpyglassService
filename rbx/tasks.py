@@ -23,7 +23,7 @@ from rbx.chain_contract import smart_contract_from_chain
 from rbx.client import get_master_nodes, get_block, get_nft, get_topics
 from shop.media import scp_down_folder, upload_to_s3
 from rbx.exceptions import RBXException
-from rbx.vbtc_gates import field, net_string, parse_envelope
+from rbx.vbtc_gates import field, net_string, parse_envelope, parse_object
 from rbx import forged_vfx_burn, historical_reserve_reversals, vbtc_bridge, vbtc_dispatch
 from rbx.models import (
     FungibleToken,
@@ -511,9 +511,13 @@ def token_function_of(tx: Transaction):
 def process_token_function(tx: Transaction):
     """A fungible-token function (TOKEN_FUNCTIONS), under whichever envelope
     type carries it: the node dispatches on Function for every one of them
-    (StateData.UpdateTreis)."""
+    (StateData.UpdateTreis). Each handler there parses tx.Data as a single
+    JSON object, so a call carried in an array applies nothing."""
 
-    parsed, _ = parse_envelope(tx.data)
+    parsed = parse_object(tx.data)
+    if parsed is None:
+        logging.warning(f"Token call {tx.hash}: payload is not a JSON object; the node applies nothing.")
+        return
 
     func = parsed["Function"]
     sc_identifier = parsed["ContractUID"]

@@ -2,6 +2,7 @@
 node's StateData.UpdateTreis dispatches them on Function."""
 from decimal import Decimal
 from io import StringIO
+from unittest.mock import patch
 
 from django.core.management import call_command
 from django.test import TestCase
@@ -24,7 +25,7 @@ class TokenFunctionCase(TestCase):
             can_mint=True, can_burn=True, can_vote=False,
         )
 
-    def call(self, tx_hash, tx_type, function, as_array=True, **fields):
+    def call(self, tx_hash, tx_type, function, as_array=False, **fields):
         payload = dict({"Function": function, "ContractUID": "ft:1"}, **fields)
         tx = make_tx(self.block, tx_hash, tx_type, from_address=fields.get("FromAddress", "O"),
                      data=[payload] if as_array else payload)
@@ -42,9 +43,12 @@ class TokenFunctionUnderAnyEnvelopeTests(TokenFunctionCase):
         self.assertEqual(self.balance("R"), Decimal(5))
         self.assertEqual(self.balance("O"), Decimal(95))
 
-    def test_object_payload_dispatches_too(self):
-        self.call("t1", T.SC_TX, "TokenTransfer()", as_array=False, FromAddress="O", ToAddress="R", Amount=2)
-        self.assertEqual(self.balance("R"), Decimal(2))
+    def test_array_payload_moves_nothing(self):
+        # The dispatcher reads the function from element 0, but the token
+        # handler parses tx.Data as one object and applies nothing.
+        self.call("t1", T.SC_TX, "TokenTransfer()", as_array=True, FromAddress="O", ToAddress="R", Amount=2)
+        self.assertEqual(self.balance("R"), Decimal(0))
+        self.assertFalse(FungibleTokenTx.objects.exists())
 
     def test_mint_and_burn_under_other_types_move_the_supply(self):
         self.call("m1", T.TKNZ_MINT, "TokenMint()", FromAddress="O", Amount=10)
@@ -67,7 +71,7 @@ class TokenFunctionUnderAnyEnvelopeTests(TokenFunctionCase):
         self.assertEqual(FungibleTokenTx.objects.filter(transaction=tx).count(), 1)
 
     def test_nft_transfer_under_nft_tx_is_not_a_token_function(self):
-        self.call("n1", T.NFT_TX, "Transfer()")
+        self.call("n1", T.NFT_TX, "Transfer()", as_array=True)
         self.assertFalse(FungibleTokenTx.objects.exists())
 
 
@@ -80,7 +84,7 @@ class ReindexTokenFunctionsTests(TokenFunctionCase):
         FungibleTokenTx.objects.create(type=FungibleTokenTx.Type.TRANSFER, sc_identifier="ft:1", token=self.token,
                                        receiving_address="R", sending_address="O", amount=3)
         make_tx(self.block, "s1", T.SC_TX, from_address="O",
-                data=[{"Function": "TokenTransfer()", "ContractUID": "ft:1", "FromAddress": "O", "ToAddress": "R", "Amount": 2}])
+                data={"Function": "TokenTransfer()", "ContractUID": "ft:1", "FromAddress": "O", "ToAddress": "R", "Amount": 2})
         self.assertEqual(ftkn.type, T.FTKN_TX)
 
         call_command("reindex_token_functions", stdout=StringIO())
@@ -91,10 +95,32 @@ class ReindexTokenFunctionsTests(TokenFunctionCase):
 
     def test_reindex_replays_owner_changes_in_order(self):
         make_tx(make_block(height=2), "c1", T.SC_TX, from_address="O",
-                data=[{"Function": "TokenContractOwnerChange()", "ContractUID": "ft:1", "FromAddress": "O", "ToAddress": "P"}])
+                data={"Function": "TokenContractOwnerChange()", "ContractUID": "ft:1", "FromAddress": "O", "ToAddress": "P"})
         make_tx(make_block(height=3), "c2", T.FTKN_TX, from_address="P",
-                data=[{"Function": "TokenContractOwnerChange()", "ContractUID": "ft:1", "FromAddress": "P", "ToAddress": "Q"}])
+                data={"Function": "TokenContractOwnerChange()", "ContractUID": "ft:1", "FromAddress": "P", "ToAddress": "Q"})
         call_command("reindex_token_functions", stdout=StringIO())
         self.token.refresh_from_db()
         self.assertEqual(self.token.owner_address, "Q")
         self.assertFalse(TokenVoteTopicVote.objects.exists())
+
+    def test_reindex_takes_a_block_in_the_chains_order(self):
+        block = make_block(height=5)
+        for tx_hash, owner in (("ca", "P"), ("cb", "Q")):
+            make_tx(block, tx_hash, T.SC_TX, from_address="O",
+                    data={"Function": "TokenContractOwnerChange()", "ContractUID": "ft:1", "FromAddress": "O", "ToAddress": owner})
+        chain = {"Transactions": [{"Hash": "cb"}, {"Hash": "ca"}]}
+        with patch("rbx.client.get_block", return_value=chain):
+            call_command("reindex_token_functions", stdout=StringIO(), stderr=StringIO())
+        self.token.refresh_from_db()
+        self.assertEqual(self.token.owner_address, "P")
+
+    def test_reindex_skips_and_reports_a_payload_that_fails(self):
+        make_tx(make_block(height=6), "bad", T.SC_TX, from_address="O",
+                data={"Function": "TokenTransfer()", "ContractUID": "ft:1"})
+        make_tx(make_block(height=7), "good", T.SC_TX, from_address="O",
+                data={"Function": "TokenTransfer()", "ContractUID": "ft:1", "FromAddress": "O", "ToAddress": "R", "Amount": 1})
+        out, err = StringIO(), StringIO()
+        call_command("reindex_token_functions", stdout=out, stderr=err)
+        self.assertIn("ERROR bad", err.getvalue())
+        self.assertIn("skipped on error: 1", out.getvalue())
+        self.assertEqual(self.balance("R"), Decimal(1))
