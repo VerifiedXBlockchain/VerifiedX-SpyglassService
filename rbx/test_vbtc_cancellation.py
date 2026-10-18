@@ -244,3 +244,102 @@ class CancellationVoteRulesTests(TestCase):
         with self.assertLogs(level="ERROR"):
             self.cancel(1801, "x1b")
         self.assertEqual(self.row().cancel_transaction.hash, "x1")
+
+
+@RULES
+class RefundAfterHandoverTests(TestCase):
+    """An escrowed request the owner made, then a handover, then an approved
+    cancellation: the node credits the refund to the requestor and the
+    owner's balance is the backing less every other holder's entry, so the
+    former owner ends at zero and the new owner at the backing."""
+
+    def setUp(self):
+        self.token = make_token(owner="O", global_balance="0.01", sc_identifier="sc:a")
+        self.token.validator_snapshot = ["V1", "V2", "V3", "V4"]
+        self.token.save(update_fields=["validator_snapshot"])
+        for v in ("V1", "V2", "V3", "V4"):
+            lifecycle_tx(1990, f"h-{v}", v)
+        process_transaction(request_tx(block_at(1500), "r1", "O", "sc:a", 0.003))
+
+    def hand_over(self, height, tx_hash, sender, recipient):
+        process_transaction(make_tx(
+            block_at(height), tx_hash, Transaction.Type.TKNZ_TX, from_address=sender,
+            to_address=recipient, data={"Function": "Transfer()", "ContractUID": "sc:a"},
+        ))
+        self.token.refresh_from_db()
+
+    def refund(self, requestor="O"):
+        process_transaction(cancel_tx(block_at(2001), "x1", requestor, "sc:a", "r1"))
+        for i, v in enumerate(("V1", "V2", "V3")):
+            process_transaction(vote_tx(block_at(2002), f"v{i}", v, "CANCEL_x1"))
+        self.assertEqual(
+            VbtcV2WithdrawalRequest.objects.get(request_transaction__hash="r1").status, Status.CANCELLED
+        )
+        self.token.refresh_from_db()
+
+    def test_former_owner_ends_at_zero_and_new_owner_at_the_backing(self):
+        self.hand_over(1600, "ot1", "O", "P")
+        self.assertEqual(self.token.addresses, {"P": Decimal("0.007")})
+
+        self.refund()
+
+        self.assertEqual(self.token.addresses, {"P": Decimal("0.01")})
+        self.assertFalse(Transaction.objects.get(hash="ot1").vbtcv2tokentransfer_set.exists())
+
+    def test_each_later_handover_is_planned_again(self):
+        self.hand_over(1600, "ot1", "O", "P")
+        self.hand_over(1700, "ot2", "P", "Q")
+        self.assertEqual(self.token.addresses, {"Q": Decimal("0.007")})
+
+        self.refund()
+
+        self.assertEqual(self.token.addresses, {"Q": Decimal("0.01")})
+
+    def test_backfill_plans_the_handover_without_the_refunded_escrow(self):
+        self.hand_over(1600, "ot1", "O", "P")
+        self.refund()
+        call_command("reprocess_vbtc_v2", stdout=StringIO())
+        self.token.refresh_from_db()
+        self.assertEqual(self.token.addresses, {"P": Decimal("0.01")})
+
+    def test_refund_before_the_handover_is_settled_as_it_was(self):
+        self.refund()
+        self.assertEqual(self.token.addresses, {"O": Decimal("0.01")})
+        self.hand_over(2100, "ot1", "O", "P")
+        self.assertEqual(self.token.addresses, {"P": Decimal("0.01")})
+
+    def test_open_escrow_at_the_handover_stays_with_its_requestor_until_decided(self):
+        self.hand_over(1600, "ot1", "O", "P")
+        row = Transaction.objects.get(hash="ot1").vbtcv2tokentransfer_set.get()
+        self.assertEqual((row.from_address, row.to_address, row.amount), ("P", "O", Decimal("0.003")))
+
+    def test_owner_who_handed_the_vault_on_and_got_it_back_still_requested_as_owner(self):
+        # O escrows as owner, O -> P, P -> O, O -> C, then a vote refunds O.
+        self.hand_over(1600, "ot1", "O", "P")
+        self.hand_over(1650, "ot2", "P", "O")
+        self.hand_over(1700, "ot3", "O", "C")
+
+        self.refund()
+
+        self.assertEqual(self.token.addresses, {"C": Decimal("0.01")})
+
+
+@RULES
+class LegacyVoteRefundAfterHandoverTests(RefundAfterHandoverTests):
+    """Below the vote rules height the legacy vote path refunds the escrow
+    too, and the handover is planned again there as well."""
+
+    def refund(self, requestor="O"):
+        process_transaction(cancel_tx(block_at(1800), "x1", requestor, "sc:a", "r1"))
+        for i, v in enumerate(("V1", "V2", "V3")):
+            process_transaction(vote_tx(block_at(1801), f"v{i}", v, "CANCEL_x1"))
+        self.assertEqual(
+            VbtcV2WithdrawalRequest.objects.get(request_transaction__hash="r1").status, Status.CANCELLED
+        )
+        self.token.refresh_from_db()
+
+    def test_refund_before_the_handover_is_settled_as_it_was(self):
+        self.refund()
+        self.assertEqual(self.token.addresses, {"O": Decimal("0.01")})
+        self.hand_over(1900, "ot1", "O", "P")
+        self.assertEqual(self.token.addresses, {"P": Decimal("0.01")})

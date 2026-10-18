@@ -32,9 +32,17 @@ _MAINNET = {
     "V2_TRANSFER_MULTI_HEIGHT": 7_281_000,
     "V2_WITHDRAWAL_OWNER_ADDBACK_FIX_HEIGHT": 7_281_000,
     "CANCELLATION_VOTE_RULES_HEIGHT": 7_400_500,
+    "BRIDGE_INTRA_BLOCK_GUARD_HEIGHT": 7_296_200,
+    # Globals.FundLossAuditHeight, which BitcoinAttestationRecordHeight and
+    # the other fund-loss audit rules activate at. Core's value on mainnet is
+    # still the unset placeholder: set this to the launch height when Core's
+    # is set (the placeholder keeps the rules inactive).
+    "FUND_LOSS_AUDIT_HEIGHT": 999_999_999,
 }
 _TESTNET = {k: 1 for k in _MAINNET}
 _TESTNET["CANCELLATION_VOTE_RULES_HEIGHT"] = 1_019_000
+# Globals.FundLossAuditTestnetHeight on testnet-staging f41b1ed7.
+_TESTNET["FUND_LOSS_AUDIT_HEIGHT"] = 1_172_000
 
 
 def _gate(name):
@@ -60,6 +68,19 @@ def v2_withdrawal_owner_addback_fix_height():
 
 def cancellation_vote_rules_height():
     return _gate("CANCELLATION_VOTE_RULES_HEIGHT")
+
+
+def bridge_intra_block_guard_height():
+    return _gate("BRIDGE_INTRA_BLOCK_GUARD_HEIGHT")
+
+
+def bitcoin_attestation_record_height():
+    return _gate("FUND_LOSS_AUDIT_HEIGHT")
+
+
+def fund_loss_audit_height():
+    """Globals.FundLossAuditHeight, which PathAuditRulesHeight follows."""
+    return _gate("FUND_LOSS_AUDIT_HEIGHT")
 
 
 def escrow_applies(request_block_height):

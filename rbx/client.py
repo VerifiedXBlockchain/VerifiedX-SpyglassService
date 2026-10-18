@@ -76,6 +76,9 @@ _http = _NodeHttp()
 # because the CLI can take ~30s to answer while its validator registry loads
 # after a restart.
 CLI_TIMEOUT = (5, 30)
+# The reads block sync and the sweep make for each watched vault: a hung
+# node must not hold a block for vaults x 30s.
+NODE_READ_TIMEOUT = (5, 5)
 
 
 def _get_session() -> requests.Session:
@@ -1230,6 +1233,34 @@ def _vbtc_v2_request(method, path, payload=None, timeout=30):
         )
 
     return result
+
+
+def get_vbtc_v2_withdrawal_history(sc_uid: str):
+    """A vault's withdrawals as the chain settled them: paid (WithdrawalHistory,
+    with the Bitcoin txid and the report that completed each) and closed
+    without payment (Refunded, with the refund and the closing block)."""
+    return _vbtc_v2_request("get", f"vbtcapi/vbtc/GetWithdrawalHistory/{sc_uid}", timeout=NODE_READ_TIMEOUT)
+
+
+def get_vbtc_v2_withdrawal_status(sc_uid: str):
+    """A vault's withdrawal state and, for a watched vault, its Bitcoin as the
+    chain records it (Bitcoin.HeldBtc, PaidOutForBridgeExitsSats, ...)."""
+    return _vbtc_v2_request("get", f"vbtcapi/vbtc/GetWithdrawalStatus/{sc_uid}", timeout=NODE_READ_TIMEOUT)
+
+
+def get_vbtc_v2_withdrawal_pin(sc_uid: str, request_ref: str):
+    """One withdrawal (or exit part) of a watched vault, with its state."""
+    from urllib.parse import quote
+
+    return _vbtc_v2_request(
+        "get", f"vbtcapi/vbtc/GetWithdrawalPin/{sc_uid}/{quote(request_ref, safe='')}", timeout=NODE_READ_TIMEOUT
+    )
+
+
+def get_vbtc_v2_bridge_exit(base_burn_tx_hash: str):
+    """The bridge exit the chain holds for a Base burn, with each watched
+    vault's part."""
+    return _vbtc_v2_request("get", f"vbtcapi/vbtc/GetBridgeExit/{base_burn_tx_hash}", timeout=NODE_READ_TIMEOUT)
 
 
 # MPC Ceremony (DKG)
