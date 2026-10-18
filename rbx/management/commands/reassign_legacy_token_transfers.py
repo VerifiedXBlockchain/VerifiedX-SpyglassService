@@ -1,6 +1,7 @@
 from decimal import Decimal, InvalidOperation
 
 from django.core.management.base import BaseCommand
+from django.db.transaction import atomic
 
 from rbx.legacy_token_transfers import TOKEN_BASE, credited_address, is_legacy_shape
 from rbx.models import FungibleToken, FungibleTokenTx, Transaction
@@ -19,7 +20,15 @@ class Command(BaseCommand):
         parser.add_argument("--dry-run", action="store_true")
 
     def handle(self, *args, **options):
-        dry_run = options["dry_run"]
+        if options["dry_run"]:
+            self.run(dry_run=True)
+            return
+        with atomic():
+            self.run(dry_run=False)
+
+    def run(self, dry_run):
+        # Block by block; inside a block by hash, as no order is stored (the
+        # record rule asks the node when a block's order matters).
         txs = Transaction.objects.filter(
             type__in=list(SC_ENVELOPE_TYPES), to_address=TOKEN_BASE
         ).order_by("height", "hash")

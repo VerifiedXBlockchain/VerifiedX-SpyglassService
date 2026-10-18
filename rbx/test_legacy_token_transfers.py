@@ -1,13 +1,19 @@
 """Old-style TokenTransfer() (ToAddress Token_Base) as Core applies it: the
 recipient is credited only when it has an account record, Token_Base
-otherwise. The fixture is taken from the mainnet list posted on #233."""
+otherwise.
+
+The four transfers are mainnet rows of the #233 query: two stranded, and
+two whose recipient had a record (first record a TX to it at block 0 and
+at block 4954, as the query found). The transactions that made those
+records are stand-ins with those heights; their senders are invented."""
 from decimal import Decimal
 from io import StringIO
+from unittest.mock import patch
 
 from django.core.management import call_command
 from django.test import TestCase, override_settings
 
-from rbx.models import FungibleToken, FungibleTokenTx, Transaction
+from rbx.models import Block, FungibleToken, FungibleTokenTx, Transaction
 from rbx.tasks import process_transaction
 from rbx.tests import make_block, make_token, make_tx
 
@@ -23,7 +29,7 @@ LIST = [
     (7463956, "56edf88b483e32435be722b9c135d1d6636837e0f7c6c2bd4aac4d05bf713ab5", "RJFXd586coXRZVagjaHxhZ6P2PVonCrCE1", "100.0", True),
 ]
 # The first record of each recipient that had one (height, how).
-RECORDS = {"RH3RbM3t9DbpchWocDUYvgqX7ANWNYuA4c": 1, "RWwagN3zX41oP7UB16Y7dg1FsJaGma9DJp": 4954}
+RECORDS = {"RH3RbM3t9DbpchWocDUYvgqX7ANWNYuA4c": 0, "RWwagN3zX41oP7UB16Y7dg1FsJaGma9DJp": 4954}
 
 
 @override_settings(VBTC_NETWORK="mainnet")
@@ -111,3 +117,68 @@ class ReassignTests(LegacyTokenTransferCase):
         self.old_indexing()
         call_command("reassign_legacy_token_transfers", "--dry-run", stdout=StringIO())
         self.assertEqual(self.balance(LIST[0][2]), Decimal(100))
+
+
+class RecordRuleTests(LegacyTokenTransferCase):
+    """Every path by which Core makes an account record."""
+
+    def transfer_to(self, recipient, height=7000000, tx_hash="lt"):
+        return self.legacy(height, tx_hash, recipient, "1")
+
+    def assert_credited(self, recipient, expected):
+        tx = self.transfer_to(recipient)
+        process_transaction(tx)
+        self.assertEqual(self.balance(expected), Decimal(1))
+
+    def test_a_vfx_unshield_recipient_has_a_record(self):
+        make_tx(make_block(height=500), "u1", T.VFX_UNSHIELD, from_address="Shielded_Pool", to_address="Rz")
+        self.assert_credited("Rz", "Rz")
+
+    def test_a_sale_seller_and_royalty_payee_have_records(self):
+        make_tx(make_block(height=501), "sale", T.NFT_SALE, from_address="Buyer", to_address="Seller", data={
+            "Function": "Sale_Complete()", "ContractUID": "nft:1", "Royalty": True,
+            "Transactions": [{"ToAddress": "Rseller", "Data": "1/2"}, {"ToAddress": "Rroyalty", "Data": "2/2"}],
+        })
+        self.assert_credited("Rroyalty", "Rroyalty")
+
+    def test_a_sale_without_royalty_pays_only_its_first_payment(self):
+        make_tx(make_block(height=501), "sale", T.NFT_SALE, from_address="Buyer", to_address="Seller", data={
+            "Function": "Sale_Complete()", "ContractUID": "nft:1", "Royalty": False,
+            "Transactions": [{"ToAddress": "Rseller"}, {"ToAddress": "Rother"}],
+        })
+        self.assert_credited("Rother", "Token_Base")
+
+    def test_a_recovery_address_has_a_record(self):
+        make_tx(make_block(height=502), "rc", T.RESERVE, from_address="xRBXr", to_address="Reserve_Base",
+                data={"Function": "Recover()", "RecoveryAddress": "Rrec"})
+        self.assert_credited("Rrec", "Rrec")
+
+    def test_the_transfers_own_sender_has_a_record(self):
+        tx = self.legacy(7000000, "self", SENDER, "1")
+        process_transaction(tx)
+        self.assertEqual(FungibleTokenTx.objects.get(transaction=tx).receiving_address, SENDER)
+
+    def test_a_new_style_transfer_makes_a_record_only_on_a_token_contract(self):
+        make_tx(make_block(height=503), "ns", T.FTKN_TX, from_address="X", to_address="Rns",
+                data={"Function": "TokenTransfer()", "ContractUID": "not-a-token", "ToAddress": "Rns"})
+        self.assert_credited("Rns", "Token_Base")
+
+    def test_a_record_made_earlier_in_the_same_block_counts(self):
+        block_height = 7000000
+        make_tx(make_block(height=block_height), "pay", T.TX, from_address="X", to_address="Rsame")
+        tx = make_tx(Block.objects.get(height=block_height), "lt", T.FTKN_TX, from_address=SENDER, to_address="Token_Base", data={
+            "Function": "TokenTransfer()", "ContractUID": TOKEN, "FromAddress": SENDER, "ToAddress": "Rsame", "Amount": 1.0,
+        })
+        with patch("rbx.client.get_block", return_value={"Transactions": [{"Hash": "pay"}, {"Hash": "lt"}]}):
+            process_transaction(tx)
+        self.assertEqual(self.balance("Rsame"), Decimal(1))
+
+    def test_a_record_made_later_in_the_same_block_does_not(self):
+        block_height = 7000000
+        make_tx(make_block(height=block_height), "pay", T.TX, from_address="X", to_address="Rsame")
+        tx = make_tx(Block.objects.get(height=block_height), "lt", T.FTKN_TX, from_address=SENDER, to_address="Token_Base", data={
+            "Function": "TokenTransfer()", "ContractUID": TOKEN, "FromAddress": SENDER, "ToAddress": "Rsame", "Amount": 1.0,
+        })
+        with patch("rbx.client.get_block", return_value={"Transactions": [{"Hash": "lt"}, {"Hash": "pay"}]}):
+            process_transaction(tx)
+        self.assertEqual(self.balance("Token_Base"), Decimal(1))
