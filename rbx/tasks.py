@@ -24,7 +24,7 @@ from rbx.client import get_master_nodes, get_block, get_nft, get_topics
 from shop.media import scp_down_folder, upload_to_s3
 from rbx.exceptions import RBXException
 from rbx.vbtc_gates import field, net_string, parse_envelope, parse_object
-from rbx import forged_vfx_burn, historical_reserve_reversals, vbtc_bridge, vbtc_dispatch
+from rbx import forged_vfx_burn, historical_reserve_reversals, legacy_token_transfers, vbtc_bridge, vbtc_dispatch
 from rbx.models import (
     FungibleToken,
     FungibleTokenTx,
@@ -562,7 +562,7 @@ def process_token_function(tx: Transaction):
                 "type": FungibleTokenTx.Type.TRANSFER,
                 "sc_identifier": sc_identifier,
                 "token": token,
-                "receiving_address": to_address,
+                "receiving_address": legacy_token_transfers.credited_address(tx, to_address),
                 "sending_address": from_address,
                 "amount": amount,
             },

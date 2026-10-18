@@ -78,6 +78,11 @@ def bitcoin_attestation_record_height():
     return _gate("FUND_LOSS_AUDIT_HEIGHT")
 
 
+def fund_loss_audit_height():
+    """Globals.FundLossAuditHeight, which PathAuditRulesHeight follows."""
+    return _gate("FUND_LOSS_AUDIT_HEIGHT")
+
+
 def escrow_applies(request_block_height):
     """Mirrors VBTCWithdrawalRequest.EscrowAppliesTo: a request mined at or
     after WithdrawalEscrowHeight was debited when it was mined and is refunded
