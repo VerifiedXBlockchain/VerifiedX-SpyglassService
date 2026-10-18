@@ -1706,8 +1706,9 @@ class VbtcV2BridgeExit(models.Model):
     btc_destination = models.CharField(max_length=128)
     allocations = models.JSONField(default=list)
     is_complete = models.BooleanField(default=False)
-    # The Bitcoin transaction, or "FAILED:<fail tx hash>" as the node marks a failed exit.
-    btc_tx_hash = models.CharField(max_length=128, blank=True)
+    # The Bitcoin transaction(s) (one per vault, comma-separated), or
+    # "FAILED:<record>" as the node marks a failed exit.
+    btc_tx_hash = models.TextField(blank=True)
     # On vaults the chain watches: the parts whose outcome read from the node
     # has been applied to the locks (vbtc_bridge.reconcile_watched_exit).
     applied_parts = models.JSONField(default=list)

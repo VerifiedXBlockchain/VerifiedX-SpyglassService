@@ -1194,12 +1194,20 @@ def reconcile_all_watched_vaults(after_rewind=False):
         statuses.append(VbtcV2WithdrawalRequest.Status.COMPLETED)
     tokens = VbtcV2Token.objects.filter(withdrawal_requests__status__in=statuses).distinct()
     for token in tokens:
-        if token.is_watched:
+        if not token.is_watched:
+            continue
+        # One vault's failure does not stop the others.
+        try:
             settled += reconcile_watched_withdrawals(token, after_rewind=after_rewind)
+        except Exception:
+            logging.exception(f"Watched vault {token.sc_identifier}: reading its withdrawals failed")
     # Exits on watched vaults settle the same way.
     from rbx.vbtc_bridge import reconcile_watched_exits
 
-    reconcile_watched_exits(after_rewind=after_rewind)
+    try:
+        reconcile_watched_exits(after_rewind=after_rewind)
+    except Exception:
+        logging.exception("Reading the watched vaults' bridge exits failed")
     return settled
 
 

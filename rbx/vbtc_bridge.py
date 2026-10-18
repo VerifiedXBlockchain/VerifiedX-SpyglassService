@@ -465,6 +465,8 @@ def apply_exit(tx):
 
     guarded = tx.height >= bridge_intra_block_guard_height()
     record_first = tx.height >= bitcoin_attestation_record_height()
+    if record_first:
+        _expire_unheard_watched_exit(burn, tx)
     if record_first and guarded:
         _delete_failed_exit(burn)
     if record_first and _exit(burn) is not None:
@@ -490,6 +492,30 @@ def apply_exit(tx):
             allocations=_stored(allocations),
         )
     return None
+
+
+def _expire_unheard_watched_exit(burn, tx):
+    """An exit on watched vaults is failed by rule at block start, with no
+    transaction (BtcWithdrawals.ExpireExit), and its failed record goes when
+    the burn is exited again (StateData.cs:3988). When that new exit is
+    mined before Spyglass has read the expiry from the node, the open record
+    it finds was expired: its locks are given back (once) and the record
+    goes, so the new exit draws its own."""
+    old = _exit(burn)
+    if old is None or old.is_complete or not is_watched_exit(old) or old.exit_transaction_id == tx.pk:
+        return
+    if "expired" not in old.applied_parts:
+        voided = {ref.split(":", 1)[1] for ref in old.applied_parts if ref.startswith("void:")}
+        for allocation in old.allocations:
+            lock = _lock(allocation.get("LockId", ""))
+            if lock is None or lock.token.sc_identifier in voided:
+                continue
+            _restore(lock, Decimal(str(allocation["UnlockAmount"])))
+    logging.warning(
+        f"Bridge exit {old.exit_transaction_id} for burn {burn}: expired by rule before {tx.hash} exited the "
+        f"burn again; its locks are given back."
+    )
+    old.delete()
 
 
 def _stored(allocations):
@@ -622,6 +648,14 @@ def reconcile_watched_exit(exit, data):
     if not isinstance(view, dict):
         logging.error(f"Bridge exit {exit.burn_tx_hash}: the node's answer has no Exit; left as it is.")
         return False
+    if view.get("ExitTxHash") != exit.exit_transaction_id:
+        # The node holds a later exit of the same burn: this one was expired
+        # and made again (applied when the new exit is indexed, apply_exit).
+        logging.warning(
+            f"Bridge exit {exit.exit_transaction_id} for burn {exit.burn_tx_hash}: the node describes exit "
+            f"{view.get('ExitTxHash')}; left as it is."
+        )
+        return False
     lock_tokens = {}
     for allocation in exit.allocations:
         lock = _lock(allocation.get("LockId", ""))
@@ -648,7 +682,7 @@ def reconcile_watched_exit(exit, data):
         exit.btc_tx_hash = ""
     elif view.get("IsComplete") and not view.get("Failed"):
         exit.is_complete = True
-        exit.btc_tx_hash = (view.get("BitcoinTransactions") or "")[:128]
+        exit.btc_tx_hash = view.get("BitcoinTransactions") or ""
         _mark_consumed(exit.burn_tx_hash, "BTC_EXIT_COMPLETE", exit.exit_transaction)
     elif view.get("Failed"):
         if "expired@" in failure and "expired" not in applied:
@@ -657,7 +691,7 @@ def reconcile_watched_exit(exit, data):
                     _restore(lock, amount)
             applied.append("expired")
         exit.is_complete = True
-        exit.btc_tx_hash = f"FAILED:{failure}"[:128]
+        exit.btc_tx_hash = f"FAILED:{failure}"
     exit.applied_parts = applied
     exit.save(update_fields=["is_complete", "btc_tx_hash", "applied_parts"])
     return True
@@ -704,9 +738,10 @@ def reconcile_watched_exits(after_rewind=False):
             if current is not None:
                 reconcile_watched_exit(current, answers[exit.pk])
     for exit in VbtcV2BridgeExit.objects.all():
+        if not is_watched_exit(exit):
+            continue
         for token in _exit_tokens(exit):
-            if token.is_watched:
-                drawn[token.pk] = token
+            drawn[token.pk] = token
     for token in drawn.values():
         refresh_watched_exit_payouts(token)
 
