@@ -537,6 +537,21 @@ class ReserveTransferTests(TestCase):
         self.assertEqual(self.token.addresses["xRBXreserve"], Decimal("0.005"))
         self.assertNotIn("R", self.token.addresses)
 
+    def test_pending_reserve_send_is_not_available_to_the_sender(self):
+        # The node subtracts an in-flight reserve send from what the sender
+        # can spend and refuses a second one until it settles.
+        self.assertEqual(self.token.available_balances(current_height=1)["xRBXreserve"], Decimal("0.003"))
+
+    def test_unlocked_reserve_send_is_reserved_no_longer(self):
+        self.tx.unlock_time = timezone.now() - timedelta(minutes=1)
+        self.tx.save(update_fields=["unlock_time"])
+        self.assertEqual(self.token.available_balances(current_height=1)["xRBXreserve"], Decimal("0.003"))
+        self.assertEqual(self.token.available_balances(current_height=1)["R"], Decimal("0.002"))
+
+    def test_called_back_reserve_send_is_available_again(self):
+        void_reserve_transfer(self.tx)
+        self.assertEqual(self.token.available_balances(current_height=1)["xRBXreserve"], Decimal("0.005"))
+
     def test_unlocked_reserve_send_moves_the_ledger(self):
         self.tx.unlock_time = timezone.now() - timedelta(minutes=1)
         self.tx.save(update_fields=["unlock_time"])

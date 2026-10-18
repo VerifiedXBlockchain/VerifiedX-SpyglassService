@@ -1399,7 +1399,8 @@ class VbtcV2Token(models.Model):
         return {addr: bal for addr, bal in entries.items() if bal > 0}
 
     def available_balances(self, current_height=None):
-        """`addresses` minus each address's open legacy withdrawal requests.
+        """`addresses` minus each address's open legacy withdrawal requests
+        and each reserve address's sends still waiting to unlock.
 
         Below WithdrawalEscrowHeight a withdrawal request writes no ledger
         row until it completes, and the node's transfer check reads the raw
@@ -1439,6 +1440,26 @@ class VbtcV2Token(models.Model):
             address = w.requestor_address
             if address in balances:
                 balances[address] = max(balances[address] - w.amount, Decimal(0))
+
+        # A reserve (xRBX) send is debited only when it unlocks (see
+        # ledger_entries), and until then the node subtracts it from what the
+        # sender can spend and refuses a second one on the contract
+        # (VBTCController.cs:4434-4462, ReserveTransactions
+        # .GetPendingVBTCTransferTotal). The node counts single transfers
+        # only: a multi-transfer's payload carries no top-level ContractUID.
+        pending_reserve_sends = VbtcV2TokenTransfer.objects.filter(
+            token=self,
+            from_address__startswith="xRBX",
+            is_multi=False,
+            transaction__type=Transaction.Type.VBTC_V2_TRANSFER,
+            transaction__voided_from_callback=False,
+            transaction__unlock_time__gt=timezone.now(),
+        )
+        for t in pending_reserve_sends:
+            if t.from_address in balances:
+                balances[t.from_address] = max(
+                    balances[t.from_address] - t.amount, Decimal(0)
+                )
 
         return balances
 
