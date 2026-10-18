@@ -1,15 +1,21 @@
 """A vault the chain watches (created from the recording height on): its
 withdrawals settle from Bitcoin reports, read from the node's
 GetWithdrawalHistory, as Core settles them (BtcWithdrawals)."""
+import json
+from contextlib import ExitStack
 from decimal import Decimal
+from io import StringIO
 from unittest.mock import patch
+
+from django.core.management import call_command
 
 from django.test import TestCase, TransactionTestCase, override_settings
 
-from rbx.models import Transaction, VbtcV2WithdrawalRequest
-from rbx.tasks import process_transaction
+from rbx.models import Transaction, VbtcV2BridgeExit, VbtcV2BridgeLock, VbtcV2WithdrawalRequest
+from rbx.tasks import process_transaction, sync_block
 from rbx.test_vbtc_dispatch import cancel_tx, complete_tx, request_tx
 from rbx.tests import add_transfer, make_block, make_tx, make_token
+from rbx.vbtc_bridge import rebuild_bridge_state
 from rbx.vbtc_dispatch import reconcile_watched_withdrawals
 
 T = Transaction.Type
@@ -357,6 +363,128 @@ class WatchedExitTests(WatchedVaultCase):
         self.sweep({"Success": False, "Message": "down"})
         self.assertFalse(self.exit().is_complete)
         self.assertEqual(self.remaining(), Decimal("0.001"))
+
+
+class ExitExpiryTests(WatchedVaultCase):
+    """Core fails an exit never pinned at the start of the block 361 blocks
+    after it (OnBlockStart, ExpireExit) and restores its locks there, before
+    that block's transactions: a strict draw of that block or a later one
+    finds them, one of the block before does not. Exit x1 is at block 41,
+    so it expires at the start of block 402."""
+
+    EXPIRED = {"Success": True, "Exit": {"ExitTxHash": "x1", "IsComplete": True, "Failed": True,
+                                         "FailureRecord": "FAILED:expired@402", "Parts": []}}
+    OPEN = {"Success": True, "Exit": {"ExitTxHash": "x1", "IsComplete": False, "Failed": False, "Parts": []}}
+    # Draws the whole of L1: it holds that only once x1's 0.002 is back.
+    POOL_UNLOCK = {
+        "TotalAmount": 0.003, "TotalAmountSats": 300000, "VfxDestinationAddress": "D", "ExitBurnTxHash": "b2",
+        "Allocations": [{"LockId": "L1", "UnlockAmount": 0.003}]}
+
+    def setUp(self):
+        super().setUp()
+        process_transaction(make_tx(make_block(height=39), "l1", T.VBTC_BRIDGE_LOCK, from_address="U", to_address="U", data={
+            "ContractUID": "sc:w", "LockId": "L1", "Amount": 0.003, "AmountSats": 300000, "EvmDestination": "0xabc"}))
+        process_transaction(make_tx(make_block(height=41), "x1", T.VBTC_BRIDGE_EXIT_TO_BTC, from_address="Caster",
+                                    to_address="Caster", data={
+            "TotalAmount": 0.002, "TotalAmountSats": 200000, "BtcDestination": "bc1q", "BaseBurnTxHash": "b1",
+            "Allocations": [{"LockId": "L1", "SmartContractUID": "sc:w", "UnlockAmount": 0.002}]}))
+
+    def pool_unlock(self, height):
+        make_tx(make_block(height=height), "p1", T.VBTC_BRIDGE_POOL_UNLOCK, from_address="Caster",
+                to_address="Caster", data=self.POOL_UNLOCK)
+
+    def node(self, exit_view):
+        stack = ExitStack()
+        self.exit_reads = stack.enter_context(patch(EXIT, return_value=exit_view))
+        stack.enter_context(patch(STATUS, return_value={"Success": True, "Bitcoin": {"PaidOutForBridgeExitsSats": 0}}))
+        stack.enter_context(patch(HISTORY, return_value=history()))
+        return stack
+
+    def reprocess(self, exit_view=EXPIRED):
+        with self.node(exit_view):
+            call_command("reprocess_vbtc_v2", stdout=StringIO(), stderr=StringIO())
+
+    def rebuild(self):
+        with self.node(self.EXPIRED):
+            rebuild_bridge_state()
+
+    def sync(self, height, with_unlock=True):
+        txs = [{"Hash": "p1", "TransactionType": int(T.VBTC_BRIDGE_POOL_UNLOCK), "ToAddress": "Caster",
+                "FromAddress": "Caster", "Amount": 0, "Fee": 0, "Data": json.dumps(self.POOL_UNLOCK), "Signature": ""}]
+        data = {"Height": height, "Hash": f"block-{height}", "PrevHash": "", "Validator": "V", "ValidatorSignature": "",
+                "ValidatorAnswer": "", "ChainRefId": "", "MerkleRoot": "", "StateRoot": "", "TotalReward": 0,
+                "TotalAmount": 0, "TotalValidators": 0, "Version": 1, "Size": 0, "BCraftTime": 0, "Timestamp": 1760000000,
+                "Transactions": txs if with_unlock else []}
+        with self.node(self.EXPIRED):
+            sync_block(height, data=data, notify=False)
+
+    def lock(self):
+        return VbtcV2BridgeLock.objects.get(lock_id="L1")
+
+    def exit(self):
+        return VbtcV2BridgeExit.objects.get(burn_key="b1")
+
+    def test_the_backfill_restores_the_locks_at_the_expiry_block_before_its_draw(self):
+        self.pool_unlock(402)
+        self.reprocess()
+        self.assertEqual(self.addresses().get("D"), Decimal("0.003"))
+        self.assertEqual(self.lock().remaining_amount, Decimal("0"))
+        self.assertTrue(self.exit().failed)
+
+    def test_the_backfill_drops_a_draw_of_the_block_before_the_expiry(self):
+        self.pool_unlock(401)
+        self.reprocess()
+        self.assertNotIn("D", self.addresses())
+        # Given back at 402, after the draw.
+        self.assertEqual(self.lock().remaining_amount, Decimal("0.003"))
+
+    def test_the_backfill_leaves_an_exit_the_node_has_not_failed(self):
+        self.pool_unlock(402)
+        self.reprocess(self.OPEN)
+        self.assertNotIn("D", self.addresses())
+        self.assertFalse(self.exit().is_complete)
+        self.assertEqual(self.lock().remaining_amount, Decimal("0.001"))
+
+    def test_the_backfill_reads_an_exit_made_again_since_from_its_part(self):
+        # The node describes a later exit of the burn; x1's part says when it expired.
+        self.pool_unlock(402)
+        later = {"Success": True, "Exit": {"ExitTxHash": "x2", "IsComplete": False, "Failed": False, "Parts": []}}
+        part = {"Success": True, "Withdrawal": {"State": "Expired", "ClosedAtVfxHeight": 402}}
+        with patch(PIN, return_value=part) as pin:
+            self.reprocess(later)
+        pin.assert_called_with("sc:w", "exit:x1@41")
+        self.assertEqual(self.addresses().get("D"), Decimal("0.003"))
+
+    def test_a_rebuild_restores_the_locks_at_the_expiry_block_before_its_draw(self):
+        self.pool_unlock(402)
+        self.rebuild()
+        self.assertEqual(self.lock().remaining_amount, Decimal("0"))
+        self.assertTrue(self.exit().failed)
+
+    def test_a_rebuild_drops_a_draw_of_the_block_before_the_expiry(self):
+        self.pool_unlock(401)
+        self.rebuild()
+        # The rebuild reads no outcome after its last transaction: x1 stays
+        # open until the next sweep.
+        self.assertEqual(self.lock().remaining_amount, Decimal("0.001"))
+        self.assertFalse(self.exit().is_complete)
+
+    def test_a_synced_block_at_the_expiry_finds_the_locks_restored(self):
+        self.sync(402)
+        self.exit_reads.assert_called_once_with("b1")
+        self.assertEqual(self.addresses().get("D"), Decimal("0.003"))
+        self.assertEqual(self.lock().remaining_amount, Decimal("0"))
+        self.assertTrue(self.exit().failed)
+
+    def test_a_synced_block_before_the_expiry_does_not_ask_the_node(self):
+        self.sync(401)
+        self.exit_reads.assert_not_called()
+        self.assertNotIn("D", self.addresses())
+        self.assertFalse(self.exit().is_complete)
+
+    def test_a_synced_block_past_the_window_edge_does_not_ask_again(self):
+        self.sync(403, with_unlock=False)
+        self.exit_reads.assert_not_called()
 
 
 @override_settings(VBTC_NETWORK="testnet", VBTC_FUND_LOSS_AUDIT_HEIGHT=1000)

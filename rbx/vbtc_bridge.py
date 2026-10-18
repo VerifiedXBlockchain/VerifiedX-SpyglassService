@@ -21,6 +21,7 @@ import base64
 import binascii
 import json
 import logging
+import re
 from decimal import Decimal, InvalidOperation
 
 from django.db import connection
@@ -50,6 +51,9 @@ SOURCE = "+"
 PSEUDO_ADDRESSES = (SINK, SOURCE)
 
 SATS_PER_BTC = Decimal(100_000_000)
+# VBTCWithdrawalRequest.EXPIRY_BLOCKS: an exit never pinned is failed at the
+# start of a block more than this many blocks after its own.
+EXIT_EXPIRY_BLOCKS = 360
 ALLOCATION_TOLERANCE = Decimal("0.00000001")
 
 BRIDGE_TYPES = frozenset(
@@ -179,7 +183,12 @@ def rebuild_bridge_state():
         for height in unresolved:
             logging.warning(f"Bridge state rebuilt with block {height} in hash order; the node gave no order.")
         reset_bridge_state()
+        expiries = {}
         for tx in txs:
+            # The node's ExpireExit runs at the start of a block, before its
+            # transactions; a replay asks it when each exit failed.
+            read_exit_expiries(tx.height, expiries)
+            expire_exits(tx.height, expiries)
             route(tx)
     return unresolved
 
@@ -721,6 +730,88 @@ def reconcile_watched_exit(exit, data):
     exit.applied_parts = applied
     exit.save(update_fields=["is_complete", "btc_tx_hash", "applied_parts"])
     return True
+
+
+def _expiry_candidates(height):
+    """The open exits on watched vaults the node can have expired by the
+    start of block `height`: those mined more than EXIT_EXPIRY_BLOCKS blocks
+    before it (BtcWithdrawals.OnBlockStart, WaitingWithdrawalsRequestedBefore)."""
+    exits = VbtcV2BridgeExit.objects.filter(
+        is_complete=False, exit_transaction__height__lt=height - EXIT_EXPIRY_BLOCKS
+    ).select_related("exit_transaction")
+    return [exit for exit in exits if is_watched_exit(exit)]
+
+
+def exit_expiry_height(exit):
+    """The block at whose start the node failed `exit` by rule (ExpireExit),
+    or None: the expired@<height> of GetBridgeExit's FailureRecord while the
+    node still describes this exit, else, once the burn has been exited
+    again, the ClosedAtVfxHeight of its part on its first vault
+    (GetWithdrawalPin) when that part expired. Every part of an exit
+    expires in the same block."""
+    from rbx.client import get_vbtc_v2_bridge_exit, get_vbtc_v2_withdrawal_pin
+
+    data = get_vbtc_v2_bridge_exit(exit.burn_tx_hash)
+    view = data.get("Exit") if isinstance(data, dict) and data.get("Success") else None
+    if isinstance(view, dict) and view.get("ExitTxHash") == exit.exit_transaction_id:
+        found = re.search(r"expired@(\d+)", view.get("FailureRecord") or "")
+        return int(found.group(1)) if view.get("Failed") and found else None
+    tokens = _exit_tokens(exit)
+    if not tokens:
+        return None
+    ref = f"exit:{exit.exit_transaction_id}@{exit.exit_transaction.height}"
+    data = get_vbtc_v2_withdrawal_pin(tokens[0].sc_identifier, ref)
+    part = data.get("Withdrawal") if isinstance(data, dict) and data.get("Success") else None
+    if not isinstance(part, dict) or part.get("State") != "Expired":
+        return None
+    closed = part.get("ClosedAtVfxHeight")
+    return closed if isinstance(closed, int) and not isinstance(closed, bool) else None
+
+
+def read_exit_expiries(height, known, since=None):
+    """Adds to `known` (exit pk: expiry height or None) every exit the node
+    can have expired by the start of block `height`, mined at or after
+    block `since`, that it does not hold yet. Read before the bridge lock is
+    taken."""
+    for exit in _expiry_candidates(height):
+        if exit.pk not in known and (since is None or exit.exit_transaction.height >= since):
+            known[exit.pk] = exit_expiry_height(exit)
+    return known
+
+
+def expiry_window_edge(height):
+    """The block whose exits reach their window at the start of `height`.
+    Core expires an exit there or never: a part goes back to Waiting only
+    while another part is pinned or paid (VoidExitPart), and ExpireExit
+    needs every part Waiting."""
+    return height - EXIT_EXPIRY_BLOCKS - 1
+
+
+def expire_exits(height, expiries):
+    """Start of block `height`, before its transactions: each open exit on
+    watched vaults the node expired at or before it gives its locks back
+    (RestoreUnlock) and is closed as failed, as ExpireExit does in
+    OnBlockStart, so a draw of the block finds the lock restored.
+    `expiries` is what read_exit_expiries gave."""
+    for exit in _expiry_candidates(height):
+        at = expiries.get(exit.pk)
+        if at is None or at > height:
+            continue
+        applied = list(exit.applied_parts)
+        if "expired" not in applied:
+            for allocation in exit.allocations:
+                lock = _lock(allocation.get("LockId", ""))
+                if lock is not None:
+                    _restore(lock, Decimal(str(allocation["UnlockAmount"])))
+            applied.append("expired")
+        exit.applied_parts = applied
+        exit.is_complete = True
+        exit.btc_tx_hash = f"FAILED:expired@{at}"
+        exit.save(update_fields=["is_complete", "btc_tx_hash", "applied_parts"])
+        logging.warning(
+            f"Bridge exit {exit.exit_transaction_id} for burn {exit.burn_tx_hash}: failed by rule at block {at}; "
+            f"its locks are given back."
+        )
 
 
 def refresh_watched_exit_payouts(token):

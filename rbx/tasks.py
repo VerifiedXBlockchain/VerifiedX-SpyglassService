@@ -160,6 +160,16 @@ def sync_block(height: int, data: Optional[dict] = None, notify: bool = True) ->
     if not data:
         return
 
+    # Exits on watched vaults that reach their window at this block: the
+    # node fails one never pinned at the block's start, before its
+    # transactions. Asked before the bridge lock is taken; a failure leaves
+    # it to the reads after a Bitcoin report and the ten-minute sweep.
+    try:
+        exit_expiries = vbtc_bridge.read_exit_expiries(height, {}, since=vbtc_bridge.expiry_window_edge(height))
+    except Exception:
+        logging.exception(f"Reading the bridge exits due to expire at block {height} failed")
+        exit_expiries = {}
+
     # One transaction per block: a crash mid-block rolls the whole block back
     # so the next run re-syncs it instead of silently skipping its remaining
     # transactions, and the block's writes commit in a single round trip.
@@ -201,6 +211,11 @@ def sync_block(height: int, data: Optional[dict] = None, notify: bool = True) ->
 
         # Core burns the forged VFX before the burn block's transactions apply.
         forged_vfx_burn.apply_at(height)
+
+        if any(at is not None and at <= height for at in exit_expiries.values()):
+            with atomic_transaction():
+                vbtc_bridge.lock_bridge_state()
+                vbtc_bridge.expire_exits(height, exit_expiries)
 
         for transaction in data["Transactions"]:
             if transaction.get("TransactionStatus") == 999:
