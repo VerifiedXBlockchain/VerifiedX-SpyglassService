@@ -556,3 +556,92 @@ class MintReprocessAddressTests(TestCase):
     @override_settings(VBTC_NETWORK="testnet", VBTC_FUND_LOSS_AUDIT_HEIGHT=1000)
     def test_a_legacy_vault_takes_the_mint_address_as_before(self):
         self.assertEqual(self.reprocess().deposit_address, "bc1mint")
+
+
+@WATCHING
+class RewindRetryTests(RewindTests):
+    """The rewind is read until a pass after it has succeeded."""
+
+    def test_a_node_failing_at_the_rewind_block_is_caught_up_by_a_later_pass(self):
+        from rbx.models import VbtcV2RewindMark
+        from rbx.vbtc_dispatch import reconcile_all_watched_vaults
+
+        self.sync(70, [T.VBTC_V2_BTC_REORG], {"Success": False, "Message": "down"})
+        self.assertEqual(self.row().status, Status.COMPLETED)
+        with patch(HISTORY, return_value=history()), patch(STATUS, return_value={"Success": False}), \
+                patch(EXIT, return_value={"Success": False}):
+            reconcile_all_watched_vaults()
+        self.assertEqual(self.row().status, Status.REQUESTED)
+        self.assertEqual(VbtcV2RewindMark.objects.get().reconciled_height, 70)
+
+    def test_once_caught_up_a_pass_no_longer_reopens(self):
+        from rbx.vbtc_dispatch import reconcile_all_watched_vaults
+
+        self.sync(70, [T.VBTC_V2_BTC_REORG], history(paid=[self.PAID]))
+        with patch(HISTORY, return_value=history()), patch(STATUS, return_value={"Success": False}), \
+                patch(EXIT, return_value={"Success": False}):
+            reconcile_all_watched_vaults()
+        self.assertEqual(self.row().status, Status.COMPLETED)
+
+    def test_a_failed_node_response_reopens_nothing(self):
+        self.sync(70, [T.VBTC_V2_BTC_REORG], {"Success": False})
+        self.assertEqual(self.row().status, Status.COMPLETED)
+
+    def test_a_reopened_request_is_pending_again_and_handovers_are_planned_again(self):
+        with patch("rbx.vbtc_dispatch._replan_settlements_since") as replan:
+            self.sync(70, [T.VBTC_V2_BTC_REORG], history())
+        self.token.refresh_from_db()
+        self.assertTrue(self.token.is_pending_withdrawal)
+        replan.assert_called_once()
+        self.assertEqual(replan.call_args.args[1].hash, "r1")
+
+    def test_a_reopened_request_older_than_the_window_stays_pending(self):
+        from rbx.models import WITHDRAWAL_EXPIRY_BLOCKS
+
+        self.sync(70, [T.VBTC_V2_BTC_REORG], history())
+        self.token.recompute_pending_withdrawal(current_height=10 + WITHDRAWAL_EXPIRY_BLOCKS + 100)
+        self.token.refresh_from_db()
+        self.assertTrue(self.token.is_pending_withdrawal)
+
+
+@override_settings(VBTC_NETWORK="testnet", VBTC_FUND_LOSS_AUDIT_HEIGHT=1000)
+class LegacyRewindTests(WatchedVaultCase):
+    def test_a_legacy_vaults_completed_withdrawal_is_not_reopened(self):
+        from rbx.vbtc_dispatch import reconcile_all_watched_vaults
+
+        process_transaction(complete_tx(make_block(height=21), "c1", "U", "sc:w", "r1"))
+        self.assertEqual(self.row().status, Status.COMPLETED)
+        with patch(HISTORY, return_value=history()) as node, patch(EXIT, return_value={"Success": False}):
+            reconcile_all_watched_vaults(after_rewind=True)
+        node.assert_not_called()
+        self.assertEqual(self.row().status, Status.COMPLETED)
+
+
+@WATCHING
+class ExitRewindFilterTests(WatchedExitTests):
+    def complete(self):
+        self.sweep({"Success": True, "Exit": {"IsComplete": True, "Failed": False, "BitcoinTransactions": "btcA", "Parts": []}})
+        self.assertTrue(self.exit().is_complete)
+
+    def reconcile(self, view, after_rewind):
+        from rbx.vbtc_dispatch import reconcile_all_watched_vaults
+
+        with patch(EXIT, return_value=view), patch(STATUS, return_value={"Success": False}), \
+                patch(HISTORY, return_value=history()):
+            reconcile_all_watched_vaults(after_rewind=after_rewind)
+
+    def test_a_failed_exit_is_not_reopened(self):
+        self.sweep({"Success": True, "Exit": {"IsComplete": True, "Failed": True, "FailureRecord": "FAILED:expired@500", "Parts": []}})
+        self.reconcile({"Success": True, "Exit": {"ExitTxHash": "x1", "IsComplete": False, "Failed": False, "Parts": []}}, True)
+        self.assertTrue(self.exit().failed)
+        self.assertTrue(self.exit().is_complete)
+
+    def test_a_report_only_pass_does_not_reopen_an_exit(self):
+        self.complete()
+        self.reconcile({"Success": True, "Exit": {"ExitTxHash": "x1", "IsComplete": False, "Failed": False, "Parts": []}}, False)
+        self.assertTrue(self.exit().is_complete)
+
+    def test_a_missing_completion_field_does_not_reopen(self):
+        self.complete()
+        self.reconcile({"Success": True, "Exit": {"ExitTxHash": "x1", "Failed": False, "Parts": []}}, True)
+        self.assertTrue(self.exit().is_complete)

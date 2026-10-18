@@ -655,7 +655,7 @@ def reconcile_watched_exit(exit, data):
             f"Bridge exit {exit.exit_transaction_id} for burn {exit.burn_tx_hash}: the node describes exit "
             f"{view.get('ExitTxHash')}; left as it is."
         )
-        return False
+        return True
     lock_tokens = {}
     for allocation in exit.allocations:
         lock = _lock(allocation.get("LockId", ""))
@@ -674,7 +674,7 @@ def reconcile_watched_exit(exit, data):
         applied.append(ref)
 
     failure = view.get("FailureRecord") or ""
-    if exit.is_complete and not exit.failed and not view.get("IsComplete"):
+    if exit.is_complete and not exit.failed and view.get("IsComplete") is False:
         # A Bitcoin rewind took the payment back (BtcWithdrawals.Unsettle):
         # the exit is open again; its burn stays spent.
         logging.warning(f"Bridge exit {exit.burn_tx_hash}: no longer paid after a Bitcoin rewind; open again.")
@@ -729,14 +729,15 @@ def reconcile_watched_exits(after_rewind=False):
     open_exits = [e for e in candidates if not e.failed and is_watched_exit(e)]
     answers = {exit.pk: get_vbtc_v2_bridge_exit(exit.burn_tx_hash) for exit in open_exits}
     drawn = {}
+    ok = True
     for exit in open_exits:
         with atomic():
             lock_bridge_state()
             current = VbtcV2BridgeExit.objects.select_related("exit_transaction").filter(pk=exit.pk).first()
             if current is not None and current.is_complete and not after_rewind:
                 current = None
-            if current is not None:
-                reconcile_watched_exit(current, answers[exit.pk])
+            if current is not None and not reconcile_watched_exit(current, answers[exit.pk]):
+                ok = False
     for exit in VbtcV2BridgeExit.objects.all():
         if not is_watched_exit(exit):
             continue
@@ -744,6 +745,7 @@ def reconcile_watched_exits(after_rewind=False):
             drawn[token.pk] = token
     for token in drawn.values():
         refresh_watched_exit_payouts(token)
+    return ok
 
 
 # --- 34-35: shield and unshield ---------------------------------------------

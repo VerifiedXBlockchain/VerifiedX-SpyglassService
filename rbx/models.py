@@ -1273,11 +1273,14 @@ class VbtcV2Token(models.Model):
         if current_height is None:
             current_height = Block.objects.aggregate(v=Max("height"))["v"] or 0
 
-        pending = self.withdrawal_requests.filter(
-            status__in=VbtcV2WithdrawalRequest.ACTIVE_STATUSES,
-            request_transaction__height__gte=current_height
-            - WITHDRAWAL_EXPIRY_BLOCKS,
-        ).exists()
+        open_requests = self.withdrawal_requests.filter(status__in=VbtcV2WithdrawalRequest.ACTIVE_STATUSES)
+        # On a watched vault the chain closes an unpinned request itself and
+        # never ages out a pinned one; the open rows are the chain's.
+        if not self.is_watched:
+            open_requests = open_requests.filter(
+                request_transaction__height__gte=current_height - WITHDRAWAL_EXPIRY_BLOCKS
+            )
+        pending = open_requests.exists()
         if self.is_pending_withdrawal != pending:
             self.is_pending_withdrawal = pending
             self.save(update_fields=["is_pending_withdrawal"])
@@ -1665,6 +1668,15 @@ class VbtcV2TokenTransfer(models.Model):
 # (VBTCBridgeLockState, VBTCBridgeBtcExitState, VBTCBridgeConsumedBurn). The
 # ledger moves themselves are VbtcV2TokenTransfer rows against the node's
 # sink "-" and source "+" (rbx/vbtc_bridge.py).
+class VbtcV2RewindMark(models.Model):
+    """The height of the latest Bitcoin rewind (type 45) block whose
+    reconciliation with the node succeeded for every watched vault and exit.
+    Until it reaches the latest one, every pass re-opens what the node no
+    longer lists as paid."""
+
+    reconciled_height = models.BigIntegerField(default=0)
+
+
 class VbtcV2BridgeLock(models.Model):
     lock_id = models.CharField(max_length=128, unique=True)
     token = models.ForeignKey(VbtcV2Token, on_delete=models.CASCADE, related_name="bridge_locks")

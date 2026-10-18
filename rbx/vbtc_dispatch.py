@@ -32,11 +32,12 @@ from datetime import datetime, timezone
 from contextvars import ContextVar
 from decimal import Decimal
 
-from django.db.models import Q
+from django.db.models import Max, Q
 from django.db.transaction import atomic
 
 from rbx.models import (
     Block,
+    VbtcV2RewindMark,
     Recovery,
     Transaction,
     VbtcV2Token,
@@ -994,6 +995,8 @@ def reconcile_watched_withdrawals(token, after_rewind=False):
     if not token.withdrawal_requests.filter(status__in=statuses).exists():
         return 0
     data = get_vbtc_v2_withdrawal_history(token.sc_identifier)
+    if not _usable_history(token, data):
+        return None
     # One transaction per vault, the token row locked: a block sync and the
     # sweep do not settle or re-plan the same vault at once.
     with atomic():
@@ -1001,6 +1004,19 @@ def reconcile_watched_withdrawals(token, after_rewind=False):
         if after_rewind:
             _reopen_unpaid(token, data)
         return _apply_withdrawal_history(token, data)
+
+
+def _usable_history(token, data):
+    if not isinstance(data, dict) or not data.get("Success"):
+        # The client has logged the refusal or the failure.
+        return False
+    if not isinstance(data.get("WithdrawalHistory"), list) or not isinstance(data.get("Refunded"), list):
+        logging.error(
+            f"Watched vault {token.sc_identifier}: the node's withdrawal history has no WithdrawalHistory "
+            f"or Refunded list; its withdrawals are left as they are."
+        )
+        return False
+    return True
 
 
 def _reopen_unpaid(token, data):
@@ -1187,9 +1203,23 @@ def refresh_backing(token, client):
     VbtcV2Token.objects.filter(pk=token.pk).update(**update_fields)
 
 
+def _latest_rewind_height():
+    return (
+        Transaction.objects.filter(type=Transaction.Type.VBTC_V2_BTC_REORG).aggregate(h=Max("height"))["h"] or 0
+    )
+
+
 def reconcile_all_watched_vaults(after_rewind=False):
     """Every watched vault with an open request (and, after a Bitcoin
-    rewind, with a completed one)."""
+    rewind, with a completed one). A rewind is read on every pass, the
+    ten-minute sweep included, until one pass after the latest rewind block
+    has succeeded for every vault and exit (VbtcV2RewindMark): a node that
+    failed during the rewind block's own pass must not leave a payment the
+    rewind took back counted for good."""
+    latest = _latest_rewind_height()
+    mark, _ = VbtcV2RewindMark.objects.get_or_create(pk=1)
+    after_rewind = after_rewind or latest > mark.reconciled_height
+    ok = True
     settled = 0
     statuses = list(VbtcV2WithdrawalRequest.ACTIVE_STATUSES)
     if after_rewind:
@@ -1200,16 +1230,25 @@ def reconcile_all_watched_vaults(after_rewind=False):
             continue
         # One vault's failure does not stop the others.
         try:
-            settled += reconcile_watched_withdrawals(token, after_rewind=after_rewind)
+            result = reconcile_watched_withdrawals(token, after_rewind=after_rewind)
         except Exception:
             logging.exception(f"Watched vault {token.sc_identifier}: reading its withdrawals failed")
+            result = None
+        if result is None:
+            ok = False
+        else:
+            settled += result
     # Exits on watched vaults settle the same way.
     from rbx.vbtc_bridge import reconcile_watched_exits
 
     try:
-        reconcile_watched_exits(after_rewind=after_rewind)
+        if not reconcile_watched_exits(after_rewind=after_rewind):
+            ok = False
     except Exception:
         logging.exception("Reading the watched vaults' bridge exits failed")
+        ok = False
+    if after_rewind and ok and latest > mark.reconciled_height:
+        VbtcV2RewindMark.objects.filter(pk=mark.pk).update(reconciled_height=latest)
     return settled
 
 
