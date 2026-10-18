@@ -1363,3 +1363,74 @@ class MaturedReserveSendTests(TestCase):
         self.assertTrue(self.send.voided_from_callback)
         self.assertEqual(VbtcV2TokenTransfer.objects.get(transaction=self.send).to_address, "R")
         self.assertNotIn("R", self.token.ledger_entries())
+
+    def owner_send(self, sc_identifier, sender, owner, amount, tx_hash):
+        token = make_token(owner=owner, global_balance="0.01", sc_identifier=sc_identifier)
+        send = single_transfer_tx(self.sent, tx_hash, sender, "R2", sc_identifier, amount)
+        send.date_crafted = self.send.date_crafted
+        send.unlock_time = self.send.unlock_time
+        send.save(update_fields=["date_crafted", "unlock_time"])
+        process_transaction(send)
+        return token, send
+
+    def test_a_handover_due_earlier_in_the_pass_judges_the_send_as_the_new_owners(self):
+        # The reserve owner hands the vault on; the handover falls due in the
+        # same block as its own send, and sorts first: the send is then judged
+        # as a holder's, and the reserve holds nothing.
+        token, send = self.owner_send("sc:h", "xRBXowner", "xRBXowner", 0.004, "rs2")
+        handover = make_tx(self.sent, "ho1", Transaction.Type.NFT_TX, from_address="xRBXowner", to_address="P",
+                           data=[{"Function": "Transfer()", "ContractUID": "sc:h"}])
+        handover.date_crafted = self.send.date_crafted
+        handover.unlock_time = self.send.unlock_time - timedelta(seconds=1)
+        handover.save(update_fields=["date_crafted", "unlock_time"])
+        process_transaction(handover)
+        settle_matured_reserve_sends(self.due_block())
+        send.refresh_from_db()
+        self.assertTrue(send.refused_at_maturity)
+        self.assertNotIn("R2", token.ledger_entries())
+
+    def test_an_owner_change_between_the_send_and_its_maturity_counts(self):
+        # The sender holds nothing when it sends, then is handed the vault
+        # before the send falls due: it is judged as the owner.
+        token, send = self.owner_send("sc:b", "xRBXlater", "O2", 0.004, "rs3")
+        due = self.due_block()
+        process_transaction(make_tx(due, "ho2", Transaction.Type.TKNZ_TX, from_address="O2", to_address="xRBXlater",
+                                    data={"Function": "Transfer()", "ContractUID": "sc:b"}))
+        settle_matured_reserve_sends(due)
+        send.refresh_from_db()
+        self.assertFalse(send.refused_at_maturity)
+
+    def test_a_backfill_clears_a_stale_refusal(self):
+        Transaction.objects.filter(pk=self.send.pk).update(refused_at_maturity=True)
+        self.due_block()
+        call_command("reprocess_vbtc_v2", stdout=StringIO(), stderr=StringIO())
+        self.send.refresh_from_db()
+        self.assertFalse(self.send.refused_at_maturity)
+
+    def test_a_backfill_judges_a_block_after_its_own_transactions(self):
+        # The sender escrows 0.003 and then, in the block the send falls due
+        # in, receives 0.002: covered only once the block's transfers count.
+        request = make_tx(self.sent, "w1", Transaction.Type.VBTC_V2_WITHDRAWAL_REQUEST)
+        add_withdrawal(self.token, request, "xRBXreserve", "0.003", VbtcV2WithdrawalRequest.Status.REQUESTED)
+        due = self.due_block()
+        credit = single_transfer_tx(due, "in1", "O", "xRBXreserve", "sc:a", 0.002)
+        process_transaction(credit)
+        # Stored wrong by an earlier indexer: only its replay in the due block
+        # makes the sender covered.
+        VbtcV2TokenTransfer.objects.filter(transaction=credit).update(amount=Decimal(0))
+        call_command("reprocess_vbtc_v2", stdout=StringIO(), stderr=StringIO())
+        self.send.refresh_from_db()
+        self.assertFalse(self.send.refused_at_maturity)
+
+    def test_a_send_taken_back_at_the_recovery_keeps_its_recipient_on_replay(self):
+        request = make_tx(self.rules, "w0", Transaction.Type.VBTC_V2_WITHDRAWAL_REQUEST)
+        add_withdrawal(self.token, request, "xRBXreserve", "0.003", VbtcV2WithdrawalRequest.Status.REQUESTED)
+        recovery = make_tx(self.sent, "rc1", Transaction.Type.RESERVE, from_address="xRBXreserve",
+                           data={"Function": "Recover()", "RecoveryAddress": "Y"})
+        Transaction.objects.filter(pk=recovery.pk).update(date_crafted=self.send.date_crafted)
+        recovery.refresh_from_db()
+        process_transaction(recovery)
+        self.send.refresh_from_db()
+        with replaying():
+            process_transaction(self.send)
+        self.assertEqual(VbtcV2TokenTransfer.objects.get(transaction=self.send).to_address, "R")

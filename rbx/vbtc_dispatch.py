@@ -28,6 +28,7 @@ The balance math that consumes these rows is in rbx.models.VbtcV2Token.
 """
 import logging
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from contextvars import ContextVar
 from decimal import Decimal
 
@@ -173,8 +174,9 @@ def _write_transfer(token, tx, from_address, to_address, amount, is_multi):
         # A recovery moved this send to its own address while it was in
         # flight (redirect_reserve_transfer). A later pass over the send
         # does not replay the recovery, so it keeps that recipient.
+        # A send the recovery took back without applying keeps its own.
         recovery = Recovery.objects.filter(outstanding_transactions=tx).first()
-        if recovery is not None:
+        if recovery is not None and not tx.voided_from_callback:
             to_address = recovery.new_address
     # update_or_create, not get_or_create: a backfill must correct rows that
     # were indexed from payload addresses before the parties came from the
@@ -446,17 +448,16 @@ def settle_pending_owners(block):
             _move_owner(token, token.pending_owner_address, tx)
 
 
-def _sender_covers(row, cutoff, held, owners, pending):
+def _sender_covers(row, cutoff, held, owner, pending):
     """DeferredVbtcTransferStillCovered: the owner of a vault the chain does
-    not watch is covered; anyone else must hold the amount on the ledger as
-    it stood at `cutoff`. `held` carries the running figure per (contract,
-    sender) through one judging pass; `pending` is what to add back to the
-    ledger's figure (sends the ledger already counts but that are judged in
-    this pass)."""
+    not watch (`owner`, as the pass has it when it reaches the row) is
+    covered; anyone else must hold the amount on the ledger as it stood at
+    `cutoff`. `held` carries the running figure per (contract, sender)
+    through one judging pass; `pending` is what to add back to the ledger's
+    figure (sends the ledger already counts but that are judged in this
+    pass)."""
     token = row.token
-    if token.pk not in owners:
-        owners[token.pk] = token.owner_before(cutoff)
-    if owners[token.pk] == row.from_address:
+    if owner == row.from_address:
         return True
     key = (token.pk, row.from_address)
     if key not in held:
@@ -471,6 +472,37 @@ def _sender_covers(row, cutoff, held, owners, pending):
 def _pass_order(row):
     """Core's order of reserve rows: (ConfirmTimestamp, Height, Hash)."""
     return (row.transaction.unlock_time, row.transaction.height, row.transaction.hash)
+
+
+def _pending_handovers(token, unlock_from, unlock_before, sender=None):
+    """A reserve owner's Transfer()s of token still waiting for the reserve
+    pass, unlocking in [unlock_from, unlock_before), in Core's order."""
+    rows = []
+    for tx in token.ownership_transfers():
+        if not is_reserve_address(tx.from_address) or tx.unlock_time is None:
+            continue
+        if sender is not None and tx.from_address != sender:
+            continue
+        if tx.voided_from_callback or not (unlock_from <= tx.unlock_time < unlock_before):
+            continue
+        if reserve_transfer_undone(tx):
+            continue
+        rows.append(tx)
+    return sorted(rows, key=lambda t: (t.unlock_time, t.height, t.hash))
+
+
+def _owner_in_pass(token, base_owner, handovers, row, moves_to=None):
+    """The owner when the pass reaches row: base_owner, then each handover
+    of the same pass that sorts before the row and was made by the owner of
+    the moment (to its recipient, or to moves_to at a recovery)."""
+    owner = base_owner
+    key = _pass_order(row)
+    for tx in handovers:
+        if (tx.unlock_time, tx.height, tx.hash) >= key:
+            break
+        if tx.from_address == owner:
+            owner = moves_to or tx.to_address
+    return owner
 
 
 def _end_of(block):
@@ -516,11 +548,21 @@ def settle_matured_reserve_sends(block):
     for row in due:
         key = (row.token_id, row.from_address)
         pending[key] = pending.get(key, Decimal(0)) + row.amount
+    # Core settles the block's due ownership transfers and vBTC sends in one
+    # pass, in (unlock, height, hash) order: a handover due earlier in the
+    # pass has changed the owner when a send is reached.
     cutoff = _end_of(block)
-    held, owners = {}, {}
+    held, base, handovers = {}, {}, {}
     for row in sorted(due, key=_pass_order):
         tx = row.transaction
-        if tx.unlock_time < rules_from or _sender_covers(row, cutoff, held, owners, pending):
+        if tx.unlock_time < rules_from:
+            continue
+        token = row.token
+        if token.pk not in base:
+            base[token.pk] = token.owner_before(cutoff)
+            handovers[token.pk] = _pending_handovers(token, previous, block.date_crafted)
+        owner = _owner_in_pass(token, base[token.pk], handovers[token.pk], row)
+        if _sender_covers(row, cutoff, held, owner, pending):
             continue
         logging.warning(
             f"Reserve vBTC send {tx.hash} of {row.amount} on {row.token.sc_identifier}: not covered by "
@@ -565,9 +607,20 @@ def redirect_reserve_sends(recovery_tx, sends, recovery_address):
         VbtcV2TokenTransfer.objects.filter(transaction__in=sends, is_multi=False).select_related("transaction", "token")
     )
     judged = recovery_tx.height >= fund_loss_audit_height()
-    held, owners = {}, {}
+    # The recovery's pending loop runs in (unlock, height, hash) order and
+    # gives a contract the reserve still owns to the recovery address when
+    # it reaches that contract's pending transfer (StateData.cs:1539, :1571).
+    reserve = recovery_tx.from_address
+    held, base, handovers = {}, {}, {}
     for row in sorted(rows, key=_pass_order):
-        if judged and not _sender_covers(row, recovery_tx, held, owners, {}):
+        token = row.token
+        if token.pk not in base:
+            base[token.pk] = token.owner_before(recovery_tx)
+            handovers[token.pk] = _pending_handovers(
+                token, recovery_tx.date_crafted, datetime.max.replace(tzinfo=timezone.utc), sender=reserve
+            )
+        owner = _owner_in_pass(token, base[token.pk], handovers[token.pk], row, moves_to=recovery_address)
+        if judged and not _sender_covers(row, recovery_tx, held, owner, {}):
             logging.warning(
                 f"Reserve vBTC send {row.transaction.hash} on {row.token.sc_identifier}: not covered by "
                 f"{row.from_address} at the recovery {recovery_tx.hash}; taken back, never applied."
