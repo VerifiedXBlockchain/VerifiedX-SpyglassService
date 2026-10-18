@@ -33,6 +33,7 @@ from contextvars import ContextVar
 from decimal import Decimal
 
 from django.db.models import Q
+from django.db.transaction import atomic
 
 from rbx.models import (
     Block,
@@ -976,6 +977,17 @@ def reconcile_watched_withdrawals(token):
     changes nothing. Returns the number of rows settled."""
     from rbx.client import get_vbtc_v2_withdrawal_history
 
+    if not token.withdrawal_requests.filter(status__in=VbtcV2WithdrawalRequest.ACTIVE_STATUSES).exists():
+        return 0
+    data = get_vbtc_v2_withdrawal_history(token.sc_identifier)
+    # One transaction per vault, the token row locked: a block sync and the
+    # sweep do not settle or re-plan the same vault at once.
+    with atomic():
+        VbtcV2Token.objects.select_for_update().filter(pk=token.pk).first()
+        return _apply_withdrawal_history(token, data)
+
+
+def _apply_withdrawal_history(token, data):
     open_rows = {
         w.request_transaction_id: w
         for w in token.withdrawal_requests.filter(status__in=VbtcV2WithdrawalRequest.ACTIVE_STATUSES)
@@ -983,13 +995,15 @@ def reconcile_watched_withdrawals(token):
     }
     if not open_rows:
         return 0
-    data = get_vbtc_v2_withdrawal_history(token.sc_identifier)
     paid = data.get("WithdrawalHistory") if isinstance(data, dict) else None
     closed = data.get("Refunded") if isinstance(data, dict) else None
-    if not isinstance(data, dict) or not data.get("Success") or not isinstance(paid, list) or not isinstance(closed, list):
+    if not isinstance(data, dict) or not data.get("Success"):
+        # The client has logged the refusal or the failure.
+        return 0
+    if not isinstance(paid, list) or not isinstance(closed, list):
         logging.error(
-            f"Watched vault {token.sc_identifier}: no withdrawal history from the node "
-            f"({data.get('Message') if isinstance(data, dict) else data!r}); its open withdrawals are left as they are."
+            f"Watched vault {token.sc_identifier}: the node's withdrawal history has no WithdrawalHistory "
+            f"or Refunded list; its open withdrawals are left as they are."
         )
         return 0
 
@@ -1002,7 +1016,11 @@ def reconcile_watched_withdrawals(token):
             continue
         report = Transaction.objects.filter(hash=entry.get("CompletionHash") or "").first()
         txid = entry.get("BTCTransactionHash")
-        if report is None or not txid:
+        if not txid or not entry.get("CompletionHash"):
+            _log_once(token, entry, "has no Bitcoin txid or completing report; the row stays open")
+            continue
+        if report is None:
+            _log_once(token, entry, f"waits for report {entry.get('CompletionHash')} to be indexed")
             continue
         withdrawal.status = VbtcV2WithdrawalRequest.Status.COMPLETED
         withdrawal.btc_transaction_hash = txid
@@ -1018,9 +1036,13 @@ def reconcile_watched_withdrawals(token):
         if withdrawal.status in VbtcV2WithdrawalRequest.TERMINAL_STATUSES:
             continue
         closed_at = entry.get("ClosedAtBlock")
-        block = Block.objects.filter(height=closed_at).first() if closed_at is not None else None
         refunded = net_decimal(entry.get("Refunded"))
-        if block is None or refunded is None:
+        if closed_at is None or refunded is None:
+            _log_once(token, entry, "has no closing block or refund; the row stays open")
+            continue
+        block = Block.objects.filter(height=closed_at).first()
+        if block is None:
+            _log_once(token, entry, f"waits for block {closed_at} to be synced")
             continue
         withdrawal.status = VbtcV2WithdrawalRequest.Status.CANCELLED
         withdrawal.cancelled_at = block.date_crafted
@@ -1036,13 +1058,27 @@ def reconcile_watched_withdrawals(token):
     return settled
 
 
+_LOGGED = set()
+
+
+def _log_once(token, entry, why, level=logging.WARNING):
+    """One line per vault, entry and reason for the life of the process: the
+    sweep reads the same history every ten minutes."""
+    request = entry.get("RequestHash") if isinstance(entry, dict) else repr(entry)
+    key = (token.sc_identifier, request, why)
+    if key in _LOGGED:
+        return
+    _LOGGED.add(key)
+    logging.log(level, f"Watched vault {token.sc_identifier}: withdrawal {request} {why}.")
+
+
 def _log_unknown(token, entry):
     if not isinstance(entry, dict):
-        logging.error(f"Watched vault {token.sc_identifier}: unreadable withdrawal history entry {entry!r}.")
+        _log_once(token, entry, "is not a readable history entry", logging.ERROR)
         return
     request = entry.get("RequestHash")
     if not token.withdrawal_requests.filter(request_transaction_id=request).exists():
-        logging.error(f"Watched vault {token.sc_identifier}: the node lists request {request}, which Spyglass does not hold.")
+        _log_once(token, entry, "is listed by the node but not held by Spyglass", logging.ERROR)
 
 
 def reconcile_all_watched_vaults():

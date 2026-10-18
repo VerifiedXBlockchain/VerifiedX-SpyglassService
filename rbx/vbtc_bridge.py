@@ -607,19 +607,20 @@ def _restore(lock, amount, blacklist=False):
     lock.save(update_fields=["unlocked_amount", "unlocked_amount_sats", "is_unlocked", "is_blacklisted"])
 
 
-def reconcile_watched_exit(exit):
+def reconcile_watched_exit(exit, data):
     """An open exit on watched vaults takes its outcome from the node's
     GetBridgeExit (BtcWithdrawals: SettleExitPart, ExpireExit,
     VoidExitPart). Complete: the exit is closed and its burn is spent.
     Expired by rule: its locks are given back. A part voided: that vault's
     locks are given back and taken out of use. Each outcome is applied once.
-    A node that does not answer changes nothing."""
-    from rbx.client import get_vbtc_v2_bridge_exit
-
-    data = get_vbtc_v2_bridge_exit(exit.burn_tx_hash)
-    view = data.get("Exit") if isinstance(data, dict) and data.get("Success") else None
+    A node that does not answer changes nothing. `data` is the node's
+    GetBridgeExit answer, read before the bridge lock is taken."""
+    if not isinstance(data, dict) or not data.get("Success"):
+        # The client has logged the refusal or the failure.
+        return False
+    view = data.get("Exit")
     if not isinstance(view, dict):
-        logging.error(f"Bridge exit {exit.burn_tx_hash}: no state from the node; left as it is.")
+        logging.error(f"Bridge exit {exit.burn_tx_hash}: the node's answer has no Exit; left as it is.")
         return False
     lock_tokens = {}
     for allocation in exit.allocations:
@@ -661,7 +662,10 @@ def refresh_watched_exit_payouts(token):
     from rbx.client import get_vbtc_v2_withdrawal_status
 
     data = get_vbtc_v2_withdrawal_status(token.sc_identifier)
-    bitcoin = data.get("Bitcoin") if isinstance(data, dict) and data.get("Success") else None
+    if not isinstance(data, dict) or not data.get("Success"):
+        # The client has logged the refusal or the failure.
+        return False
+    bitcoin = data.get("Bitcoin")
     sats = bitcoin.get("PaidOutForBridgeExitsSats") if isinstance(bitcoin, dict) else None
     if not isinstance(sats, int) or isinstance(sats, bool):
         logging.error(f"Watched vault {token.sc_identifier}: no bridge payout figure from the node; left as it is.")
@@ -675,19 +679,24 @@ def refresh_watched_exit_payouts(token):
 
 def reconcile_watched_exits():
     """Every open exit on watched vaults, then the payout figure of every
-    watched vault an exit has drawn on."""
-    with atomic():
-        lock_bridge_state()
-        drawn = {}
-        for exit in VbtcV2BridgeExit.objects.filter(is_complete=False).select_related("exit_transaction"):
-            if is_watched_exit(exit):
-                reconcile_watched_exit(exit)
-                for token in _exit_tokens(exit):
-                    drawn[token.pk] = token
-        for exit in VbtcV2BridgeExit.objects.filter(is_complete=True):
-            for token in _exit_tokens(exit):
-                if token.is_watched:
-                    drawn[token.pk] = token
+    watched vault an exit has drawn on. The node is asked first; each exit's
+    outcome is then applied in its own transaction under the bridge lock,
+    so the lock is never held across a node call."""
+    from rbx.client import get_vbtc_v2_bridge_exit
+
+    open_exits = [e for e in VbtcV2BridgeExit.objects.filter(is_complete=False) if is_watched_exit(e)]
+    answers = {exit.pk: get_vbtc_v2_bridge_exit(exit.burn_tx_hash) for exit in open_exits}
+    drawn = {}
+    for exit in open_exits:
+        with atomic():
+            lock_bridge_state()
+            current = VbtcV2BridgeExit.objects.select_related("exit_transaction").filter(pk=exit.pk, is_complete=False).first()
+            if current is not None:
+                reconcile_watched_exit(current, answers[exit.pk])
+    for exit in VbtcV2BridgeExit.objects.all():
+        for token in _exit_tokens(exit):
+            if token.is_watched:
+                drawn[token.pk] = token
     for token in drawn.values():
         refresh_watched_exit_payouts(token)
 

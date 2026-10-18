@@ -275,6 +275,16 @@ def sync_block(height: int, data: Optional[dict] = None, notify: bool = True) ->
                 block_count=F("block_count") + 1
             )
 
+    # A Bitcoin report, rewind or rekey: the watched vaults' withdrawals and
+    # exits take their outcome from the node, once, after the block is
+    # committed. A failure here is logged; the block and its transactions
+    # stand, and the next pass (or the ten-minute sweep) reads them again.
+    if any(t.get("TransactionType") in ATTESTATION_TYPES for t in data["Transactions"]):
+        try:
+            vbtc_dispatch.reconcile_all_watched_vaults()
+        except Exception:
+            logging.exception(f"Reading the watched vaults' outcomes after block {height} failed")
+
     if block_created and notify:
         b = None
         try:
@@ -463,6 +473,16 @@ def expire_stale_withdrawals():
 # wired up, and until now it looked exactly like a type nobody needed to —
 # which is how every Base-bridge transaction (37-42) has been passing through
 # the indexer unnoticed.
+# The attestation types after which sync_block reads the watched vaults'
+# outcomes from the node.
+ATTESTATION_TYPES = frozenset(
+    {
+        Transaction.Type.VBTC_V2_BTC_REPORT,
+        Transaction.Type.VBTC_V2_BTC_REORG,
+        Transaction.Type.VBTC_V2_VAULT_REKEY,
+    }
+)
+
 UNINDEXED_TX_TYPES = frozenset(
     {
         Transaction.Type.TX,
@@ -1199,9 +1219,9 @@ def process_transaction(tx: Transaction):
         Transaction.Type.VBTC_V2_BTC_REORG,
         Transaction.Type.VBTC_V2_VAULT_REKEY,
     ):
-        # Bitcoin moved in consensus: the watched vaults' open withdrawals
-        # take their outcome from the node.
-        vbtc_dispatch.reconcile_all_watched_vaults()
+        # Bitcoin moved in consensus: sync_block reads the watched vaults'
+        # outcomes from the node once the block is committed.
+        pass
 
     elif tx.type == Transaction.Type.VBTC_V2_WITHDRAWAL_VOTE:
         vbtc_dispatch.apply_vote(tx)

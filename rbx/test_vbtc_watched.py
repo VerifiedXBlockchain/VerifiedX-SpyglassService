@@ -106,10 +106,23 @@ class WatchedSettlementTests(WatchedVaultCase):
         self.assertEqual(sum(addresses.values()), Decimal("0.0099"))
 
     def test_vii_a_node_that_does_not_answer_changes_nothing(self):
-        with self.assertLogs(level="ERROR") as logs:
+        # The client logs the refusal; the reconciliation adds no second line.
+        with self.assertNoLogs(level="ERROR"):
             self.reconcile({"Success": False, "Message": "down"})
         self.assertEqual(self.row().status, Status.REQUESTED)
-        self.assertEqual(len([line for line in logs.output if "no withdrawal history" in line]), 1)
+
+    def test_an_unknown_request_is_logged_once(self):
+        entry = {"RequestHash": "nope", "CompletionHash": "rep1", "BTCTransactionHash": "T"}
+        with self.assertLogs(level="ERROR") as logs:
+            self.reconcile(history(paid=[entry]))
+            self.reconcile(history(paid=[entry]))
+        self.assertEqual(len([line for line in logs.output if "nope" in line]), 1)
+
+    def test_an_entry_without_its_closing_block_is_logged_and_left(self):
+        with self.assertLogs(level="WARNING") as logs:
+            self.reconcile(history(refunded=[{"RequestHash": "r1", "Refunded": 0.003}]))
+        self.assertEqual(self.row().status, Status.REQUESTED)
+        self.assertTrue(any("no closing block" in line for line in logs.output))
 
     def test_viii_a_report_not_yet_indexed_leaves_the_row_open_until_it_is(self):
         entry = {"RequestHash": "r1", "CompletionHash": "rep1", "BTCTransactionHash": "T"}
@@ -119,10 +132,55 @@ class WatchedSettlementTests(WatchedVaultCase):
         self.reconcile(history(paid=[entry]))
         self.assertEqual(self.row().status, Status.COMPLETED)
 
-    def test_a_report_transaction_triggers_the_reconciliation(self):
-        report = self.report()
-        with patch(HISTORY, return_value=history(paid=[{"RequestHash": "r1", "CompletionHash": "rep1", "BTCTransactionHash": "T"}])):
-            process_transaction(report)
+    def block_data(self, height, txs):
+        return {"Height": height, "Hash": f"block-{height}", "PrevHash": "", "Validator": "V", "ValidatorSignature": "",
+                "ValidatorAnswer": "", "ChainRefId": "", "MerkleRoot": "", "StateRoot": "", "TotalReward": 0,
+                "TotalAmount": 0, "TotalValidators": 0, "Version": 1, "Size": 0, "BCraftTime": 0, "Timestamp": 1760000000,
+                "Transactions": [{"Hash": h, "TransactionType": int(T.VBTC_V2_BTC_REPORT), "ToAddress": "BTC_Attestation",
+                                  "FromAddress": "BTC_Attestation", "Amount": 0, "Fee": 0, "Data": "{}", "Signature": ""}
+                                 for h in txs]}
+
+    def test_a_block_with_reports_reconciles_once_after_it_commits(self):
+        from rbx.tasks import sync_block
+
+        # A second open request the history does not settle keeps the vault
+        # open after the first report.
+        process_transaction(request_tx(make_block(height=11), "r9", "O", "sc:w", 0.001))
+        entry = {"RequestHash": "r1", "CompletionHash": "rep1", "BTCTransactionHash": "T"}
+        with patch(HISTORY, return_value=history(paid=[entry])) as node:
+            sync_block(50, data=self.block_data(50, ["rep1", "rep2"]), notify=False)
+        self.assertEqual(node.call_count, 1)
+        self.assertEqual(self.row().status, Status.COMPLETED)
+
+    def test_a_failing_reconciliation_keeps_the_report(self):
+        from rbx.tasks import sync_block
+
+        with patch("rbx.vbtc_dispatch.reconcile_all_watched_vaults", side_effect=RuntimeError("node broke")):
+            with self.assertLogs(level="ERROR"):
+                sync_block(50, data=self.block_data(50, ["rep1"]), notify=False)
+        self.assertTrue(Transaction.objects.filter(hash="rep1").exists())
+
+    def test_the_balance_sweep_reconciles(self):
+        from django.core.management import call_command
+
+        entry = {"RequestHash": "r1", "CompletionHash": "rep1", "BTCTransactionHash": "T"}
+        self.report()
+        with patch(HISTORY, return_value=history(paid=[entry])), \
+                patch("btc.management.commands.update_vbtc_balances.BtcClient") as client, \
+                patch("btc.management.commands.update_vbtc_balances.sleep"):
+            client.return_value.get_balance.return_value = None
+            call_command("update_vbtc_balances")
+        self.assertEqual(self.row().status, Status.COMPLETED)
+
+    def test_the_backfill_reconciles(self):
+        from io import StringIO
+
+        from django.core.management import call_command
+
+        entry = {"RequestHash": "r1", "CompletionHash": "rep1", "BTCTransactionHash": "T"}
+        self.report()
+        with patch(HISTORY, return_value=history(paid=[entry])):
+            call_command("reprocess_vbtc_v2", stdout=StringIO(), stderr=StringIO())
         self.assertEqual(self.row().status, Status.COMPLETED)
 
     def test_vi_a_cancel_closes_a_watched_request_at_once(self):
@@ -227,8 +285,7 @@ class WatchedExitTests(WatchedVaultCase):
         self.assertEqual(lock.remaining_amount, Decimal("0.003"))
 
     def test_a_node_that_does_not_answer_changes_nothing(self):
-        with self.assertLogs(level="ERROR"):
-            self.sweep({"Success": False, "Message": "down"})
+        self.sweep({"Success": False, "Message": "down"})
         self.assertFalse(self.exit().is_complete)
         self.assertEqual(self.remaining(), Decimal("0.001"))
 
