@@ -8,7 +8,7 @@ from decimal import Decimal
 from django.conf import settings
 from shop.models import Listing
 from django.db.models import Q
-from django.db.models.functions import Cast
+from django.db.models.functions import Cast, Upper
 from django.utils import timezone
 import json
 import uuid
@@ -1639,6 +1639,10 @@ class VbtcV2BridgeLock(models.Model):
         Transaction, blank=True, null=True, on_delete=models.SET_NULL, related_name="+"
     )
     exit_burn_tx_hash = models.CharField(max_length=128, blank=True)
+
+    class Meta:
+        # The node compares lock ids without regard to case (lock_id__iexact).
+        indexes = [models.Index(Upper("lock_id"), name="vbtcv2bridgelock_lock_id_upper")]
 
     @property
     def remaining_amount(self):

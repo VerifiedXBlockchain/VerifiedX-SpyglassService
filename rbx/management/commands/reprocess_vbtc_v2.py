@@ -114,10 +114,9 @@ class Command(BaseCommand):
         # a burn is taken in the chain's order, read from the node.
         txs = list(Transaction.objects.filter(selected))
         shared = shared_bridge_blocks(txs)
+        goes_last = lambda tx: tx.hash in ownership_transfers or tx.hash in recoveries  # noqa: E731
         txs, unresolved = in_chain_order(
-            txs,
-            shared,
-            lambda tx: (int(tx.hash in ownership_transfers or tx.hash in recoveries), tx.hash),
+            txs, shared, lambda tx: (int(goes_last(tx)), tx.hash), last=goes_last
         )
         count = len(txs)
 

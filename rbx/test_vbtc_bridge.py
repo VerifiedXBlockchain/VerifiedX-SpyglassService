@@ -392,3 +392,44 @@ class ShieldPayloadNumbersTests(BridgeCase):
     def test_a_numeric_asset_binds_as_its_text(self):
         self.shield({"v": 1, "asset": 7, "vbtc_uid": "sc:a", "vbtc_amt": 0.001})
         self.assertEqual(self.addresses()["H"], Decimal("0.003"))
+
+
+@TESTNET
+class BridgeResyncFailureTests(BridgeCase):
+    def setUp(self):
+        super().setUp()
+        self.lock()
+
+    def test_a_failing_sync_still_rebuilds_the_blocks_already_synced(self):
+        unlock = self.pool_unlock("p1", "b1", [("L1", "0.002")])
+        other = make_block(height=99)
+        data = unlock.data
+
+        def sync_again(height):
+            if height == other.height:
+                raise RuntimeError("node down")
+            tx = make_tx(Block.objects.get(height=height), "p1", T.VBTC_BRIDGE_POOL_UNLOCK,
+                         from_address="Caster", to_address="Caster")
+            tx.data = data
+            tx.save(update_fields=["data"])
+            process_transaction(tx)
+
+        with patch("rbx.management.commands.validate_transactions.sync_block", side_effect=sync_again), \
+                patch("rbx.client.get_block", return_value=None):
+            with self.assertRaises(RuntimeError):
+                fix_blocks([unlock.height, other.height])
+        self.assertEqual(self.remaining(), Decimal("0.001"))
+        self.assertEqual(self.addresses()["D"], Decimal("0.002"))
+
+
+class ChainOrderTests(TestCase):
+    def test_transactions_named_last_stay_after_the_rest_of_a_chain_ordered_block(self):
+        from rbx.vbtc_bridge import in_chain_order
+
+        block = make_block(height=5)
+        txs = [make_tx(block, h, T.VBTC_BRIDGE_POOL_UNLOCK) for h in ("own", "pa", "pb")]
+        chain = {"Transactions": [{"Hash": "own"}, {"Hash": "pb"}, {"Hash": "pa"}]}
+        with patch("rbx.client.get_block", return_value=chain):
+            ordered, unresolved = in_chain_order(txs, [5], lambda tx: (tx.hash,), last=lambda tx: tx.hash == "own")
+        self.assertEqual([tx.hash for tx in ordered], ["pb", "pa", "own"])
+        self.assertEqual(unresolved, [])

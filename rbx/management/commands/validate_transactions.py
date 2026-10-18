@@ -71,10 +71,14 @@ def fix_blocks(heights):
     transaction the bridge state is rebuilt from every bridge transaction."""
     bridge = list(BRIDGE_TYPES)
     touched = Transaction.objects.filter(height__in=heights, type__in=bridge).exists()
-    for h in heights:
-        print(f"Fixing {h}")
-        Transaction.objects.filter(height=h).delete()
-        sync_block(h)
-    if touched or Transaction.objects.filter(height__in=heights, type__in=bridge).exists():
-        print("Rebuilding the vBTC bridge state")
-        rebuild_bridge_state()
+    try:
+        for h in heights:
+            print(f"Fixing {h}")
+            Transaction.objects.filter(height=h).delete()
+            sync_block(h)
+    finally:
+        # Also when a sync fails partway: the blocks already synced again
+        # would otherwise keep their second draws.
+        if touched or Transaction.objects.filter(height__in=heights, type__in=bridge).exists():
+            print("Rebuilding the vBTC bridge state")
+            rebuild_bridge_state()

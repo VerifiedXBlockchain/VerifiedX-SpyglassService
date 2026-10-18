@@ -23,6 +23,9 @@ import json
 import logging
 from decimal import Decimal, InvalidOperation
 
+from django.db import connection
+from django.db.transaction import atomic
+
 from rbx.models import (
     Transaction,
     VbtcV2BridgeConsumedBurn,
@@ -62,13 +65,27 @@ BRIDGE_TYPES = frozenset(
 SHIELD_TYPES = frozenset({Transaction.Type.VBTC_SHIELD, Transaction.Type.VBTC_UNSHIELD})
 
 
+# pg_advisory_xact_lock key shared by every writer of the bridge state.
+BRIDGE_STATE_LOCK = 0x76627463  # "vbtc"
+
+
+def _lock_bridge_state():
+    """Held to the end of the enclosing transaction: a rebuild and a block
+    sync never write the bridge state at the same time."""
+    if connection.vendor == "postgresql":
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT pg_advisory_xact_lock(%s)", [BRIDGE_STATE_LOCK])
+
+
 def route(tx):
     """Applies tx when it is one of these types and returns True."""
     handler = _HANDLERS.get(tx.type)
     if handler is None:
         return False
-    moves = handler(tx) or {}
-    _write_moves(tx, moves)
+    with atomic():
+        _lock_bridge_state()
+        moves = handler(tx) or {}
+        _write_moves(tx, moves)
     return True
 
 
@@ -124,10 +141,11 @@ def shared_bridge_blocks(txs):
     return shared
 
 
-def in_chain_order(txs, heights, fallback_key):
+def in_chain_order(txs, heights, fallback_key, last=None):
     """txs sorted block by block: the blocks in `heights` in the chain's
-    order, every other block by fallback_key. Returns (txs, the heights whose
-    order the node could not give)."""
+    order, every other block by fallback_key. In a block taken in the chain's
+    order the transactions `last` names still come after the others. Returns
+    (txs, the heights whose order the node could not give)."""
     orders = {}
     unresolved = []
     for height in sorted(heights):
@@ -140,7 +158,7 @@ def in_chain_order(txs, heights, fallback_key):
     def key(tx):
         order = orders.get(tx.height)
         if order is not None and tx.hash in order:
-            return (tx.height, 0, order[tx.hash], "")
+            return (tx.height, 0, bool(last and last(tx)), order[tx.hash], "")
         return (tx.height, 1) + tuple(fallback_key(tx))
 
     return sorted(txs, key=key), unresolved
@@ -155,9 +173,13 @@ def rebuild_bridge_state():
     txs, unresolved = in_chain_order(txs, shared_bridge_blocks(txs), lambda tx: (tx.hash,))
     for height in unresolved:
         logging.warning(f"Bridge state rebuilt with block {height} in hash order; the node gave no order.")
-    reset_bridge_state()
-    for tx in txs:
-        route(tx)
+    # One transaction under the bridge lock: a block synced meanwhile waits
+    # for the rebuild instead of finding the state half built.
+    with atomic():
+        _lock_bridge_state()
+        reset_bridge_state()
+        for tx in txs:
+            route(tx)
     return unresolved
 
 
