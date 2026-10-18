@@ -15,7 +15,7 @@ from rbx.models import Block, Transaction, VbtcV2BridgeExit, VbtcV2BridgeLock, V
 from rbx.tasks import process_transaction, sync_block
 from rbx.test_vbtc_dispatch import cancel_tx, complete_tx, request_tx
 from rbx.tests import add_transfer, make_block, make_tx, make_token
-from rbx.vbtc_bridge import ExitExpiryUnanswered, rebuild_bridge_state
+from rbx.vbtc_bridge import ExitExpiryUnanswered, expire_exits, read_exit_expiries, rebuild_bridge_state
 from rbx.vbtc_dispatch import reconcile_watched_withdrawals
 
 T = Transaction.Type
@@ -519,6 +519,34 @@ class ExitExpiryTests(WatchedVaultCase):
             self.rebuild(self.UNREACHABLE)
         self.assertFalse(self.exit().is_complete)
         self.assertEqual(self.lock().remaining_amount, Decimal("0.001"))
+
+    def test_a_proxy_error_page_is_not_an_answer(self):
+        from unittest.mock import MagicMock
+
+        from rbx.client import get_vbtc_v2_bridge_exit
+
+        page = MagicMock(ok=False, status_code=502)
+        page.json.return_value = {"Success": False, "Message": "Bad Gateway"}
+        with patch("rbx.client._http.get", return_value=page):
+            self.assertTrue(get_vbtc_v2_bridge_exit("b1")["Unreachable"])
+            with self.assertRaises(ExitExpiryUnanswered):
+                self.sync(402, with_unlock=False, exit_view=None)
+        self.assertFalse(Block.objects.filter(height=402).exists())
+
+    def test_an_expiry_read_still_applies_to_the_exit_made_again_by_a_rebuild(self):
+        # A rebuild between the read and the bridge lock makes the exit again
+        # as a new row: the answer is keyed by burn and exit, not by row.
+        with self.node(self.EXPIRED):
+            expiries = read_exit_expiries(402, {})
+        exit = self.exit()
+        read_pk = exit.pk
+        exit.delete()
+        exit.pk = None
+        exit.save()
+        self.assertNotEqual(self.exit().pk, read_pk)
+        expire_exits(402, expiries)
+        self.assertTrue(self.exit().failed)
+        self.assertEqual(self.lock().remaining_amount, Decimal("0.003"))
 
     def test_a_synced_block_past_the_window_edge_does_not_ask_again(self):
         self.sync(403, with_unlock=False)
