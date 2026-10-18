@@ -81,7 +81,7 @@ def bridge_references(tx):
     for name in ("LockId",):
         value = net_string(field(payload, name))
         if value:
-            refs.add(("lock", value.strip()))
+            refs.add(("lock", value.strip().lower()))
     for name in ("ExitBurnTxHash", "BaseBurnTxHash"):
         key = normalize_burn(net_string(field(payload, name)))
         if key:
@@ -89,8 +89,76 @@ def bridge_references(tx):
     for name in ("Allocations", "FailedAllocations"):
         for allocation in _allocations(payload, name) or []:
             if allocation["LockId"]:
-                refs.add(("lock", allocation["LockId"].strip()))
+                refs.add(("lock", allocation["LockId"].strip().lower()))
     return refs
+
+
+def chain_order(height):
+    """The hashes of block `height` in the chain's order, from the node, or
+    None when the node does not answer. Spyglass stores no order inside a
+    block."""
+    from rbx.client import get_block
+
+    try:
+        data = get_block(height)
+    except Exception:
+        logging.exception(f"Could not read block {height} from the node for its transaction order.")
+        return None
+    if not data:
+        return None
+    return [t.get("Hash") for t in data.get("Transactions") or []]
+
+
+def shared_bridge_blocks(txs):
+    """{height: [(kind, id, hashes)]} for the blocks in which two bridge
+    transactions draw on the same lock or spend the same burn, where the
+    order inside the block decides the outcome."""
+    seen = {}
+    for tx in txs:
+        for ref in bridge_references(tx):
+            seen.setdefault((tx.height, ref), []).append(tx.hash)
+    shared = {}
+    for (height, (kind, ref)), hashes in sorted(seen.items()):
+        if len(hashes) > 1:
+            shared.setdefault(height, []).append((kind, ref, hashes))
+    return shared
+
+
+def in_chain_order(txs, heights, fallback_key):
+    """txs sorted block by block: the blocks in `heights` in the chain's
+    order, every other block by fallback_key. Returns (txs, the heights whose
+    order the node could not give)."""
+    orders = {}
+    unresolved = []
+    for height in sorted(heights):
+        order = chain_order(height)
+        if order is None:
+            unresolved.append(height)
+        else:
+            orders[height] = {h: i for i, h in enumerate(order)}
+
+    def key(tx):
+        order = orders.get(tx.height)
+        if order is not None and tx.hash in order:
+            return (tx.height, 0, order[tx.hash], "")
+        return (tx.height, 1) + tuple(fallback_key(tx))
+
+    return sorted(txs, key=key), unresolved
+
+
+def rebuild_bridge_state():
+    """Clears the bridge state and applies every bridge and shield
+    transaction again, in the chain's order where it matters. For a block
+    synced again (validate_transactions --fix): the locks of earlier blocks
+    would otherwise keep what the deleted transactions drew."""
+    txs = list(Transaction.objects.filter(type__in=list(BRIDGE_TYPES | SHIELD_TYPES)))
+    txs, unresolved = in_chain_order(txs, shared_bridge_blocks(txs), lambda tx: (tx.hash,))
+    for height in unresolved:
+        logging.warning(f"Bridge state rebuilt with block {height} in hash order; the node gave no order.")
+    reset_bridge_state()
+    for tx in txs:
+        route(tx)
+    return unresolved
 
 
 def reset_bridge_state():
@@ -188,9 +256,13 @@ def normalize_burn(burn):
     return value[2:] if value.startswith("0x") else value
 
 
-def _lock(lock_id):
-    """VBTCBridgeLockState.GetByLockId: the id trimmed."""
-    return VbtcV2BridgeLock.objects.filter(lock_id=(lock_id or "").strip()).select_related("token").first()
+def _lock(lock_id, trim=True):
+    """VBTCBridgeLockState.GetByLockId: the id trimmed, compared without
+    regard to case as LiteDB compares strings. BlacklistLock does not trim."""
+    lock_id = lock_id or ""
+    if trim:
+        lock_id = lock_id.strip()
+    return VbtcV2BridgeLock.objects.filter(lock_id__iexact=lock_id).select_related("token").first()
 
 
 def _exit(burn):
@@ -228,7 +300,7 @@ def apply_lock(tx):
     if _sats(amount) != amount_sats:
         logging.error(f"{what} {tx.hash}: AmountSats does not match Amount; the node applies nothing.")
         return None
-    existing = VbtcV2BridgeLock.objects.filter(lock_id=lock_id.strip()).first()
+    existing = _lock(lock_id)
     if existing is not None and existing.lock_transaction_id != tx.pk:
         return None
     token = _token(sc_uid, tx, what)
@@ -415,8 +487,9 @@ def apply_exit_complete(tx):
     btc_tx = net_string(field(payload, "BtcTxHash"))
     if not burn or not btc_tx:
         return None
-    # MarkComplete matches the stored hash exactly.
-    VbtcV2BridgeExit.objects.filter(burn_tx_hash=burn.strip()).update(
+    # MarkComplete matches the stored hash trimmed and without regard to
+    # case (LiteDB), not the normalised one.
+    VbtcV2BridgeExit.objects.filter(burn_tx_hash__iexact=burn.strip()).update(
         is_complete=True, btc_tx_hash=btc_tx.strip()
     )
     if tx.height >= bridge_intra_block_guard_height():
@@ -438,8 +511,7 @@ def apply_exit_fail(tx):
 
     # Each failed allocation is given back to its lock, which is blacklisted.
     for allocation in failed:
-        # BlacklistLock matches the id exactly, untrimmed.
-        lock = VbtcV2BridgeLock.objects.filter(lock_id=allocation["LockId"]).first()
+        lock = _lock(allocation["LockId"], trim=False)
         if lock is None:
             continue
         lock.is_blacklisted = True
@@ -517,15 +589,33 @@ def _shield_amount(payload):
     return amount if amount > 0 else None
 
 
+def _payload_int(value):
+    """An int property of a deserialised payload: a whole number (or its
+    string); a fraction, a boolean or anything else fails to bind."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, Decimal):
+        return int(value) if value == value.to_integral_value() else None
+    if isinstance(value, str):
+        return net_int(value)
+    return None
+
+
 def _shield_move(tx, what):
     # JsonConvert.DeserializeObject<PrivateTxPayload>: properties bind by
     # name, exact first and then case-insensitively; v defaults to 1.
     payload = private_payload(tx.data)
     version = bound_field(payload, "v") if payload is not None else None
     asset = bound_field(payload, "asset") if payload is not None else None
+    # A string slot takes a JSON number as its text; an int slot refuses a
+    # number with a fraction.
+    if isinstance(asset, (int, Decimal)) and not isinstance(asset, bool):
+        asset = str(asset)
     if (
         payload is None
-        or (version is not None and net_int(version) != 1)
+        or (version is not None and _payload_int(version) != 1)
         or not isinstance(asset, str)
         or not asset.strip()
         or len(asset) > 64

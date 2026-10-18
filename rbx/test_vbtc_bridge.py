@@ -4,11 +4,13 @@ import base64
 import json
 from decimal import Decimal
 from io import StringIO
+from unittest.mock import patch
 
 from django.core.management import call_command
 from django.test import TestCase, override_settings
 
-from rbx.models import Transaction, VbtcV2BridgeExit, VbtcV2BridgeLock, VbtcV2TokenTransfer
+from rbx.management.commands.validate_transactions import fix_blocks
+from rbx.models import Block, Transaction, VbtcV2BridgeExit, VbtcV2BridgeLock, VbtcV2TokenTransfer
 from rbx.tasks import process_transaction
 from rbx.tests import add_transfer, make_block, make_token, make_tx
 
@@ -298,4 +300,95 @@ class ShieldPayloadBindingTests(BridgeCase):
         tx.data = json.dumps({"Asset": "VBTC:sc:a", "VBTC_UID": "sc:a", "Vbtc_Amt": 0.001})
         tx.save(update_fields=["data"])
         process_transaction(tx)
+        self.assertEqual(self.addresses()["H"], Decimal("0.003"))
+
+
+@TESTNET
+class BridgeOrderAndResyncTests(BridgeCase):
+    def setUp(self):
+        super().setUp()
+        self.lock()
+
+    def two_unlocks_in_one_block(self):
+        # 0.002 each from a lock holding 0.003: only the first is credited.
+        block = make_block(height=40)
+        for tx_hash, destination in (("pa", "A"), ("pb", "B")):
+            make_tx(block, tx_hash, T.VBTC_BRIDGE_POOL_UNLOCK, from_address="Caster", to_address="Caster", data={
+                "TotalAmount": 0.002, "TotalAmountSats": 200000, "VfxDestinationAddress": destination,
+                "ExitBurnTxHash": f"burn-{tx_hash}", "Allocations": [{"LockId": "L1", "UnlockAmount": 0.002}],
+            })
+
+    def test_backfill_replays_a_shared_lock_in_the_chains_order(self):
+        self.two_unlocks_in_one_block()
+        chain = {"Transactions": [{"Hash": "pb"}, {"Hash": "pa"}]}
+        out, err = StringIO(), StringIO()
+        with patch("rbx.client.get_block", return_value=chain):
+            call_command("reprocess_vbtc_v2", "--dry-run", stdout=out, stderr=err)
+            self.assertIn("WARNING block 40", err.getvalue())
+            call_command("reprocess_vbtc_v2", stdout=StringIO(), stderr=StringIO())
+        addresses = self.addresses()
+        self.assertEqual(addresses["B"], Decimal("0.002"))
+        self.assertNotIn("A", addresses)
+
+    def test_backfill_says_when_the_node_gives_no_order(self):
+        self.two_unlocks_in_one_block()
+        err = StringIO()
+        with patch("rbx.client.get_block", side_effect=RuntimeError("down")):
+            call_command("reprocess_vbtc_v2", "--dry-run", stdout=StringIO(), stderr=err)
+        self.assertIn("hash order (the node gave none)", err.getvalue())
+
+    def test_a_block_synced_again_draws_its_locks_once(self):
+        unlock = self.pool_unlock("p1", "b1", [("L1", "0.002")])
+        data = unlock.data
+
+        def sync_again(height):
+            tx = make_tx(Block.objects.get(height=height), "p1", T.VBTC_BRIDGE_POOL_UNLOCK,
+                         from_address="Caster", to_address="Caster")
+            tx.data = data
+            tx.save(update_fields=["data"])
+            process_transaction(tx)
+
+        with patch("rbx.management.commands.validate_transactions.sync_block", side_effect=sync_again), \
+                patch("rbx.client.get_block", return_value=None):
+            fix_blocks([unlock.height])
+        self.assertEqual(self.remaining(), Decimal("0.001"))
+        self.assertEqual(self.addresses()["D"], Decimal("0.002"))
+
+
+@TESTNET
+class BridgeCaseInsensitiveLookupTests(BridgeCase):
+    def setUp(self):
+        super().setUp()
+        self.lock()
+
+    def test_a_lock_id_in_another_case_is_the_same_lock(self):
+        self.pool_unlock("p1", "b1", [("l1", "0.001")])
+        self.assertEqual(self.addresses()["D"], Decimal("0.001"))
+        self.assertEqual(self.remaining(), Decimal("0.002"))
+
+    def test_a_second_lock_whose_id_differs_only_in_case_applies_nothing(self):
+        self.lock(tx_hash="l2", lock_id="l1", amount="0.001")
+        self.assertEqual(self.addresses()["H"], Decimal("0.001"))
+        self.assertEqual(VbtcV2BridgeLock.objects.count(), 1)
+
+    def test_completion_matches_the_burn_in_another_case(self):
+        self.exit("x1", "Ab12", [("L1", "0.001")])
+        self.tx("c1", T.VBTC_BRIDGE_EXIT_TO_BTC_COMPLETE, "Caster", {"BaseBurnTxHash": "aB12", "BtcTxHash": "btc1"})
+        self.assertTrue(VbtcV2BridgeExit.objects.get().is_complete)
+
+
+@TESTNET
+class ShieldPayloadNumbersTests(BridgeCase):
+    def shield(self, payload):
+        tx = make_tx(make_block(height=60), "sh1", T.VBTC_SHIELD, from_address="H", to_address="Shielded_Pool")
+        tx.data = json.dumps(payload)
+        tx.save(update_fields=["data"])
+        process_transaction(tx)
+
+    def test_a_version_with_a_fraction_does_not_bind(self):
+        self.shield({"v": 1.5, "asset": "VBTC:sc:a", "vbtc_uid": "sc:a", "vbtc_amt": 0.001})
+        self.assertEqual(self.addresses()["H"], Decimal("0.004"))
+
+    def test_a_numeric_asset_binds_as_its_text(self):
+        self.shield({"v": 1, "asset": 7, "vbtc_uid": "sc:a", "vbtc_amt": 0.001})
         self.assertEqual(self.addresses()["H"], Decimal("0.003"))

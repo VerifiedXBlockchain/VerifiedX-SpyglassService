@@ -15,7 +15,7 @@ from rbx.vbtc_dispatch import (
     recovery_address_of,
     replaying,
 )
-from rbx.vbtc_bridge import BRIDGE_TYPES, SHIELD_TYPES, bridge_references, reset_bridge_state
+from rbx.vbtc_bridge import BRIDGE_TYPES, SHIELD_TYPES, in_chain_order, reset_bridge_state, shared_bridge_blocks
 from rbx.vbtc_gates import field, net_string, parse_envelope
 
 
@@ -110,10 +110,14 @@ class Command(BaseCommand):
         # Block by block. The order inside a block is not stored, so an
         # ownership transfer or a recovery goes last in its block: the rows
         # it has to see to know that it shares the block are back in the
-        # table by then.
-        txs = sorted(
-            Transaction.objects.filter(selected),
-            key=lambda tx: (tx.height, tx.hash in ownership_transfers or tx.hash in recoveries, tx.hash),
+        # table by then. A block in which bridge transactions share a lock or
+        # a burn is taken in the chain's order, read from the node.
+        txs = list(Transaction.objects.filter(selected))
+        shared = shared_bridge_blocks(txs)
+        txs, unresolved = in_chain_order(
+            txs,
+            shared,
+            lambda tx: (int(tx.hash in ownership_transfers or tx.hash in recoveries), tx.hash),
         )
         count = len(txs)
 
@@ -122,6 +126,8 @@ class Command(BaseCommand):
             f"({len(envelope_hashes)} envelope transaction(s) included, "
             f"{len(recoveries)} recovery transaction(s))."
         )
+
+        self.report_shared_bridge_blocks(shared, unresolved)
 
         if dry_run:
             for tx in txs:
@@ -135,7 +141,6 @@ class Command(BaseCommand):
         errors = 0
 
         if not tx_type:
-            self.warn_unordered_bridge_blocks(txs)
             reset_bridge_state()
 
         with replaying():
@@ -157,20 +162,16 @@ class Command(BaseCommand):
             f"Done. Processed: {processed}, Errors: {errors}, Total: {count}"
         )
 
-    def warn_unordered_bridge_blocks(self, txs):
-        """The order inside a block is not stored and the run goes by hash.
-        Two bridge transactions of one block that draw on the same lock or
-        spend the same burn can come out otherwise than on the node: name
-        them, so their holders are checked against a node."""
-        seen = {}
-        for tx in txs:
-            for ref in bridge_references(tx):
-                seen.setdefault((tx.height, ref), []).append(tx.hash)
-        for (height, ref), hashes in sorted(seen.items()):
-            if len(hashes) > 1:
+    def report_shared_bridge_blocks(self, shared, unresolved):
+        """Names the blocks in which bridge transactions share a lock or a
+        burn. Each is replayed in the chain's order; one the node gave no
+        order for is replayed by hash, and its holders and locks need a
+        check against a node."""
+        for height, refs in shared.items():
+            how = "hash order (the node gave none)" if height in unresolved else "the chain's order"
+            for kind, ref, hashes in refs:
                 self.stderr.write(
-                    f"  WARNING block {height}: {', '.join(hashes)} share {ref[0]} {ref[1]}; "
-                    f"their order in the block is not stored. Check the holders against a node."
+                    f"  WARNING block {height}: {', '.join(hashes)} share {kind} {ref}; replayed in {how}."
                 )
 
     def report_settlements(self, txs):
