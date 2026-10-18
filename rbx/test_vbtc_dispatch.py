@@ -552,6 +552,24 @@ class ReserveTransferTests(TestCase):
         void_reserve_transfer(self.tx)
         self.assertEqual(self.token.available_balances(current_height=1)["xRBXreserve"], Decimal("0.005"))
 
+    def test_recovered_send_is_reserved_no_longer(self):
+        # Recover() applies the in-flight send to the recovery address at once.
+        redirect_reserve_transfer(self.tx, "Recovered", timezone.now() - timedelta(seconds=1))
+        available = self.token.available_balances(current_height=1)
+        self.assertEqual(available["xRBXreserve"], Decimal("0.003"))
+        self.assertEqual(available["Recovered"], Decimal("0.002"))
+
+    def test_pending_multi_input_is_not_reserved(self):
+        # The node's pending total reads the payload's top-level ContractUID,
+        # which a multi-transfer does not carry.
+        multi = make_tx(self.block, "rm1", Transaction.Type.VBTC_V2_TRANSFER, from_address="xRBXreserve")
+        multi.unlock_time = timezone.now() + timedelta(hours=1)
+        multi.save(update_fields=["unlock_time"])
+        row = add_transfer(self.token, multi, "xRBXreserve", "R", "0.001")
+        row.is_multi = True
+        row.save(update_fields=["is_multi"])
+        self.assertEqual(self.token.available_balances(current_height=1)["xRBXreserve"], Decimal("0.003"))
+
     def test_unlocked_reserve_send_moves_the_ledger(self):
         self.tx.unlock_time = timezone.now() - timedelta(minutes=1)
         self.tx.save(update_fields=["unlock_time"])
