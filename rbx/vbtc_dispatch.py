@@ -1444,28 +1444,38 @@ def _replan_settlements_since(token, request_tx):
     next one's, so every one since is planned again, in order: each
     Transfer() and each Recover() that gave the contract to the recovery
     address."""
-    handovers = [
-        (tx, None, None) for tx in token.ownership_transfers(since_height=request_tx.height) if tx.pk != request_tx.pk
-    ]
-    for tx in _recoveries_of(token, since_height=request_tx.height):
+    transfers = [tx for tx in token.ownership_transfers(since_height=request_tx.height) if tx.pk != request_tx.pk]
+    handovers = [(tx, None, None) for tx in transfers]
+    for tx in _recoveries_of(token, request_tx, transfers):
         handovers.append((tx, tx.from_address, recovery_address_of(tx)))
     for tx, old_owner, new_owner in sorted(handovers, key=lambda h: (h[0].height, h[0].hash)):
         what = "Recover()" if old_owner else "V2 ownership transfer"
         _write_settlement(token, tx, planned_settlement(token, tx, old_owner=old_owner, new_owner=new_owner), what)
 
 
-def _recoveries_of(token, since_height):
-    """The Recover()s from since_height on that gave token to their recovery
-    address: those of the reserve that owned it then (apply_recovery)."""
+def _recoveries_of(token, request_tx, transfers):
+    """The Recover()s since request_tx that gave token to their recovery
+    address: those of the reserve that owned it then (apply_recovery). Only
+    a reserve that could have owned it since is read: the owner at the
+    request, a Transfer() recipient since (transfers), or the recovery
+    address of an earlier such recovery."""
+    owners = {token.owner_before(request_tx)} | {tx.to_address for tx in transfers}
+    read = set()
     found = []
-    candidates = Transaction.objects.filter(
-        type=Transaction.Type.RESERVE, height__gte=since_height, from_address__startswith=RESERVE_ADDRESS_PREFIX
-    ).order_by("height", "hash")
-    for tx in candidates:
-        recovery_address = recovery_address_of(tx)
-        if recovery_address and recovery_address != tx.from_address and token.owner_before(tx) == tx.from_address:
-            found.append(tx)
-    return found
+    while True:
+        reserves = {address for address in owners if is_reserve_address(address)} - read
+        if not reserves:
+            break
+        read |= reserves
+        candidates = Transaction.objects.filter(
+            type=Transaction.Type.RESERVE, height__gte=request_tx.height, from_address__in=reserves
+        )
+        for tx in candidates:
+            recovery_address = recovery_address_of(tx)
+            if recovery_address and recovery_address != tx.from_address and token.owner_before(tx) == tx.from_address:
+                found.append(tx)
+                owners.add(recovery_address)
+    return sorted(found, key=lambda tx: (tx.height, tx.hash))
 
 
 def cancellation_uid_for(withdrawal):
