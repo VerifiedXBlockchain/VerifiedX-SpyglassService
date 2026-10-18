@@ -1015,9 +1015,12 @@ def reconcile_watched_withdrawals(token, after_rewind=False):
     # sweep do not settle or re-plan the same vault at once.
     with atomic():
         VbtcV2Token.objects.select_for_update().filter(pk=token.pk).first()
-        if after_rewind:
-            _reopen_unpaid(token, data)
-        return _apply_withdrawal_history(token, data)
+        caught_up = _reopen_unpaid(token, data) if after_rewind else True
+        settled = _apply_withdrawal_history(token, data)
+    # A payment made again whose report is not indexed yet: None, as for a
+    # node that did not answer, so the rewind mark holds and the next pass
+    # reads the paid rows again.
+    return settled if caught_up else None
 
 
 def _usable_history(token, data):
@@ -1034,16 +1037,19 @@ def _usable_history(token, data):
 
 
 def _reopen_unpaid(token, data):
+    """False when a row paid again waits for its report to be indexed."""
     paid = data.get("WithdrawalHistory") if isinstance(data, dict) and data.get("Success") else None
     if not isinstance(paid, list):
-        return
+        return True
     listed = {entry.get("RequestHash"): entry for entry in paid if isinstance(entry, dict)}
     reopened = []
+    caught_up = True
     for withdrawal in token.withdrawal_requests.filter(status=VbtcV2WithdrawalRequest.Status.COMPLETED).select_related(
         "request_transaction"
     ):
         if withdrawal.request_transaction_id in listed:
-            _repaid(token, withdrawal, listed[withdrawal.request_transaction_id])
+            if not _repaid(token, withdrawal, listed[withdrawal.request_transaction_id]):
+                caught_up = False
             continue
         logging.warning(
             f"Watched vault {token.sc_identifier}: withdrawal {withdrawal.request_transaction_id} is no longer paid "
@@ -1058,6 +1064,7 @@ def _reopen_unpaid(token, data):
     if reopened:
         token.recompute_pending_withdrawal()
         _replan_settlements_since(token, min((w.request_transaction for w in reopened), key=lambda t: t.height))
+    return caught_up
 
 
 def _repaid(token, withdrawal, entry):
@@ -1065,17 +1072,17 @@ def _repaid(token, withdrawal, entry):
     again since, by another of its pinned transactions (Unsettle keeps the
     pins, BtcWithdrawals.Rewind.cs:116-121) with a later report: the txid
     and the completing report are the node's. The amount and the status do
-    not change."""
+    not change. False when the report is not indexed yet."""
     txid = entry.get("BTCTransactionHash")
     completion = entry.get("CompletionHash")
     if not txid or not completion:
-        return
+        return True
     if withdrawal.btc_transaction_hash == txid and withdrawal.completion_transaction_id == completion:
-        return
+        return True
     report = Transaction.objects.filter(hash=completion).first()
     if report is None:
         _log_once(token, entry, f"was paid again; waits for report {completion} to be indexed")
-        return
+        return False
     logging.warning(
         f"Watched vault {token.sc_identifier}: withdrawal {withdrawal.request_transaction_id} was paid again after a "
         f"Bitcoin rewind, by {txid} (report {completion})."
@@ -1084,6 +1091,7 @@ def _repaid(token, withdrawal, entry):
     withdrawal.completion_transaction = report
     withdrawal.completed_at = report.date_crafted
     withdrawal.save(update_fields=["btc_transaction_hash", "completion_transaction", "completed_at"])
+    return True
 
 
 def _apply_withdrawal_history(token, data):

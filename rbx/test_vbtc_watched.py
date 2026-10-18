@@ -763,6 +763,35 @@ class RewindTests(WatchedVaultCase):
         self.assertEqual(row.btc_transaction_hash, "T")
         self.assertEqual(row.completion_transaction_id, "rep1")
 
+    def test_a_payment_made_again_with_a_report_of_a_later_block_is_taken_once_it_is_indexed(self):
+        # The node is ahead: the rewind at 70 lists a payment whose report
+        # block 71 brings. The rewind mark holds until it is read.
+        repaid = history(paid=[{"RequestHash": "r1", "CompletionHash": "t71-0", "BTCTransactionHash": "T2"}])
+        self.sync(70, [T.VBTC_V2_BTC_REORG], repaid)
+        self.assertEqual(self.row().btc_transaction_hash, "T")
+        self.sync(71, [T.VBTC_V2_BTC_REPORT], repaid)
+        row = self.row()
+        self.assertEqual(row.btc_transaction_hash, "T2")
+        self.assertEqual(row.completion_transaction_id, "t71-0")
+        # Caught up: a later pass is no longer after the rewind.
+        with patch.object(VbtcV2WithdrawalRequest, "save", autospec=True) as save:
+            self.sync(72, [T.VBTC_V2_BTC_REPORT], history())
+        save.assert_not_called()
+        self.assertEqual(self.row().status, Status.COMPLETED)
+
+    def test_a_payment_listed_as_stored_after_a_rewind_is_not_saved_again(self):
+        with patch.object(VbtcV2WithdrawalRequest, "save", autospec=True) as save, \
+                self.assertNoLogs("root", level="WARNING"):
+            self.sync(70, [T.VBTC_V2_BTC_REORG], history(paid=[self.PAID]))
+        save.assert_not_called()
+
+    def test_a_pass_after_no_rewind_leaves_a_differing_paid_row_alone(self):
+        self.sync(70, [T.VBTC_V2_BTC_REPORT], history(paid=[{"RequestHash": "r1", "CompletionHash": "t70-0",
+                                                              "BTCTransactionHash": "T2"}]))
+        row = self.row()
+        self.assertEqual(row.btc_transaction_hash, "T")
+        self.assertEqual(row.completion_transaction_id, "rep1")
+
     def test_the_owner_add_back_is_removed_while_the_payment_is_unconfirmed(self):
         self.token.global_balance = Decimal("0.01")
         self.token.save(update_fields=["global_balance"])
