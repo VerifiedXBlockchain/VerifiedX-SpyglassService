@@ -1,4 +1,5 @@
 from django.core.management.base import BaseCommand
+from django.db import InterfaceError, InternalError, OperationalError
 from django.db.models import Q
 from django.db.transaction import atomic
 
@@ -176,6 +177,10 @@ class Command(BaseCommand):
                         else:
                             process_transaction(tx)
                     processed += 1
+                except (OperationalError, InterfaceError, InternalError):
+                    # A deadlock or a lost connection: the whole run rolls
+                    # back rather than committing without this transaction.
+                    raise
                 except Exception as e:
                     errors += 1
                     self.stderr.write(f"  ERROR processing {tx.hash}: {e}")

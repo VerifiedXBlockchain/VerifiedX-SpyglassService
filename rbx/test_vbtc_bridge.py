@@ -478,3 +478,10 @@ class BridgeRebuildRaceTests(BridgeCase):
                 })
             call_command("reprocess_vbtc_v2", stdout=StringIO(), stderr=StringIO())
         self.assertEqual(self.addresses()["Late"], Decimal("0.001"))
+
+    def test_backfill_rolls_back_on_a_database_error(self):
+        from django.db import OperationalError
+
+        with patch("rbx.management.commands.reprocess_vbtc_v2.process_transaction", side_effect=OperationalError("deadlock")):
+            with self.assertRaises(OperationalError):
+                call_command("reprocess_vbtc_v2", stdout=StringIO(), stderr=StringIO())
