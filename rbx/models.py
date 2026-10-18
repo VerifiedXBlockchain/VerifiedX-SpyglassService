@@ -8,6 +8,7 @@ from decimal import Decimal
 from django.conf import settings
 from shop.models import Listing
 from django.db.models import Q
+from django.db.models.functions import Cast
 from django.utils import timezone
 import json
 import uuid
@@ -1298,7 +1299,14 @@ class VbtcV2Token(models.Model):
                 tx = t.transaction
                 if tx.voided_from_callback:
                     continue
-                if tx.unlock_time is not None and tx.unlock_time > as_of:
+                # The node applies a reserve send at the end of the first
+                # block stamped after its unlock time. A send a recovery
+                # redirected counts from that recovery on.
+                if (
+                    tx.unlock_time is not None
+                    and tx.unlock_time >= as_of
+                    and not self._redirected_by(tx, before)
+                ):
                     continue
             entries[t.to_address] = entries.get(t.to_address, Decimal(0)) + t.amount
             entries[t.from_address] = entries.get(t.from_address, Decimal(0)) - t.amount
@@ -1315,6 +1323,17 @@ class VbtcV2Token(models.Model):
                 )
 
         return entries
+
+    @staticmethod
+    def _redirected_by(tx, before):
+        """redirect_reserve_transfer brings a send's unlock time to its
+        recovery's time."""
+        return (
+            before is not None
+            and before.type == Transaction.Type.RESERVE
+            and before.from_address == tx.from_address
+            and tx.unlock_time == before.date_crafted
+        )
 
     @staticmethod
     def _applied_before(tx, before):
@@ -1351,7 +1370,7 @@ class VbtcV2Token(models.Model):
         unlocked = Q(
             from_address__startswith="xRBX",
             transaction__voided_from_callback=False,
-            transaction__unlock_time__lte=tx.date_crafted,
+            transaction__unlock_time__lt=tx.date_crafted,
         )
         previous = (
             Block.objects.filter(height=tx.height - 1)
@@ -1413,9 +1432,12 @@ class VbtcV2Token(models.Model):
         from rbx.vbtc_dispatch import OWNERSHIP_TRANSFER_FUNCTION, OWNERSHIP_TRANSFER_TYPES
 
         found = []
-        candidates = Transaction.objects.filter(
-            type__in=list(OWNERSHIP_TRANSFER_TYPES), height__gte=since_height
-        ).order_by("height", "hash")
+        candidates = (
+            Transaction.objects.filter(type__in=list(OWNERSHIP_TRANSFER_TYPES), height__gte=since_height)
+            .annotate(data_text=Cast("data", models.TextField()))
+            .filter(data_text__contains=self.sc_identifier)
+            .order_by("height", "hash")
+        )
         for tx in candidates:
             payload, _ = parse_envelope(tx.data)
             if (
@@ -1424,6 +1446,46 @@ class VbtcV2Token(models.Model):
             ):
                 found.append(tx)
         return found
+
+    def owner_before(self, tx):
+        """The contract's owner when tx was applied, from the chain: the
+        minter, then each Transfer() from the owner of the day (a reserve
+        owner's once it took effect: unlocked by a block before tx and not
+        undone) and each Recover() of the owner of the day. Inside a block
+        the order is the backfill's, by hash."""
+        from rbx.vbtc_dispatch import is_reserve_address, recovery_address_of, reserve_transfer_undone
+
+        def before_tx(event):
+            return event.pk != tx.pk and (event.height, event.hash) < (tx.height, tx.hash)
+
+        recoveries = (
+            Transaction.objects.filter(type=Transaction.Type.RESERVE, height__lte=tx.height)
+            .annotate(data_text=Cast("data", models.TextField()))
+            .filter(data_text__contains="Recover()")
+        )
+        events = sorted(
+            [e for e in self.ownership_transfers() if before_tx(e)]
+            + [e for e in recoveries if before_tx(e) and recovery_address_of(e)],
+            key=lambda e: (e.height, e.hash),
+        )
+        owner = self.nft.minter_address
+        for event in events:
+            if event.from_address != owner:
+                continue
+            if event.type == Transaction.Type.RESERVE:
+                owner = recovery_address_of(event)
+                continue
+            if not event.to_address:
+                continue
+            if is_reserve_address(event.from_address):
+                if event.voided_from_callback or reserve_transfer_undone(event):
+                    continue
+                if event.unlock_time is not None and not Block.objects.filter(
+                    height__lt=tx.height, height__gte=event.height, date_crafted__gt=event.unlock_time
+                ).exists():
+                    continue
+            owner = event.to_address
+        return owner
 
     def _became_owner_between(self, address, since_tx, before):
         return any(
@@ -1522,7 +1584,7 @@ class VbtcV2Token(models.Model):
             is_multi=False,
             transaction__type=Transaction.Type.VBTC_V2_TRANSFER,
             transaction__voided_from_callback=False,
-            transaction__unlock_time__gt=timezone.now(),
+            transaction__unlock_time__gte=timezone.now(),
         )
         for t in pending_reserve_sends:
             if t.from_address in balances:

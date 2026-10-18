@@ -97,9 +97,10 @@ class Command(BaseCommand):
 
         # Recover() moves the vaults a reserve owns and sweeps its vBTC; only
         # that part is replayed (the rest of the RESERVE handler is not
-        # idempotent).
+        # idempotent). It moves owners, so it is replayed only with the
+        # ownership transfers that come after it.
         recoveries = set()
-        if not tx_type:
+        if not tx_type and not skip_envelopes:
             for tx in Transaction.objects.filter(type=Transaction.Type.RESERVE).only("hash", "data"):
                 if recovery_address_of(tx):
                     recoveries.add(tx.hash)

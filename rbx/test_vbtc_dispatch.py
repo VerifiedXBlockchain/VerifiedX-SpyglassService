@@ -3,6 +3,7 @@ state apply (VerifiedX-Core StateData.cs at 63468588). Each class names the
 review finding it pins (reviews/vbtc-non-core-followups-2026-09-24.md).
 """
 from datetime import timedelta
+from io import StringIO
 from decimal import Decimal
 
 from django.core.management import call_command
@@ -21,6 +22,7 @@ from rbx.vbtc_dispatch import (
     redirect_reserve_transfer,
     apply_recovery,
     replaying,
+    reserve_transfer_undone,
     settle_pending_owners,
     void_reserve_transfer,
 )
@@ -556,6 +558,14 @@ class ReserveTransferTests(TestCase):
     def test_called_back_reserve_send_is_available_again(self):
         void_reserve_transfer(self.tx)
         self.assertEqual(self.token.available_balances(current_height=1)["xRBXreserve"], Decimal("0.005"))
+
+    def test_send_is_applied_only_after_its_unlock_time(self):
+        at_unlock = make_tx(self.block, "x1", Transaction.Type.TX)
+        at_unlock.date_crafted = self.tx.unlock_time
+        after = make_tx(self.block, "x2", Transaction.Type.TX)
+        after.date_crafted = self.tx.unlock_time + timedelta(seconds=1)
+        self.assertNotIn("R", self.token.ledger_entries(before=at_unlock))
+        self.assertEqual(self.token.ledger_entries(before=after)["R"], Decimal("0.002"))
 
     def test_recovered_send_is_reserved_no_longer(self):
         # Recover() applies the in-flight send to the recovery address at once.
@@ -1101,8 +1111,8 @@ class RecoveryOfVbtcTests(TestCase):
     def test_replay_plans_the_same_rows(self):
         self.recover()
         rows = sorted(VbtcV2TokenTransfer.objects.filter(transaction=self.recovery).values_list("token__sc_identifier", "from_address", "to_address", "amount"))
-        # A backfill rebuilds the owners in order: at the recovery the reserve owns its vault again.
-        type(self.owned).objects.filter(pk=self.owned.pk).update(owner_address=self.RESERVE)
+        # The stored owner is already the recovery address; the replay reads
+        # the owner at the recovery from the chain.
         with replaying():
             apply_recovery(self.recovery, "Y")
         again = sorted(VbtcV2TokenTransfer.objects.filter(transaction=self.recovery).values_list("token__sc_identifier", "from_address", "to_address", "amount"))
@@ -1117,3 +1127,76 @@ class RecoveryOfVbtcTests(TestCase):
         self.held.refresh_from_db()
         self.assertEqual(self.held.addresses, {"O": Decimal("0.006"), "Y": Decimal("0.004")})
         self.assertIn("1 recovery transaction(s)", out.getvalue())
+
+    def old_indexing_state(self):
+        """What indexing before the recovery handling left: the vault's
+        token owner still the reserve, every NFT of the reserve on the
+        recovery address, no recovery rows."""
+        process_transaction(self.recovery)
+        VbtcV2TokenTransfer.objects.filter(transaction=self.recovery).delete()
+        type(self.owned).objects.filter(pk=self.owned.pk).update(owner_address=self.RESERVE)
+
+    def test_backfill_from_what_earlier_indexing_left(self):
+        self.old_indexing_state()
+        call_command("reprocess_vbtc_v2", stdout=StringIO())
+        self.owned.refresh_from_db()
+        self.held.refresh_from_db()
+        self.assertEqual(self.owned.owner_address, "Y")
+        self.assertEqual(self.owned.addresses, {"Y": Decimal("0.007"), "H": Decimal("0.003")})
+        self.assertEqual(self.held.addresses, {"O": Decimal("0.006"), "Y": Decimal("0.004")})
+
+    def test_backfill_without_envelopes_leaves_a_recovery_as_indexed(self):
+        self.recover()
+        before = (self.owned.owner_address, self.owned.addresses, self.held.addresses)
+        call_command("reprocess_vbtc_v2", "--skip-envelopes", stdout=StringIO())
+        self.owned.refresh_from_db()
+        self.held.refresh_from_db()
+        self.assertEqual((self.owned.owner_address, self.owned.addresses, self.held.addresses), before)
+
+    def test_backfill_gives_a_recovered_pending_transfer_to_the_recovery_address(self):
+        # Earlier indexing moved the owner to the recipient when the transfer
+        # was mined and marked nothing at the recovery.
+        transfer = make_tx(
+            self.block, "ot1", Transaction.Type.NFT_TX, from_address=self.RESERVE, to_address="P",
+            data=[{"Function": "Transfer()", "ContractUID": "sc:owned"}],
+        )
+        transfer.unlock_time = timezone.now() + timedelta(hours=1)
+        transfer.save(update_fields=["unlock_time"])
+        type(self.owned).objects.filter(pk=self.owned.pk).update(owner_address="P")
+        call_command("reprocess_vbtc_v2", stdout=StringIO())
+        self.owned.refresh_from_db()
+        transfer.refresh_from_db()
+        self.assertTrue(transfer.voided_from_callback)
+        self.assertEqual(self.owned.owner_address, "Y")
+        self.assertEqual(self.owned.current_owner(), "Y")
+
+
+@TESTNET
+class ReserveCallbackWindowTests(TestCase):
+    """A CallBack() counts when it is mined by the end of the first block
+    stamped after the unlock time, where the node applies the transfer."""
+
+    def setUp(self):
+        self.transfer_block = make_block(height=1)
+        self.tx = make_tx(
+            self.transfer_block, "ot1", Transaction.Type.NFT_TX, from_address="xRBXowner", to_address="P",
+            data=[{"Function": "Transfer()", "ContractUID": "sc:a"}],
+        )
+        self.at_unlock = make_block(height=2)
+        self.tx.unlock_time = self.at_unlock.date_crafted
+        self.tx.save(update_fields=["unlock_time"])
+        self.after_unlock = make_block(height=3)
+        self.later = make_block(height=4)
+
+    def call_back_in(self, block):
+        make_tx(block, "cb1", Transaction.Type.RESERVE, from_address="xRBXowner",
+                data={"Function": "CallBack()", "Hash": "ot1"})
+
+    def test_callback_in_the_block_after_one_stamped_at_the_unlock_counts(self):
+        self.assertGreater(self.after_unlock.date_crafted, self.tx.unlock_time)
+        self.call_back_in(self.after_unlock)
+        self.assertTrue(reserve_transfer_undone(self.tx))
+
+    def test_callback_after_the_transfer_applied_does_not_count(self):
+        self.call_back_in(self.later)
+        self.assertFalse(reserve_transfer_undone(self.tx))

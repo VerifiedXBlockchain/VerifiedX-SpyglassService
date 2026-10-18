@@ -916,17 +916,18 @@ class OwnershipTransferReplayTests(TestCase):
         Block.objects.filter(height=9).update(date_crafted=self.block_time(9))
         return send
 
-    def test_replay_keeps_the_settlement_when_a_reserve_send_unlocked_in_its_block(self):
+    def test_replay_settles_a_reserve_send_unlocking_at_the_handovers_block_time(self):
+        # A block stamped at the unlock time does not apply the send; the
+        # next one does, after the handover. The order is known.
         token = make_token(owner="O", global_balance="0.001")
         self.reserve_send(token, self.block_time(10))
         handover = self.handover(token, 10, "h1", "O", "P")
         process_transaction(handover)
         indexed = self.settlements(token)
 
-        with self.assertLogs(level="WARNING") as logs:
-            self.replay(handover)
+        self.assertFalse(token.has_unordered_activity(handover))
+        self.replay(handover)
 
-        self.assertKept(logs)
         self.assertEqual(self.settlements(token), indexed)
 
     def test_replay_keeps_the_settlement_when_a_reserve_send_unlocked_since_the_last_block(self):

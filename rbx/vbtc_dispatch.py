@@ -336,7 +336,7 @@ def apply_ownership_transfer(token, tx):
         # The node marks the recipient as next owner and moves the owner only
         # when the transfer unlocks without a callback (settle_pending_owners).
         # A replay already knows whether it was called back.
-        if _replaying.get() and not tx.voided_from_callback and _called_back_on_chain(tx):
+        if _replaying.get() and not tx.voided_from_callback and reserve_transfer_undone(tx):
             tx.voided_from_callback = True
             tx.save(update_fields=["voided_from_callback"])
         if tx.voided_from_callback:
@@ -380,11 +380,12 @@ def _write_settlement(token, tx, plan, what):
         )
 
 
-def _called_back_on_chain(tx):
-    """Whether the chain holds a CallBack() of tx that the node applied: one
-    mined by the end of the first block stamped after the unlock, when the
-    node applies the transfer instead. Earlier indexing did not mark a
-    called-back ownership transfer, so a backfill reads the chain."""
+def reserve_transfer_undone(tx):
+    """Whether the chain holds a CallBack() of tx, or a Recover() of its
+    sender, that the node applied before the transfer took effect: one mined
+    by the end of the first block stamped after the unlock, when the node
+    applies the transfer instead. Earlier indexing marked neither on an
+    ownership transfer, so a backfill reads the chain."""
     callbacks = Transaction.objects.filter(
         type=Transaction.Type.RESERVE, from_address=tx.from_address, height__gte=tx.height
     )
@@ -399,10 +400,10 @@ def _called_back_on_chain(tx):
             callbacks = callbacks.filter(height__lte=applied)
     for callback in callbacks:
         payload = decode_data(callback.data)
-        if (
-            net_string(field(payload, "Function")) == "CallBack()"
-            and net_string(field(payload, "Hash")) == tx.hash
-        ):
+        function = net_string(field(payload, "Function"))
+        if function == "CallBack()" and net_string(field(payload, "Hash")) == tx.hash:
+            return True
+        if function == "Recover()" and callback.pk != tx.pk:
             return True
     return False
 
@@ -505,7 +506,14 @@ def apply_recovery(tx, recovery_address):
             pending_tx.save(update_fields=["voided_from_callback"])
         _clear_pending_owner(token)
 
-    owned = list(VbtcV2Token.objects.filter(owner_address=reserve))
+    # Which vaults the reserve owned at tx comes from the chain, not the
+    # stored owner: a backfill does not reset the stored owner at a mint.
+    candidates = VbtcV2Token.objects.filter(
+        Q(owner_address__in=[reserve, recovery_address])
+        | Q(nft__minter_address=reserve)
+        | Q(vbtcv2tokentransfer__transaction=tx)
+    ).distinct()
+    owned = [token for token in candidates if token.owner_before(tx) == reserve]
     for token in owned:
         plan = planned_settlement(token, tx, old_owner=reserve, new_owner=recovery_address)
         _write_settlement(token, tx, plan, "Recover()")
