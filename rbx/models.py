@@ -9,7 +9,6 @@ from django.conf import settings
 from shop.models import Listing
 from django.db.models import Q
 from django.db.models.functions import Cast, Upper
-from django.utils import timezone
 import json
 import uuid
 from phonenumber_field.modelfields import PhoneNumberField
@@ -146,6 +145,23 @@ class Block(models.Model):
         verbose_name = _("Block")
         verbose_name_plural = _("Blocks")
         ordering = ["-height"]
+
+
+def chain_time():
+    """The time of the latest indexed block, or None when none is indexed:
+    the cut-off for a reserve (xRBX) transaction, which the node applies at
+    the end of the first block stamped after its unlock time
+    (ReserveTransactions.DueRows). Not the wall clock: until such a block
+    the node still holds it as pending, and Spyglass has not seen that
+    block until it is indexed."""
+    return Block.objects.order_by("-height").values_list("date_crafted", flat=True).first()
+
+
+def _still_locked(now):
+    """A transaction whose unlock is not past `now` (chain_time())."""
+    if now is None:
+        return Q(unlock_time__isnull=False)
+    return Q(unlock_time__isnull=False) & Q(unlock_time__gt=now)
 
 
 class Transaction(models.Model):
@@ -527,15 +543,14 @@ class Address(models.Model):
 
     def get_balance(self):
         address = self.address
+        now = chain_time()
 
         inbound_locked = (
             Transaction.objects.filter(
                 Q(
                     Q(to_address=address)
                     & Q(voided_from_callback=False)
-                    & Q(
-                        Q(unlock_time__isnull=False) & Q(unlock_time__gt=timezone.now())
-                    )
+                    & _still_locked(now)
                 )
             )
             .filter(type__in=Transaction.RECIPIENT_CREDIT_TYPES)
@@ -548,9 +563,7 @@ class Address(models.Model):
                 Q(
                     Q(from_address=address)
                     & Q(voided_from_callback=False)
-                    & Q(
-                        Q(unlock_time__isnull=False) & Q(unlock_time__gt=timezone.now())
-                    )
+                    & _still_locked(now)
                 )
             )
             .exclude(type=Transaction.Type.NFT_SALE)
@@ -1240,7 +1253,7 @@ class VbtcV2Token(models.Model):
         if tx.unlock_time is None:
             return True
         if as_of is None:
-            as_of = Block.objects.order_by("-height").values_list("date_crafted", flat=True).first()
+            as_of = chain_time()
             if as_of is None:
                 return False
         return tx.unlock_time < as_of
@@ -1324,7 +1337,7 @@ class VbtcV2Token(models.Model):
         Settlement rows created at ownership transfer are ordinary
         VbtcV2TokenTransfer rows, so they flow through here unchanged.
         """
-        as_of = timezone.now() if before is None else before.date_crafted
+        as_of = chain_time() if before is None else before.date_crafted
         transfers = (
             VbtcV2TokenTransfer.objects.filter(token=self)
             .select_related("transaction")
@@ -1345,11 +1358,13 @@ class VbtcV2Token(models.Model):
                     continue
                 # The node applies a reserve send at the end of the first
                 # block stamped after its unlock time. A send a recovery
-                # redirected counts from that recovery on.
+                # redirected counts from that recovery on: in the view of
+                # the latest block, once the recovery is indexed.
                 if (
                     tx.unlock_time is not None
-                    and tx.unlock_time >= as_of
+                    and (as_of is None or tx.unlock_time >= as_of)
                     and not self._redirected_by(tx, before)
+                    and not (before is None and tx.recovery_outstanding_transactions.exists())
                 ):
                     continue
             entries[t.to_address] = entries.get(t.to_address, Decimal(0)) + t.amount
@@ -1638,8 +1653,13 @@ class VbtcV2Token(models.Model):
             is_multi=False,
             transaction__type=Transaction.Type.VBTC_V2_TRANSFER,
             transaction__voided_from_callback=False,
-            transaction__unlock_time__gte=timezone.now(),
+            transaction__unlock_time__isnull=False,
+            # A recovery applied it to the recovery address at once.
+            transaction__recovery_outstanding_transactions__isnull=True,
         )
+        now = chain_time()
+        if now is not None:
+            pending_reserve_sends = pending_reserve_sends.filter(transaction__unlock_time__gte=now)
         for t in pending_reserve_sends:
             if t.from_address in balances:
                 balances[t.from_address] = max(

@@ -249,10 +249,11 @@ class WatchedExitTests(WatchedVaultCase):
         from rbx.models import VbtcV2BridgeLock
         return VbtcV2BridgeLock.objects.get(lock_id="L1").remaining_amount
 
-    def sweep(self, exit_view, paid_sats=0):
+    def sweep(self, exit_view, paid_sats=0, held_sats=1000000):
         from rbx.vbtc_dispatch import reconcile_all_watched_vaults
 
-        status = {"Success": True, "Bitcoin": {"PaidOutForBridgeExitsSats": paid_sats}}
+        status = {"Success": True, "Attested": True, "Bitcoin": {
+            "HeldSats": held_sats, "PaidOutForBridgeExitsSats": paid_sats, "DepositAddress": "bc1w"}}
         if isinstance(exit_view.get("Exit"), dict):
             exit_view["Exit"].setdefault("ExitTxHash", "x1")
         with patch(EXIT, return_value=exit_view), patch(STATUS, return_value=status), \
@@ -264,17 +265,27 @@ class WatchedExitTests(WatchedVaultCase):
         self.assertFalse(self.exit().is_complete)
 
     def test_a_completed_exit_spends_its_burn_and_adds_its_payout_back_to_the_owner(self):
+        # The Bitcoin left the vault: HeldSats fell by what was paid out.
         self.sweep({"Success": True, "Exit": {"IsComplete": True, "Failed": False, "BitcoinTransactions": "btcA", "Parts": []}},
-                   paid_sats=200000)
+                   paid_sats=200000, held_sats=800000)
         self.assertTrue(self.exit().is_complete)
         self.tx("p1", T.VBTC_BRIDGE_POOL_UNLOCK, {
             "TotalAmount": 0.001, "TotalAmountSats": 100000, "VfxDestinationAddress": "D", "ExitBurnTxHash": "b1",
             "Allocations": [{"LockId": "L1", "UnlockAmount": 0.001}]})
         self.assertNotIn("D", self.addresses())
-        # The Bitcoin left the vault: the owner keeps its figure.
-        self.token.global_balance = Decimal("0.008")
-        self.token.save(update_fields=["global_balance"])
+        # The owner keeps its figure.
         self.assertEqual(self.addresses()["O"], Decimal("0.006"))
+
+    def test_a_payout_between_two_reads_of_the_sweep_keeps_the_owner_consistent(self):
+        # The sweep's payout read sees the payout: the backing it writes is
+        # the same answer's, never the earlier one with the new total.
+        before = self.addresses()["O"]
+        self.sweep({"Success": True, "Exit": {"IsComplete": True, "Failed": False, "BitcoinTransactions": "btcA", "Parts": []}},
+                   paid_sats=200000, held_sats=800000)
+        self.token.refresh_from_db()
+        self.assertEqual(self.token.global_balance, Decimal("0.008"))
+        self.assertEqual(self.token.settled_exit_btc, Decimal("0.002"))
+        self.assertEqual(self.addresses()["O"], before)
 
     def test_an_exit_expired_by_rule_gives_its_locks_back(self):
         view = {"Success": True, "Exit": {"IsComplete": True, "Failed": True, "FailureRecord": "FAILED:expired@500", "Parts": []}}
@@ -562,6 +573,7 @@ class LegacyExitTests(WatchedExitTests):
     # The watched-only behaviours do not apply to a legacy exit.
     test_a_completion_transaction_changes_nothing_on_a_watched_exit = None
     test_a_completed_exit_spends_its_burn_and_adds_its_payout_back_to_the_owner = None
+    test_a_payout_between_two_reads_of_the_sweep_keeps_the_owner_consistent = None
     test_an_exit_expired_by_rule_gives_its_locks_back = None
     test_a_voided_part_takes_its_locks_out_of_use_once = None
     test_a_node_that_does_not_answer_changes_nothing = None

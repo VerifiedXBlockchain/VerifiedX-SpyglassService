@@ -839,23 +839,13 @@ def expire_exits(height, expiries):
 
 
 def refresh_watched_exit_payouts(token):
-    """PaidOutForBridgeExitsSats from the node's GetWithdrawalStatus."""
-    from rbx.client import get_vbtc_v2_withdrawal_status
+    """PaidOutForBridgeExitsSats, written with the backing it goes with:
+    Core moves HeldSats and SettledExitSats in one apply, and the owner
+    anchor adds one to the other, so both come from one GetWithdrawalStatus
+    answer (refresh_watched_backing) or neither is written."""
+    from rbx.vbtc_dispatch import refresh_watched_backing
 
-    data = get_vbtc_v2_withdrawal_status(token.sc_identifier)
-    if not isinstance(data, dict) or not data.get("Success"):
-        # The client has logged the refusal or the failure.
-        return False
-    bitcoin = data.get("Bitcoin")
-    sats = bitcoin.get("PaidOutForBridgeExitsSats") if isinstance(bitcoin, dict) else None
-    if not isinstance(sats, int) or isinstance(sats, bool):
-        logging.error(f"Watched vault {token.sc_identifier}: no bridge payout figure from the node; left as it is.")
-        return False
-    paid = Decimal(sats) / SATS_PER_BTC
-    if token.settled_exit_btc != paid:
-        type(token).objects.filter(pk=token.pk).update(settled_exit_btc=paid)
-        token.settled_exit_btc = paid
-    return True
+    return refresh_watched_backing(token) is True
 
 
 def reconcile_watched_exits(after_rewind=False):

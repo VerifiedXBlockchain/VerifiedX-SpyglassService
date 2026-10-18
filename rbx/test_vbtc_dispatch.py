@@ -918,6 +918,8 @@ class ReserveOwnershipTransferTests(TestCase):
         self.tx.save(update_fields=["unlock_time"])
         self.assertLess(unlock, timezone.now())
         self.assertEqual(self.token.current_owner(), self.OWNER)
+        # The ledger takes the same cut-off: the settlement row waits too.
+        self.assertEqual(self.token.addresses, {self.OWNER: Decimal("0.008"), "H": Decimal("0.002")})
         data = VbtcV2TokenSerializer(self.token).data
         self.assertEqual(data["owner_address"], self.OWNER)
         self.assertEqual(data["pending_owner_address"], "P")
@@ -925,6 +927,7 @@ class ReserveOwnershipTransferTests(TestCase):
         later = make_block(height=2)
         Block.objects.filter(pk=later.pk).update(date_crafted=unlock + timedelta(seconds=1))
         self.assertEqual(self.token.current_owner(), "P")
+        self.assertEqual(self.token.addresses, {"P": Decimal("0.008"), "H": Decimal("0.002")})
         self.assertIsNone(VbtcV2TokenSerializer(self.token).data["pending_owner_address"])
 
     def test_block_stamped_at_the_unlock_does_not_pass_it(self):
