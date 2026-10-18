@@ -6,7 +6,7 @@ from datetime import datetime
 from django.utils import timezone
 from django.core.cache import cache
 from django.db import close_old_connections
-from django.db.models import Case, F, Value, When
+from django.db.models import Case, F, Q, Value, When
 from rest_framework.response import Response
 from rest_framework.generics import GenericAPIView, RetrieveAPIView
 from api.btc.constants import FALLBACK_VBTC_IMAGE_DATA
@@ -211,8 +211,12 @@ class VbtcV2ListView(GenericAPIView):
         for transfer in transfers:
             sc_identifiers.add(transfer.token.sc_identifier)
 
-        for token in VbtcV2Token.objects.filter(owner_address=vfx_address):
-            sc_identifiers.add(token.sc_identifier)
+        owned = VbtcV2Token.objects.filter(
+            Q(owner_address=vfx_address) | Q(pending_owner_address=vfx_address)
+        )
+        for token in owned:
+            if token.current_owner() == vfx_address:
+                sc_identifiers.add(token.sc_identifier)
 
         tokens = VbtcV2Token.objects.filter(
             sc_identifier__in=sc_identifiers

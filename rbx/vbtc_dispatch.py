@@ -32,6 +32,7 @@ from contextvars import ContextVar
 from decimal import Decimal
 
 from rbx.models import (
+    Block,
     Recovery,
     Transaction,
     VbtcV2Token,
@@ -41,6 +42,7 @@ from rbx.models import (
 from rbx import vbtc_cancellation
 from rbx.vbtc_gates import (
     bound_field,
+    decode_data,
     field,
     net_bool,
     net_decimal,
@@ -348,8 +350,64 @@ def apply_ownership_transfer(token, tx):
                 "created_at": tx.date_crafted,
             },
         )
+    if is_reserve_address(tx.from_address):
+        # The node marks the recipient as next owner and moves the owner only
+        # when the transfer unlocks without a callback (settle_pending_owners).
+        # A replay already knows whether it was called back.
+        if _replaying.get() and not tx.voided_from_callback and _called_back_on_chain(tx):
+            tx.voided_from_callback = True
+            tx.save(update_fields=["voided_from_callback"])
+        if tx.voided_from_callback:
+            if token.pending_owner_transaction_id == tx.pk:
+                _clear_pending_owner(token)
+            return
+        token.pending_owner_address = new_owner
+        token.pending_owner_transaction = tx
+        token.save(update_fields=["pending_owner_address", "pending_owner_transaction"])
+        if _replaying.get() and token.pending_owner_settled():
+            _move_owner(token, new_owner, tx)
+        return
+    _move_owner(token, new_owner, tx)
+
+
+def _called_back_on_chain(tx):
+    """Whether the chain holds a CallBack() of tx that the node applied: one
+    mined by the end of the first block stamped at or after the unlock, when
+    the node applies the transfer instead. Earlier indexing did not mark a
+    called-back ownership transfer, so a backfill reads the chain."""
+    callbacks = Transaction.objects.filter(
+        type=Transaction.Type.RESERVE, from_address=tx.from_address, height__gte=tx.height
+    )
+    if tx.unlock_time is not None:
+        applied = (
+            Block.objects.filter(height__gte=tx.height, date_crafted__gte=tx.unlock_time)
+            .order_by("height")
+            .values_list("height", flat=True)
+            .first()
+        )
+        if applied is not None:
+            callbacks = callbacks.filter(height__lte=applied)
+    for callback in callbacks:
+        payload = decode_data(callback.data)
+        if (
+            net_string(field(payload, "Function")) == "CallBack()"
+            and net_string(field(payload, "Hash")) == tx.hash
+        ):
+            return True
+    return False
+
+
+def _clear_pending_owner(token):
+    token.pending_owner_address = None
+    token.pending_owner_transaction = None
+    token.save(update_fields=["pending_owner_address", "pending_owner_transaction"])
+
+
+def _move_owner(token, new_owner, tx):
     token.owner_address = new_owner
-    token.save(update_fields=["owner_address"])
+    token.pending_owner_address = None
+    token.pending_owner_transaction = None
+    token.save(update_fields=["owner_address", "pending_owner_address", "pending_owner_transaction"])
     try:
         nft = token.nft
         nft.owner_address = new_owner
@@ -358,6 +416,41 @@ def apply_ownership_transfer(token, tx):
         logging.exception(
             f"Failed to update NFT owner for V2 ownership transfer {tx.hash} ({token.sc_identifier})"
         )
+
+
+def settle_pending_owners(block):
+    """End of a block: a reserve owner's Transfer() that has unlocked by the
+    block's time and was not called back takes effect, as the node's
+    ReserveService applies it after the block (UpdateTreiFromReserve)."""
+    pending = VbtcV2Token.objects.filter(
+        pending_owner_transaction__isnull=False
+    ).select_related("pending_owner_transaction")
+    for token in pending:
+        tx = token.pending_owner_transaction
+        if tx.voided_from_callback:
+            _clear_pending_owner(token)
+        elif token.pending_owner_settled(as_of=block.date_crafted):
+            _move_owner(token, token.pending_owner_address, tx)
+
+
+def call_back_ownership_transfer(original_tx):
+    """CallBack() of a reserve owner's Transfer() of a vBTC V2 contract.
+    Returns False when original_tx is not one. While the transfer is pending
+    the callback voids it: the owner never moved and the settlement row is
+    never counted. Once it has taken effect the node skips the callback (its
+    reserve row is no longer Pending), and so does this."""
+    token = VbtcV2Token.objects.filter(pending_owner_transaction=original_tx).first()
+    if token is None:
+        payload, _ = parse_envelope(original_tx.data)
+        if net_string(field(payload, "Function")) != OWNERSHIP_TRANSFER_FUNCTION:
+            return False
+        sc_uid = net_string(field(payload, "ContractUID"))
+        return bool(sc_uid) and VbtcV2Token.objects.filter(sc_identifier=sc_uid).exists()
+    if not original_tx.voided_from_callback:
+        original_tx.voided_from_callback = True
+        original_tx.save(update_fields=["voided_from_callback"])
+    _clear_pending_owner(token)
+    return True
 
 
 # --- reserve callback and recovery -----------------------------------------

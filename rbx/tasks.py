@@ -266,6 +266,8 @@ def sync_block(height: int, data: Optional[dict] = None, notify: bool = True) ->
                     f"{height}; skipping it"
                 )
 
+        vbtc_dispatch.settle_pending_owners(block)
+
         if block_created and master_node:
             MasterNode.objects.filter(address=master_node.address).update(
                 block_count=F("block_count") + 1
@@ -690,11 +692,15 @@ def process_transaction(tx: Transaction):
             return
 
         if func == "Transfer()":
-            nft.owner_address = tx.to_address
             nft.transfer_transactions.add(tx)
             v2_token = VbtcV2Token.objects.filter(sc_identifier=identifier).first()
             if v2_token is not None:
+                # Moves the NFT owner with the contract owner, which waits for
+                # the unlock when the sender is a reserve address.
                 vbtc_dispatch.apply_ownership_transfer(v2_token, tx)
+                nft.refresh_from_db(fields=["owner_address"])
+            else:
+                nft.owner_address = tx.to_address
 
         elif func in ["ChangeEvolveStateSpecific()", "Evolve()", "Devolve()"]:
             nft.misc_transactions.add(tx)
@@ -787,7 +793,11 @@ def process_transaction(tx: Transaction):
                 print("Could not find callback original TX")
                 return
 
-            if original_tx.type == Transaction.Type.TX:
+            if vbtc_dispatch.call_back_ownership_transfer(original_tx):
+                # A vBTC V2 contract: its owner and its NFT's owner never moved.
+                pass
+
+            elif original_tx.type == Transaction.Type.TX:
                 Callback.objects.get_or_create(
                     transaction=tx,
                     original_transaction=original_tx,

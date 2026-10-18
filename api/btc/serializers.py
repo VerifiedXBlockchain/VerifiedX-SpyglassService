@@ -88,6 +88,16 @@ class VbtcV2TokenSerializer(serializers.ModelSerializer):
     # `addresses` is the gross ledger; this nets out each address's open
     # withdrawal requests and is what a wallet should size sends from.
     available_balances = serializers.SerializerMethodField()
+    # A reserve owner's transfer of the contract takes effect at its unlock;
+    # until then the recipient is only the pending owner.
+    owner_address = serializers.CharField(source="current_owner", read_only=True)
+    pending_owner_address = serializers.SerializerMethodField()
+
+    def get_pending_owner_address(self, token):
+        tx = token.pending_owner_transaction
+        if tx is None or tx.voided_from_callback or token.pending_owner_settled():
+            return None
+        return token.pending_owner_address
 
     def get_available_balances(self, token):
         # One chain-tip lookup per serialisation, not one per token.
@@ -102,6 +112,7 @@ class VbtcV2TokenSerializer(serializers.ModelSerializer):
             "name",
             "description",
             "owner_address",
+            "pending_owner_address",
             "image_url",
             "deposit_address",
             "frost_group_public_key",

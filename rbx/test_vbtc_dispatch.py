@@ -9,7 +9,10 @@ from django.core.management import call_command
 from django.test import TestCase, override_settings
 from django.utils import timezone
 
-from api.btc.views import _mark_withdrawal_signed
+from api.btc.serializers import VbtcV2TokenSerializer
+from access.models import User
+from api.btc.views import VbtcV2ListView, _mark_withdrawal_signed
+from rest_framework.test import APIRequestFactory, force_authenticate
 from rbx.models import Address, Recovery, Transaction, VbtcV2TokenTransfer, VbtcV2WithdrawalRequest
 from rbx.tasks import process_transaction
 from rbx.tests import add_transfer, add_withdrawal, make_block, make_token, make_tx
@@ -17,6 +20,7 @@ from rbx.vbtc_dispatch import (
     cancellation_uid_for,
     redirect_reserve_transfer,
     replaying,
+    settle_pending_owners,
     void_reserve_transfer,
 )
 from rbx.vbtc_gates import bound_field, field, net_decimal, net_int, parse_envelope
@@ -819,3 +823,170 @@ class MintReprocessTests(TestCase):
         self.assertEqual(token.owner_address, "P")
         self.assertEqual(token.validator_snapshot, ["V1"])
 
+
+@TESTNET
+class ReserveOwnershipTransferTests(TestCase):
+    """A Transfer() of the contract from a reserve (xRBX) owner moves the
+    owner when it unlocks without a callback; until then the recipient is
+    only the next owner, and a callback leaves the owner where it was."""
+
+    OWNER = "xRBXowner"
+
+    def setUp(self):
+        self.block = make_block()
+        self.token = make_token(owner=self.OWNER, global_balance="0.01", sc_identifier="sc:a")
+        add_transfer(self.token, make_tx(self.block, "s1", Transaction.Type.VBTC_V2_TRANSFER), self.OWNER, "H", "0.002")
+        self.tx = make_tx(
+            self.block, "ot1", Transaction.Type.NFT_TX, from_address=self.OWNER, to_address="P",
+            data=[{"Function": "Transfer()", "ContractUID": "sc:a"}],
+        )
+        self.tx.unlock_time = timezone.now() + timedelta(hours=1)
+        self.tx.save(update_fields=["unlock_time"])
+        process_transaction(self.tx)
+        self.token.refresh_from_db()
+
+    def unlock(self):
+        self.tx.unlock_time = timezone.now() - timedelta(minutes=1)
+        self.tx.save(update_fields=["unlock_time"])
+
+    def block_after_unlock(self):
+        return make_block(height=2)
+
+    def call_back(self):
+        callback = make_tx(
+            self.block, "cb1", Transaction.Type.RESERVE, from_address=self.OWNER,
+            data={"Function": "CallBack()", "Hash": "ot1"},
+        )
+        process_transaction(callback)
+        self.tx.refresh_from_db()
+        self.token.refresh_from_db()
+
+    def assertOwner(self, owner):
+        self.token.refresh_from_db()
+        self.assertEqual(self.token.owner_address, owner)
+        self.assertEqual(self.token.nft.owner_address, owner)
+        self.assertEqual(self.token.current_owner(), owner)
+
+    def test_owner_waits_for_the_unlock(self):
+        self.assertOwner(self.OWNER)
+        self.assertEqual(self.token.pending_owner_address, "P")
+        self.assertEqual(self.token.addresses, {self.OWNER: Decimal("0.008"), "H": Decimal("0.002")})
+
+    def test_api_shows_the_recipient_as_pending_owner(self):
+        data = VbtcV2TokenSerializer(self.token).data
+        self.assertEqual(data["owner_address"], self.OWNER)
+        self.assertEqual(data["pending_owner_address"], "P")
+
+    def test_unlocked_transfer_reads_as_the_recipients(self):
+        self.unlock()
+        self.assertEqual(self.token.current_owner(), "P")
+        self.assertEqual(self.token.addresses, {"P": Decimal("0.008"), "H": Decimal("0.002")})
+        data = VbtcV2TokenSerializer(self.token).data
+        self.assertEqual(data["owner_address"], "P")
+        self.assertIsNone(data["pending_owner_address"])
+
+    def test_block_after_the_unlock_moves_the_owner(self):
+        self.unlock()
+        settle_pending_owners(self.block_after_unlock())
+        self.assertOwner("P")
+        self.assertIsNone(self.token.pending_owner_transaction)
+        self.assertEqual(self.token.addresses, {"P": Decimal("0.008"), "H": Decimal("0.002")})
+
+    def test_block_before_the_unlock_leaves_the_owner(self):
+        settle_pending_owners(self.block_after_unlock())
+        self.assertOwner(self.OWNER)
+        self.assertEqual(self.token.pending_owner_address, "P")
+
+    def test_called_back_transfer_never_moves_the_owner(self):
+        self.call_back()
+        self.assertTrue(self.tx.voided_from_callback)
+        self.assertIsNone(self.token.pending_owner_address)
+
+        self.unlock()
+        settle_pending_owners(self.block_after_unlock())
+        self.assertOwner(self.OWNER)
+        self.assertEqual(self.token.addresses, {self.OWNER: Decimal("0.008"), "H": Decimal("0.002")})
+
+    def test_callback_after_the_transfer_took_effect_changes_nothing(self):
+        # The node skips a callback of a reserve row that is no longer pending.
+        self.unlock()
+        settle_pending_owners(self.block_after_unlock())
+        self.call_back()
+        self.assertFalse(self.tx.voided_from_callback)
+        self.assertOwner("P")
+
+    def test_replay_of_an_unlocked_transfer_moves_the_owner(self):
+        self.unlock()
+        with replaying():
+            process_transaction(self.tx)
+        self.assertOwner("P")
+
+    def test_replay_of_a_called_back_transfer_leaves_the_owner(self):
+        self.call_back()
+        self.unlock()
+        with replaying():
+            process_transaction(self.tx)
+        self.assertOwner(self.OWNER)
+        self.assertIsNone(self.token.pending_owner_address)
+
+    def test_replay_reads_a_callback_earlier_indexing_did_not_mark(self):
+        make_tx(
+            self.block, "cb1", Transaction.Type.RESERVE, from_address=self.OWNER,
+            data={"Function": "CallBack()", "Hash": "ot1"},
+        )
+        self.unlock()
+        with replaying():
+            process_transaction(self.tx)
+        self.tx.refresh_from_db()
+        self.assertTrue(self.tx.voided_from_callback)
+        self.assertOwner(self.OWNER)
+        self.assertEqual(self.token.addresses, {self.OWNER: Decimal("0.008"), "H": Decimal("0.002")})
+
+    def test_replay_ignores_a_callback_mined_after_the_transfer_applied(self):
+        self.unlock()
+        applied = self.block_after_unlock()
+        later = make_block(height=3)
+        make_tx(
+            later, "cb1", Transaction.Type.RESERVE, from_address=self.OWNER,
+            data={"Function": "CallBack()", "Hash": "ot1"},
+        )
+        self.assertGreaterEqual(applied.date_crafted, self.tx.unlock_time)
+        with replaying():
+            process_transaction(self.tx)
+        self.assertOwner("P")
+
+    def test_ordinary_owner_transfer_moves_at_once(self):
+        tx = make_tx(
+            self.block, "ot2", Transaction.Type.NFT_TX, from_address="O", to_address="Q",
+            data=[{"Function": "Transfer()", "ContractUID": "sc:b"}],
+        )
+        token = make_token(owner="O", global_balance="0.01", sc_identifier="sc:b")
+        process_transaction(tx)
+        token.refresh_from_db()
+        self.assertEqual(token.owner_address, "Q")
+        self.assertEqual(token.nft.owner_address, "Q")
+
+    def listed_for(self, address):
+        request = APIRequestFactory().get(f"/api/btc/vbtc-v2/{address}/")
+        user, _ = User.objects.get_or_create(email=f"{address}@example.com")
+        force_authenticate(request, user=user)
+        response = VbtcV2ListView.as_view()(request, vfx_address=address)
+        return {t["sc_identifier"] for t in response.data["results"]}
+
+    def test_pending_owner_is_listed_once_the_transfer_takes_effect(self):
+        # A contract with no ledger rows: the recipient is listed as owner only.
+        token = make_token(owner=self.OWNER, global_balance="0.01", sc_identifier="sc:c")
+        tx = make_tx(
+            self.block, "ot3", Transaction.Type.NFT_TX, from_address=self.OWNER, to_address="Q",
+            data=[{"Function": "Transfer()", "ContractUID": "sc:c"}],
+        )
+        tx.unlock_time = timezone.now() + timedelta(hours=1)
+        tx.save(update_fields=["unlock_time"])
+        process_transaction(tx)
+        self.assertEqual(self.listed_for("Q"), set())
+
+        tx.unlock_time = timezone.now() - timedelta(minutes=1)
+        tx.save(update_fields=["unlock_time"])
+        self.assertEqual(self.listed_for("Q"), {"sc:c"})
+        token.refresh_from_db()
+        self.assertEqual(token.owner_address, self.OWNER)

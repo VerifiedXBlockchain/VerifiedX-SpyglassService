@@ -1179,10 +1179,33 @@ class VbtcV2Token(models.Model):
     total_sent = models.DecimalField(decimal_places=16, max_digits=32, default=0)
     tx_count = models.IntegerField(default=0)
     is_pending_withdrawal = models.BooleanField(default=False)
+    # A Transfer() of the contract from a reserve (xRBX) owner only marks the
+    # recipient as next owner; the node moves the owner when the transfer
+    # unlocks, and a callback before then undoes it (StateData.cs
+    # TransferSmartContract, UpdateTreiFromReserve, CallBackReserveAccountTx).
+    pending_owner_address = models.CharField(max_length=64, blank=True, null=True)
+    pending_owner_transaction = models.ForeignKey(
+        "Transaction", blank=True, null=True, on_delete=models.SET_NULL, related_name="+"
+    )
     created_at = models.DateTimeField()
 
     def __str__(self):
         return f"{self.sc_identifier} ({self.deposit_address})"
+
+    def pending_owner_settled(self, as_of=None):
+        """Whether the pending reserve transfer has taken effect at as_of
+        (default now): it unlocked and was not called back, the rule
+        ledger_entries applies to the transfer's settlement row."""
+        tx = self.pending_owner_transaction
+        if tx is None or not self.pending_owner_address or tx.voided_from_callback:
+            return False
+        as_of = timezone.now() if as_of is None else as_of
+        return tx.unlock_time is None or tx.unlock_time <= as_of
+
+    def current_owner(self, as_of=None):
+        if self.pending_owner_settled(as_of):
+            return self.pending_owner_address
+        return self.owner_address
 
     @property
     def image_is_default(self):
@@ -1265,7 +1288,9 @@ class VbtcV2Token(models.Model):
         for t in transfers:
             if not self._applied_before(t.transaction, before):
                 continue
-            if t.from_address.startswith("xRBX"):
+            # A reserve owner's ownership transfer defers its settlement row
+            # with the transfer, whichever way the row runs.
+            if t.from_address.startswith("xRBX") or t.transaction.from_address.startswith("xRBX"):
                 tx = t.transaction
                 if tx.voided_from_callback:
                     continue
@@ -1380,8 +1405,9 @@ class VbtcV2Token(models.Model):
         ).aggregate(total=Sum("amount"))["total"] or Decimal(0)
 
         # Owner anchor = global_balance (actual BTC on deposit) + total_withdrawn
-        entries[self.owner_address] = (
-            entries.get(self.owner_address, Decimal(0))
+        owner = self.current_owner()
+        entries[owner] = (
+            entries.get(owner, Decimal(0))
             + self.global_balance
             + total_withdrawn
         )
