@@ -732,14 +732,37 @@ def reconcile_watched_exit(exit, data):
     return True
 
 
-def _expiry_candidates(height):
+class ExitExpiryUnanswered(Exception):
+    """The node did not answer whether an exit expired: nothing may be
+    applied as if it had not."""
+
+
+def _expiry_key(exit):
+    """Stable across a rebuild, which makes the exits again with new rows,
+    and distinct for each exit of one burn."""
+    return (exit.burn_key, exit.exit_transaction_id)
+
+
+def _expiry_candidates(height, since=None):
     """The open exits on watched vaults the node can have expired by the
     start of block `height`: those mined more than EXIT_EXPIRY_BLOCKS blocks
-    before it (BtcWithdrawals.OnBlockStart, WaitingWithdrawalsRequestedBefore)."""
+    before it (BtcWithdrawals.OnBlockStart, WaitingWithdrawalsRequestedBefore),
+    and at or after block `since`."""
     exits = VbtcV2BridgeExit.objects.filter(
         is_complete=False, exit_transaction__height__lt=height - EXIT_EXPIRY_BLOCKS
     ).select_related("exit_transaction")
+    if since is not None:
+        exits = exits.filter(exit_transaction__height__gte=since)
     return [exit for exit in exits if is_watched_exit(exit)]
+
+
+def _answered(data, exit):
+    if isinstance(data, dict) and data.get("Unreachable"):
+        raise ExitExpiryUnanswered(
+            f"Bridge exit {exit.exit_transaction_id} for burn {exit.burn_tx_hash}: the node did not answer whether "
+            f"it expired ({data.get('Message')})."
+        )
+    return data
 
 
 def exit_expiry_height(exit):
@@ -748,10 +771,11 @@ def exit_expiry_height(exit):
     node still describes this exit, else, once the burn has been exited
     again, the ClosedAtVfxHeight of its part on its first vault
     (GetWithdrawalPin) when that part expired. Every part of an exit
-    expires in the same block."""
+    expires in the same block. Raises ExitExpiryUnanswered when the node
+    gives no answer: None means it answered that the exit did not expire."""
     from rbx.client import get_vbtc_v2_bridge_exit, get_vbtc_v2_withdrawal_pin
 
-    data = get_vbtc_v2_bridge_exit(exit.burn_tx_hash)
+    data = _answered(get_vbtc_v2_bridge_exit(exit.burn_tx_hash), exit)
     view = data.get("Exit") if isinstance(data, dict) and data.get("Success") else None
     if isinstance(view, dict) and view.get("ExitTxHash") == exit.exit_transaction_id:
         found = re.search(r"expired@(\d+)", view.get("FailureRecord") or "")
@@ -760,7 +784,7 @@ def exit_expiry_height(exit):
     if not tokens:
         return None
     ref = f"exit:{exit.exit_transaction_id}@{exit.exit_transaction.height}"
-    data = get_vbtc_v2_withdrawal_pin(tokens[0].sc_identifier, ref)
+    data = _answered(get_vbtc_v2_withdrawal_pin(tokens[0].sc_identifier, ref), exit)
     part = data.get("Withdrawal") if isinstance(data, dict) and data.get("Success") else None
     if not isinstance(part, dict) or part.get("State") != "Expired":
         return None
@@ -769,13 +793,13 @@ def exit_expiry_height(exit):
 
 
 def read_exit_expiries(height, known, since=None):
-    """Adds to `known` (exit pk: expiry height or None) every exit the node
-    can have expired by the start of block `height`, mined at or after
+    """Adds to `known` (_expiry_key: expiry height or None) every exit the
+    node can have expired by the start of block `height`, mined at or after
     block `since`, that it does not hold yet. Read before the bridge lock is
-    taken."""
-    for exit in _expiry_candidates(height):
-        if exit.pk not in known and (since is None or exit.exit_transaction.height >= since):
-            known[exit.pk] = exit_expiry_height(exit)
+    taken. Raises ExitExpiryUnanswered when the node does not answer."""
+    for exit in _expiry_candidates(height, since):
+        if _expiry_key(exit) not in known:
+            known[_expiry_key(exit)] = exit_expiry_height(exit)
     return known
 
 
@@ -794,7 +818,7 @@ def expire_exits(height, expiries):
     OnBlockStart, so a draw of the block finds the lock restored.
     `expiries` is what read_exit_expiries gave."""
     for exit in _expiry_candidates(height):
-        at = expiries.get(exit.pk)
+        at = expiries.get(_expiry_key(exit))
         if at is None or at > height:
             continue
         applied = list(exit.applied_parts)

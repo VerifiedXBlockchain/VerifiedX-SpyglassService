@@ -162,13 +162,12 @@ def sync_block(height: int, data: Optional[dict] = None, notify: bool = True) ->
 
     # Exits on watched vaults that reach their window at this block: the
     # node fails one never pinned at the block's start, before its
-    # transactions. Asked before the bridge lock is taken; a failure leaves
-    # it to the reads after a Bitcoin report and the ten-minute sweep.
-    try:
-        exit_expiries = vbtc_bridge.read_exit_expiries(height, {}, since=vbtc_bridge.expiry_window_edge(height))
-    except Exception:
-        logging.exception(f"Reading the bridge exits due to expire at block {height} failed")
-        exit_expiries = {}
+    # transactions. Asked before the bridge lock is taken. They are asked
+    # at this block only, so a node that does not answer stops the sync
+    # here (ExitExpiryUnanswered) and the block is synced again on the next
+    # run, rather than committed without the locks given back.
+    edge = vbtc_bridge.expiry_window_edge(height)
+    exit_expiries = vbtc_bridge.read_exit_expiries(height, {}, since=edge)
 
     # One transaction per block: a crash mid-block rolls the whole block back
     # so the next run re-syncs it instead of silently skipping its remaining

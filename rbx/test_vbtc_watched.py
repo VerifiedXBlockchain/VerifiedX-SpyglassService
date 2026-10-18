@@ -7,15 +7,15 @@ from decimal import Decimal
 from io import StringIO
 from unittest.mock import patch
 
+import requests
 from django.core.management import call_command
-
 from django.test import TestCase, TransactionTestCase, override_settings
 
-from rbx.models import Transaction, VbtcV2BridgeExit, VbtcV2BridgeLock, VbtcV2WithdrawalRequest
+from rbx.models import Block, Transaction, VbtcV2BridgeExit, VbtcV2BridgeLock, VbtcV2WithdrawalRequest
 from rbx.tasks import process_transaction, sync_block
 from rbx.test_vbtc_dispatch import cancel_tx, complete_tx, request_tx
 from rbx.tests import add_transfer, make_block, make_tx, make_token
-from rbx.vbtc_bridge import rebuild_bridge_state
+from rbx.vbtc_bridge import ExitExpiryUnanswered, rebuild_bridge_state
 from rbx.vbtc_dispatch import reconcile_watched_withdrawals
 
 T = Transaction.Type
@@ -377,6 +377,7 @@ class ExitExpiryTests(WatchedVaultCase):
     EXPIRED = {"Success": True, "Exit": {"ExitTxHash": "x1", "IsComplete": True, "Failed": True,
                                          "FailureRecord": "FAILED:expired@402", "Parts": []}}
     OPEN = {"Success": True, "Exit": {"ExitTxHash": "x1", "IsComplete": False, "Failed": False, "Parts": []}}
+    UNREACHABLE = {"Success": False, "Message": "read timed out", "Unreachable": True}
     # Draws the whole of L1: it holds that only once x1's 0.002 is back.
     POOL_UNLOCK = {
         "TotalAmount": 0.003, "TotalAmountSats": 300000, "VfxDestinationAddress": "D", "ExitBurnTxHash": "b2",
@@ -396,8 +397,10 @@ class ExitExpiryTests(WatchedVaultCase):
                 to_address="Caster", data=self.POOL_UNLOCK)
 
     def node(self, exit_view):
+        """exit_view None leaves GetBridgeExit to the client."""
         stack = ExitStack()
-        self.exit_reads = stack.enter_context(patch(EXIT, return_value=exit_view))
+        if exit_view is not None:
+            self.exit_reads = stack.enter_context(patch(EXIT, return_value=exit_view))
         stack.enter_context(patch(STATUS, return_value={"Success": True, "Bitcoin": {"PaidOutForBridgeExitsSats": 0}}))
         stack.enter_context(patch(HISTORY, return_value=history()))
         return stack
@@ -406,18 +409,18 @@ class ExitExpiryTests(WatchedVaultCase):
         with self.node(exit_view):
             call_command("reprocess_vbtc_v2", stdout=StringIO(), stderr=StringIO())
 
-    def rebuild(self):
-        with self.node(self.EXPIRED):
+    def rebuild(self, exit_view=EXPIRED):
+        with self.node(exit_view):
             rebuild_bridge_state()
 
-    def sync(self, height, with_unlock=True):
+    def sync(self, height, with_unlock=True, exit_view=EXPIRED):
         txs = [{"Hash": "p1", "TransactionType": int(T.VBTC_BRIDGE_POOL_UNLOCK), "ToAddress": "Caster",
                 "FromAddress": "Caster", "Amount": 0, "Fee": 0, "Data": json.dumps(self.POOL_UNLOCK), "Signature": ""}]
         data = {"Height": height, "Hash": f"block-{height}", "PrevHash": "", "Validator": "V", "ValidatorSignature": "",
                 "ValidatorAnswer": "", "ChainRefId": "", "MerkleRoot": "", "StateRoot": "", "TotalReward": 0,
                 "TotalAmount": 0, "TotalValidators": 0, "Version": 1, "Size": 0, "BCraftTime": 0, "Timestamp": 1760000000,
                 "Transactions": txs if with_unlock else []}
-        with self.node(self.EXPIRED):
+        with self.node(exit_view):
             sync_block(height, data=data, notify=False)
 
     def lock(self):
@@ -483,6 +486,39 @@ class ExitExpiryTests(WatchedVaultCase):
         self.exit_reads.assert_not_called()
         self.assertNotIn("D", self.addresses())
         self.assertFalse(self.exit().is_complete)
+
+    def test_a_node_outage_at_the_expiry_block_stops_the_sync_until_it_answers(self):
+        # The node times out at 402: the block is not committed, and the
+        # next run syncs it again; the draw at 403 then finds the locks.
+        with patch("rbx.client._http.get", side_effect=requests.Timeout("read timed out")):
+            with self.assertRaises(ExitExpiryUnanswered):
+                self.sync(402, with_unlock=False, exit_view=None)
+        self.assertFalse(Block.objects.filter(height=402).exists())
+        self.assertFalse(self.exit().is_complete)
+        self.sync(402, with_unlock=False)
+        self.sync(403)
+        self.assertEqual(self.addresses().get("D"), Decimal("0.003"))
+        self.assertEqual(self.lock().remaining_amount, Decimal("0"))
+
+    def test_a_refusal_the_node_answers_is_taken_as_not_expired(self):
+        with patch(PIN, return_value={"Success": False, "Message": "no withdrawal"}):
+            self.sync(402, with_unlock=False, exit_view={"Success": False, "Message": "no exit"})
+        self.assertTrue(Block.objects.filter(height=402).exists())
+        self.assertFalse(self.exit().is_complete)
+
+    def test_the_backfill_stops_on_an_unanswered_read(self):
+        self.pool_unlock(402)
+        with self.assertRaises(ExitExpiryUnanswered):
+            self.reprocess(self.UNREACHABLE)
+        self.assertFalse(self.exit().is_complete)
+        self.assertEqual(self.lock().remaining_amount, Decimal("0.001"))
+
+    def test_a_rebuild_stops_on_an_unanswered_read(self):
+        self.pool_unlock(402)
+        with self.assertRaises(ExitExpiryUnanswered):
+            self.rebuild(self.UNREACHABLE)
+        self.assertFalse(self.exit().is_complete)
+        self.assertEqual(self.lock().remaining_amount, Decimal("0.001"))
 
     def test_a_synced_block_past_the_window_edge_does_not_ask_again(self):
         self.sync(403, with_unlock=False)
