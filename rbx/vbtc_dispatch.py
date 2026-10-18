@@ -1171,14 +1171,27 @@ def refresh_watched_backing(token):
     if not data.get("Attested") or not isinstance(bitcoin, dict):
         return False
     held = bitcoin.get("HeldSats")
+    paid = bitcoin.get("PaidOutForBridgeExitsSats")
     address = bitcoin.get("DepositAddress")
-    if not isinstance(held, int) or isinstance(held, bool) or not isinstance(address, str) or not address:
-        logging.error(f"Watched vault {token.sc_identifier}: the node's Bitcoin view has no HeldSats or DepositAddress.")
+    if (
+        not all(isinstance(sats, int) and not isinstance(sats, bool) for sats in (held, paid))
+        or not isinstance(address, str)
+        or not address
+    ):
+        logging.error(
+            f"Watched vault {token.sc_identifier}: the node's Bitcoin view has no HeldSats, "
+            f"PaidOutForBridgeExitsSats or DepositAddress."
+        )
         return None
     # total_received, total_sent and tx_count are the providers' and are
-    # not kept for a watched vault (see VbtcV2TokenSerializer).
+    # not kept for a watched vault (see VbtcV2TokenSerializer). Core moves
+    # HeldSats and SettledExitSats in one apply (BtcAttestBalance.cs:52-56):
+    # the owner anchor adds the second to the first, so they are written
+    # together, or a payout seen in one and not the other shrinks the owner.
     VbtcV2Token.objects.filter(pk=token.pk).update(
-        global_balance=Decimal(held) / Decimal(100_000_000), deposit_address=address
+        global_balance=Decimal(held) / Decimal(100_000_000),
+        settled_exit_btc=Decimal(paid) / Decimal(100_000_000),
+        deposit_address=address,
     )
     return True
 

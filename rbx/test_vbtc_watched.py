@@ -514,9 +514,9 @@ class WatchedBackingTests(WatchedVaultCase):
     """A watched vault's backing is the chain's (Bitcoin.HeldSats) and its
     deposit address the current key's, from GetWithdrawalStatus."""
 
-    def status(self, held_sats=1000000, address="bc1new", attested=True):
+    def status(self, held_sats=1000000, address="bc1new", attested=True, paid_sats=0):
         return {"Success": True, "Attested": attested,
-                "Bitcoin": {"HeldSats": held_sats, "DepositAddress": address}}
+                "Bitcoin": {"HeldSats": held_sats, "PaidOutForBridgeExitsSats": paid_sats, "DepositAddress": address}}
 
     def refresh(self, status, provider_balance="0.5"):
         from unittest.mock import MagicMock
@@ -580,6 +580,23 @@ class WatchedBackingTests(WatchedVaultCase):
         client.return_value.get_balance.assert_not_called()
         self.assertEqual(Decimal(str(response.data["global_balance"])), Decimal("0.008"))
 
+    def test_a_bridge_payout_moves_the_backing_and_the_settled_exits_together(self):
+        # An exit pays 0.002 out of the vault: HeldSats falls by it and
+        # SettledExitSats rises by it in one apply, so the owner keeps its figure.
+        before = self.addresses()
+        self.refresh(self.status(held_sats=800000, paid_sats=200000))
+        self.assertEqual(self.token.global_balance, Decimal("0.008"))
+        self.assertEqual(self.token.settled_exit_btc, Decimal("0.002"))
+        self.assertEqual(self.addresses(), before)
+
+    def test_a_node_view_without_the_payout_figure_leaves_the_row(self):
+        status = self.status(held_sats=800000)
+        del status["Bitcoin"]["PaidOutForBridgeExitsSats"]
+        with self.assertLogs(level="ERROR"):
+            client = self.refresh(status)
+        client.get_balance.assert_not_called()
+        self.assertEqual(self.token.global_balance, Decimal("0.01"))
+
 
 @override_settings(VBTC_NETWORK="testnet", VBTC_FUND_LOSS_AUDIT_HEIGHT=1000)
 class LegacyBackingTests(WatchedBackingTests):
@@ -601,6 +618,8 @@ class LegacyBackingTests(WatchedBackingTests):
     test_a_node_that_does_not_answer_leaves_the_backing = None
     test_the_detail_view_refreshes_the_same_way = None
     test_a_block_with_a_report_refreshes_the_backing = None
+    test_a_bridge_payout_moves_the_backing_and_the_settled_exits_together = None
+    test_a_node_view_without_the_payout_figure_leaves_the_row = None
 
 
 @WATCHING
