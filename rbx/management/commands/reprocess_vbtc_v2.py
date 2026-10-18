@@ -15,7 +15,7 @@ from rbx.vbtc_dispatch import (
     recovery_address_of,
     replaying,
 )
-from rbx.vbtc_bridge import BRIDGE_TYPES, SHIELD_TYPES, reset_bridge_state
+from rbx.vbtc_bridge import BRIDGE_TYPES, SHIELD_TYPES, bridge_references, reset_bridge_state
 from rbx.vbtc_gates import field, net_string, parse_envelope
 
 
@@ -135,6 +135,7 @@ class Command(BaseCommand):
         errors = 0
 
         if not tx_type:
+            self.warn_unordered_bridge_blocks(txs)
             reset_bridge_state()
 
         with replaying():
@@ -155,6 +156,22 @@ class Command(BaseCommand):
         self.stdout.write(
             f"Done. Processed: {processed}, Errors: {errors}, Total: {count}"
         )
+
+    def warn_unordered_bridge_blocks(self, txs):
+        """The order inside a block is not stored and the run goes by hash.
+        Two bridge transactions of one block that draw on the same lock or
+        spend the same burn can come out otherwise than on the node: name
+        them, so their holders are checked against a node."""
+        seen = {}
+        for tx in txs:
+            for ref in bridge_references(tx):
+                seen.setdefault((tx.height, ref), []).append(tx.hash)
+        for (height, ref), hashes in sorted(seen.items()):
+            if len(hashes) > 1:
+                self.stderr.write(
+                    f"  WARNING block {height}: {', '.join(hashes)} share {ref[0]} {ref[1]}; "
+                    f"their order in the block is not stored. Check the holders against a node."
+                )
 
     def report_settlements(self, txs):
         """The settlement rows the run would write, change or remove, and

@@ -72,6 +72,27 @@ def route(tx):
     return True
 
 
+def bridge_references(tx):
+    """The lock ids and burn keys a bridge transaction draws on or spends."""
+    payload = parse_object(tx.data)
+    if payload is None or tx.type not in BRIDGE_TYPES:
+        return set()
+    refs = set()
+    for name in ("LockId",):
+        value = net_string(field(payload, name))
+        if value:
+            refs.add(("lock", value.strip()))
+    for name in ("ExitBurnTxHash", "BaseBurnTxHash"):
+        key = normalize_burn(net_string(field(payload, name)))
+        if key:
+            refs.add(("burn", key))
+    for name in ("Allocations", "FailedAllocations"):
+        for allocation in _allocations(payload, name) or []:
+            if allocation["LockId"]:
+                refs.add(("lock", allocation["LockId"].strip()))
+    return refs
+
+
 def reset_bridge_state():
     """Clears what the bridge handlers keep outside the ledger, so that a
     replay from the first block rebuilds it in order."""
@@ -161,10 +182,30 @@ def _partial_unlock(lock, amount):
     return True
 
 
+def normalize_burn(burn):
+    """VBTCBridgeConsumedBurn.Normalize: trimmed, lower case, no 0x."""
+    value = (burn or "").strip().lower()
+    return value[2:] if value.startswith("0x") else value
+
+
+def _lock(lock_id):
+    """VBTCBridgeLockState.GetByLockId: the id trimmed."""
+    return VbtcV2BridgeLock.objects.filter(lock_id=(lock_id or "").strip()).select_related("token").first()
+
+
+def _exit(burn):
+    """VBTCBridgeBtcExitState.GetByBurnHash: matched on the normalised hash."""
+    key = normalize_burn(burn)
+    return VbtcV2BridgeExit.objects.filter(burn_key=key).first() if key else None
+
+
 def _mark_consumed(burn, kind, tx):
     """VBTCBridgeConsumedBurn.TryMarkConsumed: False when the burn is spent."""
+    key = normalize_burn(burn)
+    if not key:
+        return False
     _, created = VbtcV2BridgeConsumedBurn.objects.get_or_create(
-        burn_tx_hash=burn, defaults={"kind": kind, "transaction": tx}
+        burn_tx_hash=key, defaults={"kind": kind, "transaction": tx}
     )
     return created
 
@@ -221,7 +262,7 @@ def apply_unlock(tx):
     if not sc_uid or not lock_id or amount is None or amount_sats is None or not exit_burn:
         logging.error(f"{what} {tx.hash}: missing required fields; the node applies nothing.")
         return None
-    lock = VbtcV2BridgeLock.objects.filter(lock_id=lock_id).select_related("token").first()
+    lock = _lock(lock_id)
     if lock is None or (lock.is_unlocked and lock.unlock_transaction_id != tx.pk):
         return None
     if lock.owner_address != tx.from_address or lock.token.sc_identifier != sc_uid:
@@ -270,7 +311,7 @@ def apply_pool_unlock(tx):
 
     credits = {}
     for allocation in allocations:
-        lock = VbtcV2BridgeLock.objects.filter(lock_id=allocation["LockId"]).select_related("token").first()
+        lock = _lock(allocation["LockId"])
         if lock is None or lock.is_unlocked:
             continue
         drawn = _partial_unlock(lock, allocation["UnlockAmount"])
@@ -303,15 +344,16 @@ def apply_exit(tx):
         amount_sats = net_int(field(payload, "AmountSats"))
         if not sc_uid or not lock_id or amount is None or amount_sats is None or not btc_destination or not burn:
             return None
-        VbtcV2BridgeExit.objects.get_or_create(
+        if _exit(burn) is not None:
+            return None
+        VbtcV2BridgeExit.objects.create(
             burn_tx_hash=burn.strip(),
-            defaults={
-                "exit_transaction": tx,
-                "owner_address": tx.from_address,
-                "amount": amount,
-                "btc_destination": btc_destination,
-                "allocations": [{"LockId": lock_id.strip(), "SmartContractUID": sc_uid, "UnlockAmount": str(amount)}],
-            },
+            burn_key=normalize_burn(burn),
+            exit_transaction=tx,
+            owner_address=tx.from_address,
+            amount=amount,
+            btc_destination=btc_destination,
+            allocations=[{"LockId": lock_id.strip(), "SmartContractUID": sc_uid, "UnlockAmount": str(amount)}],
         )
         return None
 
@@ -330,28 +372,28 @@ def apply_exit(tx):
     record_first = tx.height >= bitcoin_attestation_record_height()
     if record_first and guarded:
         _delete_failed_exit(burn)
-    if record_first and VbtcV2BridgeExit.objects.filter(burn_tx_hash=burn).exists():
+    if record_first and _exit(burn) is not None:
         logging.error(f"{what} {tx.hash}: burn {burn} already has an exit; no lock drawn.")
         return None
 
     for allocation in allocations:
-        lock = VbtcV2BridgeLock.objects.filter(lock_id=allocation["LockId"]).first()
+        lock = _lock(allocation["LockId"])
         if lock is None or lock.is_unlocked:
             continue
         _partial_unlock(lock, allocation["UnlockAmount"])
 
     if guarded:
         _delete_failed_exit(burn)
-    VbtcV2BridgeExit.objects.get_or_create(
-        burn_tx_hash=burn,
-        defaults={
-            "exit_transaction": tx,
-            "owner_address": tx.from_address,
-            "amount": total,
-            "btc_destination": btc_destination,
-            "allocations": _stored(allocations),
-        },
-    )
+    if _exit(burn) is None:
+        VbtcV2BridgeExit.objects.create(
+            burn_tx_hash=burn,
+            burn_key=normalize_burn(burn),
+            exit_transaction=tx,
+            owner_address=tx.from_address,
+            amount=total,
+            btc_destination=btc_destination,
+            allocations=_stored(allocations),
+        )
     return None
 
 
@@ -360,7 +402,9 @@ def _stored(allocations):
 
 
 def _delete_failed_exit(burn):
-    VbtcV2BridgeExit.objects.filter(burn_tx_hash=burn, btc_tx_hash__startswith="FAILED:").delete()
+    exit = _exit(burn)
+    if exit is not None and exit.failed:
+        exit.delete()
 
 
 def apply_exit_complete(tx):
@@ -371,6 +415,7 @@ def apply_exit_complete(tx):
     btc_tx = net_string(field(payload, "BtcTxHash"))
     if not burn or not btc_tx:
         return None
+    # MarkComplete matches the stored hash exactly.
     VbtcV2BridgeExit.objects.filter(burn_tx_hash=burn.strip()).update(
         is_complete=True, btc_tx_hash=btc_tx.strip()
     )
@@ -393,6 +438,7 @@ def apply_exit_fail(tx):
 
     # Each failed allocation is given back to its lock, which is blacklisted.
     for allocation in failed:
+        # BlacklistLock matches the id exactly, untrimmed.
         lock = VbtcV2BridgeLock.objects.filter(lock_id=allocation["LockId"]).first()
         if lock is None:
             continue
@@ -404,7 +450,7 @@ def apply_exit_fail(tx):
             lock.is_unlocked = False
         lock.save(update_fields=["is_blacklisted", "unlocked_amount", "unlocked_amount_sats", "is_unlocked"])
 
-    exit = VbtcV2BridgeExit.objects.filter(burn_tx_hash=burn).first()
+    exit = _exit(burn)
     if exit is None or exit.is_complete:
         return None
     if tx.height >= bitcoin_attestation_record_height():
@@ -461,7 +507,7 @@ def _base64_text(text):
 
 
 def _shield_amount(payload):
-    value = payload.get("vbtc_amt")
+    value = bound_field(payload, "vbtc_amt")
     if isinstance(value, bool) or value is None:
         return None
     try:
@@ -472,12 +518,22 @@ def _shield_amount(payload):
 
 
 def _shield_move(tx, what):
+    # JsonConvert.DeserializeObject<PrivateTxPayload>: properties bind by
+    # name, exact first and then case-insensitively; v defaults to 1.
     payload = private_payload(tx.data)
-    if payload is None or payload.get("v") != 1 or not payload.get("asset"):
+    version = bound_field(payload, "v") if payload is not None else None
+    asset = bound_field(payload, "asset") if payload is not None else None
+    if (
+        payload is None
+        or (version is not None and net_int(version) != 1)
+        or not isinstance(asset, str)
+        or not asset.strip()
+        or len(asset) > 64
+    ):
         logging.error(f"{what} {tx.hash}: payload does not decode to a private transaction; the node applies nothing.")
         return None, None
     amount = _shield_amount(payload)
-    sc_uid = payload.get("vbtc_uid")
+    sc_uid = bound_field(payload, "vbtc_uid")
     if amount is None or not isinstance(sc_uid, str) or not sc_uid.strip():
         return None, None
     token = VbtcV2Token.objects.filter(sc_identifier=sc_uid).first()

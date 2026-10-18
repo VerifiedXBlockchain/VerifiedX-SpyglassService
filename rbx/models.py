@@ -1645,7 +1645,10 @@ class VbtcV2BridgeLock(models.Model):
 
 
 class VbtcV2BridgeExit(models.Model):
-    burn_tx_hash = models.CharField(max_length=128, unique=True)
+    # As the transaction carried it (trimmed), and normalised (lower case, no
+    # 0x), which is what the node matches an exit's burn on.
+    burn_tx_hash = models.CharField(max_length=128)
+    burn_key = models.CharField(max_length=128, unique=True)
     exit_transaction = models.ForeignKey(Transaction, on_delete=models.CASCADE, related_name="+")
     owner_address = models.CharField(max_length=64)
     amount = models.DecimalField(decimal_places=16, max_digits=32)
@@ -1661,6 +1664,7 @@ class VbtcV2BridgeExit(models.Model):
 
 
 class VbtcV2BridgeConsumedBurn(models.Model):
+    # Normalised: lower case, no 0x (VBTCBridgeConsumedBurn.Normalize).
     burn_tx_hash = models.CharField(max_length=128, unique=True)
     kind = models.CharField(max_length=32)
     transaction = models.ForeignKey(Transaction, on_delete=models.CASCADE, related_name="+")

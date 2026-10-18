@@ -207,3 +207,95 @@ class ShieldTests(BridgeCase):
     def test_payload_without_an_amount_applies_nothing(self):
         self.shielded("sh1", T.VBTC_SHIELD, "H", "Shielded_Pool", private("sc:a", 0))
         self.assertFalse(VbtcV2TokenTransfer.objects.filter(transaction__hash="sh1").exists())
+
+
+RECORDING = override_settings(VBTC_NETWORK="testnet", VBTC_FUND_LOSS_AUDIT_HEIGHT=1)
+
+
+@RECORDING
+class BridgeExitRecordingTests(BridgeCase):
+    """From BitcoinAttestationRecordHeight an exit's record comes first."""
+
+    def setUp(self):
+        super().setUp()
+        self.lock()
+        add_transfer(self.token, make_tx(make_block(height=2), "s2", T.VBTC_V2_TRANSFER), "O", "H2", "0.002")
+        self.lock(tx_hash="l2", lock_id="L2", sender="H2", amount="0.002")
+
+    def fail(self, tx_hash, burn, allocations):
+        return self.tx(tx_hash, T.VBTC_BRIDGE_EXIT_TO_BTC_FAIL, "Caster", {
+            "BaseBurnTxHash": burn, "Reason": "utxo",
+            "FailedAllocations": [{"LockId": lock_id, "UnlockAmount": float(a)} for lock_id, a in allocations],
+        })
+
+    def test_partial_failure_leaves_the_rest_open(self):
+        self.exit("x1", "b2", [("L1", "0.001"), ("L2", "0.001")])
+        self.fail("f1", "b2", [("L2", "0.001")])
+        exit = VbtcV2BridgeExit.objects.get(burn_key="b2")
+        self.assertFalse(exit.is_complete)
+        self.assertEqual([a["LockId"] for a in exit.allocations], ["L1"])
+        self.assertEqual(self.remaining("L2"), Decimal("0.002"))
+        self.assertEqual(self.remaining("L1"), Decimal("0.002"))
+
+    def test_second_exit_for_a_recorded_burn_draws_nothing(self):
+        self.exit("x1", "b2", [("L1", "0.001")])
+        self.exit("x2", "0xB2", [("L1", "0.001")])
+        self.assertEqual(self.remaining(), Decimal("0.002"))
+        self.assertEqual(VbtcV2BridgeExit.objects.get().exit_transaction.hash, "x1")
+
+    def test_failed_record_is_replaced_by_a_new_exit(self):
+        self.exit("x1", "b2", [("L1", "0.001")])
+        self.fail("f1", "b2", [("L1", "0.001")])
+        self.assertTrue(VbtcV2BridgeExit.objects.get().failed)
+        self.exit("x2", "b2", [("L1", "0.001")])
+        exit = VbtcV2BridgeExit.objects.get()
+        self.assertEqual(exit.exit_transaction.hash, "x2")
+        self.assertFalse(exit.failed)
+        self.assertEqual(self.remaining(), Decimal("0.002"))
+
+    def test_single_lock_exit_records_without_drawing(self):
+        self.tx("x1", T.VBTC_BRIDGE_EXIT_TO_BTC, "H", {
+            "ContractUID": "sc:a", "LockId": "L1", "Amount": 0.001, "AmountSats": 100000,
+            "BtcDestination": "bc1q", "BaseBurnTxHash": "b2",
+        })
+        exit = VbtcV2BridgeExit.objects.get()
+        self.assertEqual(exit.allocations[0]["LockId"], "L1")
+        self.assertEqual(self.remaining(), Decimal("0.003"))
+
+
+@TESTNET
+class BridgeExitBeforeRecordingTests(BridgeCase):
+    def test_second_exit_for_a_burn_draws_again(self):
+        # Below the recording height the node drew the locks before it found
+        # the record taken.
+        self.lock()
+        self.exit("x1", "b2", [("L1", "0.001")])
+        self.exit("x2", "b2", [("L1", "0.001")])
+        self.assertEqual(self.remaining(), Decimal("0.001"))
+        self.assertEqual(VbtcV2BridgeExit.objects.get().exit_transaction.hash, "x1")
+
+
+@TESTNET
+class BridgeIdentifierTests(BridgeCase):
+    def setUp(self):
+        super().setUp()
+        self.lock()
+
+    def test_a_burn_in_another_case_or_with_0x_is_the_same_burn(self):
+        self.pool_unlock("p1", "ab12", [("L1", "0.001")])
+        self.pool_unlock("p2", "0xAB12", [("L1", "0.001")], destination="E")
+        self.assertNotIn("E", self.addresses())
+
+    def test_lock_ids_are_trimmed(self):
+        self.pool_unlock("p1", "b1", [(" L1 ", "0.001")])
+        self.assertEqual(self.addresses()["D"], Decimal("0.001"))
+
+
+@TESTNET
+class ShieldPayloadBindingTests(BridgeCase):
+    def test_keys_bind_case_insensitively_and_the_version_defaults_to_one(self):
+        tx = make_tx(make_block(height=50), "sh1", T.VBTC_SHIELD, from_address="H", to_address="Shielded_Pool")
+        tx.data = json.dumps({"Asset": "VBTC:sc:a", "VBTC_UID": "sc:a", "Vbtc_Amt": 0.001})
+        tx.save(update_fields=["data"])
+        process_transaction(tx)
+        self.assertEqual(self.addresses()["H"], Decimal("0.003"))
