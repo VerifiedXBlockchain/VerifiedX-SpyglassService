@@ -132,3 +132,33 @@ class ReindexTokenFunctionsTests(TokenFunctionCase):
         self.assertIn("ERROR bad", err.getvalue())
         self.assertIn("skipped on error: 1", out.getvalue())
         self.assertEqual(self.balance("R"), Decimal(1))
+
+
+class TokenPauseTests(TokenFunctionCase):
+    """StateData.TokenPause flips the pause whatever the payload says."""
+
+    def pause(self, tx_hash, height, says):
+        tx = make_tx(make_block(height=height), tx_hash, T.FTKN_TX, from_address="O",
+                     data={"Function": "TokenPause()", "ContractUID": "ft:1", "FromAddress": "O", "Pause": says})
+        process_transaction(tx)
+        self.token.refresh_from_db()
+        return tx
+
+    def test_two_calls_in_a_row_pause_then_unpause(self):
+        self.pause("p1", 2, True)
+        self.assertTrue(self.token.is_paused)
+        self.pause("p2", 3, True)
+        self.assertFalse(self.token.is_paused)
+
+    def test_the_payloads_pause_flag_is_not_what_decides(self):
+        self.pause("p1", 2, False)
+        self.assertTrue(self.token.is_paused)
+
+    def test_a_reindex_lands_on_the_same_state(self):
+        self.pause("p1", 2, True)
+        self.pause("p2", 3, True)
+        self.pause("p3", 4, False)
+        call_command("reindex_token_functions", stdout=StringIO(), stderr=StringIO())
+        call_command("reindex_token_functions", stdout=StringIO(), stderr=StringIO())
+        self.token.refresh_from_db()
+        self.assertTrue(self.token.is_paused)

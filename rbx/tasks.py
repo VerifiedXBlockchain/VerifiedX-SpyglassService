@@ -13,7 +13,8 @@ from decimal import Decimal
 from typing import Optional
 import pytz
 from django.db import InterfaceError, InternalError, OperationalError
-from django.db.models import Q, Sum, F, Max
+from django.db.models import Q, Sum, F, Max, TextField
+from django.db.models.functions import Cast
 from django.db.transaction import atomic as atomic_transaction, on_commit
 from django.utils import timezone
 from api.block.serializers import BlockSerializer
@@ -511,6 +512,29 @@ def token_function_of(tx: Transaction):
     return function if function in TOKEN_FUNCTIONS else None
 
 
+def pause_calls_through(token, tx):
+    """The TokenPause() calls the node applied to token up to tx, tx
+    included: object payloads under a contract-call type, in block order
+    (by hash inside a block, as no order is stored)."""
+    candidates = (
+        Transaction.objects.filter(type__in=list(vbtc_dispatch.SC_ENVELOPE_TYPES), height__lte=tx.height)
+        .annotate(data_text=Cast("data", TextField()))
+        .filter(data_text__contains=token.sc_identifier)
+        .filter(data_text__contains="TokenPause()")
+    )
+    count = 0
+    for call in candidates.only("hash", "height", "data"):
+        if (call.height, call.hash) > (tx.height, tx.hash):
+            continue
+        payload = parse_object(call.data)
+        if (
+            net_string(field(payload, "Function")) == "TokenPause()"
+            and net_string(field(payload, "ContractUID")) == token.sc_identifier
+        ):
+            count += 1
+    return count
+
+
 def process_token_function(tx: Transaction):
     """A fungible-token function (TOKEN_FUNCTIONS), under whichever envelope
     type carries it: the node dispatches on Function for every one of them
@@ -581,8 +605,10 @@ def process_token_function(tx: Transaction):
         token.save()
 
     elif func == "TokenPause()":
-        token.is_paused = parsed["Pause"]
-        token.save()
+        # StateData.TokenPause flips the state whatever the payload's Pause
+        # says. Counted from the chain, so a re-index lands on the same state.
+        token.is_paused = pause_calls_through(token, tx) % 2 == 1
+        token.save(update_fields=["is_paused"])
     elif func == "TokenBanAddress()":
         address = parsed["BanAddress"]
         if address not in token.banned_addresses:
