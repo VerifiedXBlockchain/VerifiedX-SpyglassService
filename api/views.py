@@ -38,7 +38,8 @@ def network_metrics(request):
     nm = NetworkMetrics.load()
     if not nm:
         sync_network_metrics()
-    elif nm.created_at < timezone.now() - datetime.timedelta(seconds=10):
+    elif nm.created_at is None or nm.created_at < timezone.now() - datetime.timedelta(seconds=10):
+        # created_at stays unset until the node has answered with metrics.
         sync_network_metrics()
 
     data = {
