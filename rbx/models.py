@@ -1290,8 +1290,11 @@ class VbtcV2Token(models.Model):
             if not self._applied_before(t.transaction, before):
                 continue
             # A reserve owner's ownership transfer defers its settlement row
-            # with the transfer, whichever way the row runs.
-            if t.from_address.startswith("xRBX") or t.transaction.from_address.startswith("xRBX"):
+            # with the transfer, whichever way the row runs. A Recover()
+            # (type RESERVE) applies at once.
+            if t.transaction.type != Transaction.Type.RESERVE and (
+                t.from_address.startswith("xRBX") or t.transaction.from_address.startswith("xRBX")
+            ):
                 tx = t.transaction
                 if tx.voided_from_callback:
                     continue

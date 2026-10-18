@@ -19,6 +19,7 @@ from rbx.tests import add_transfer, add_withdrawal, make_block, make_token, make
 from rbx.vbtc_dispatch import (
     cancellation_uid_for,
     redirect_reserve_transfer,
+    apply_recovery,
     replaying,
     settle_pending_owners,
     void_reserve_transfer,
@@ -616,14 +617,14 @@ class ReserveTransferTests(TestCase):
 
         recovery = Recovery.objects.get(transaction__hash="rc1")
         self.assertEqual(recovery.new_address, "Recovered")
-        self.assertEqual(self.token.addresses["Recovered"], Decimal("0.002"))
+        self.assertEqual(self.token.addresses["Recovered"], Decimal("0.005"))  # the redirected send and the sweep of the rest
         self.assertEqual(Address.objects.filter(address="Recovered").count(), 1)
 
     def test_recovery_transaction_routes_to_the_redirect(self):
         self.recover()
         row = VbtcV2TokenTransfer.objects.get(transaction=self.tx)
         self.assertEqual(row.to_address, "Recovered")
-        self.assertEqual(self.token.addresses["Recovered"], Decimal("0.002"))
+        self.assertEqual(self.token.addresses["Recovered"], Decimal("0.005"))  # the redirected send and the sweep of the rest
 
     def test_replay_keeps_the_recipient_a_recovery_set(self):
         # A backfill replays the send and not the recovery that followed it.
@@ -632,7 +633,7 @@ class ReserveTransferTests(TestCase):
         with replaying():
             process_transaction(self.tx)
 
-        self.assertEqual(self.token.addresses["Recovered"], Decimal("0.002"))
+        self.assertEqual(self.token.addresses["Recovered"], Decimal("0.005"))  # the redirected send and the sweep of the rest
         self.assertNotIn("R", self.token.addresses)
 
     def test_second_pass_keeps_the_recipient_a_recovery_set(self):
@@ -640,7 +641,7 @@ class ReserveTransferTests(TestCase):
 
         process_transaction(self.tx)
 
-        self.assertEqual(self.token.addresses["Recovered"], Decimal("0.002"))
+        self.assertEqual(self.token.addresses["Recovered"], Decimal("0.005"))  # the redirected send and the sweep of the rest
         self.assertNotIn("R", self.token.addresses)
 
     def test_replay_corrects_a_reserve_send_no_recovery_moved(self):
@@ -1027,3 +1028,92 @@ class ReserveOwnershipTransferTests(TestCase):
         self.assertEqual(self.listed_for("Q"), {"sc:c"})
         token.refresh_from_db()
         self.assertEqual(token.owner_address, self.OWNER)
+
+
+@TESTNET
+class RecoveryOfVbtcTests(TestCase):
+    """Recover() gives the recovery address every vault the reserve owns,
+    a pending transfer of one included, and sweeps the reserve's vBTC on
+    every contract where it holds some (RecoverReserveAccountTx)."""
+
+    RESERVE = "xRBXres"
+
+    def setUp(self):
+        self.block = make_block()
+        self.held = make_token(owner="O", global_balance="0.01", sc_identifier="sc:held")
+        add_transfer(self.held, make_tx(self.block, "s1", Transaction.Type.VBTC_V2_TRANSFER), "O", self.RESERVE, "0.004")
+        self.owned = make_token(owner=self.RESERVE, global_balance="0.01", sc_identifier="sc:owned")
+        add_transfer(self.owned, make_tx(self.block, "s2", Transaction.Type.VBTC_V2_TRANSFER), self.RESERVE, "H", "0.003")
+        self.recovery = make_tx(
+            make_block(height=2), "rc1", Transaction.Type.RESERVE, from_address=self.RESERVE,
+            data={"Function": "Recover()", "RecoveryAddress": "Y"},
+        )
+
+    def recover(self):
+        process_transaction(self.recovery)
+        self.held.refresh_from_db()
+        self.owned.refresh_from_db()
+
+    def test_held_vbtc_is_swept_to_the_recovery_address(self):
+        self.recover()
+        self.assertEqual(self.held.addresses, {"O": Decimal("0.006"), "Y": Decimal("0.004")})
+        self.assertEqual(self.held.owner_address, "O")
+
+    def test_owned_vault_goes_to_the_recovery_address(self):
+        self.recover()
+        self.assertEqual(self.owned.owner_address, "Y")
+        self.assertEqual(self.owned.nft.owner_address, "Y")
+        self.assertEqual(self.owned.addresses, {"Y": Decimal("0.007"), "H": Decimal("0.003")})
+
+    def test_pending_transfer_of_an_owned_vault_never_takes_effect(self):
+        transfer = make_tx(
+            self.block, "ot1", Transaction.Type.NFT_TX, from_address=self.RESERVE, to_address="P",
+            data=[{"Function": "Transfer()", "ContractUID": "sc:owned"}],
+        )
+        transfer.unlock_time = timezone.now() + timedelta(hours=1)
+        transfer.save(update_fields=["unlock_time"])
+        process_transaction(transfer)
+
+        self.recover()
+        transfer.refresh_from_db()
+        self.assertTrue(transfer.voided_from_callback)
+        self.assertIsNone(self.owned.pending_owner_address)
+
+        transfer.unlock_time = timezone.now() - timedelta(minutes=1)
+        transfer.save(update_fields=["unlock_time"])
+        settle_pending_owners(make_block(height=3))
+        self.owned.refresh_from_db()
+        self.assertEqual(self.owned.owner_address, "Y")
+        self.assertEqual(self.owned.current_owner(), "Y")
+        self.assertEqual(self.owned.addresses, {"Y": Decimal("0.007"), "H": Decimal("0.003")})
+
+    def test_other_holders_are_untouched(self):
+        add_transfer(self.held, make_tx(self.block, "s3", Transaction.Type.VBTC_V2_TRANSFER), "O", "K", "0.001")
+        self.recover()
+        self.assertEqual(self.held.addresses["K"], Decimal("0.001"))
+        self.assertEqual(self.held.addresses["O"], Decimal("0.005"))
+
+    def test_reserve_with_nothing_left_writes_no_row(self):
+        add_transfer(self.held, make_tx(self.block, "s4", Transaction.Type.VBTC_V2_TRANSFER), self.RESERVE, "O", "0.004")
+        self.recover()
+        self.assertFalse(VbtcV2TokenTransfer.objects.filter(token=self.held, transaction=self.recovery).exists())
+
+    def test_replay_plans_the_same_rows(self):
+        self.recover()
+        rows = sorted(VbtcV2TokenTransfer.objects.filter(transaction=self.recovery).values_list("token__sc_identifier", "from_address", "to_address", "amount"))
+        # A backfill rebuilds the owners in order: at the recovery the reserve owns its vault again.
+        type(self.owned).objects.filter(pk=self.owned.pk).update(owner_address=self.RESERVE)
+        with replaying():
+            apply_recovery(self.recovery, "Y")
+        again = sorted(VbtcV2TokenTransfer.objects.filter(transaction=self.recovery).values_list("token__sc_identifier", "from_address", "to_address", "amount"))
+        self.assertEqual(rows, again)
+        self.owned.refresh_from_db()
+        self.assertEqual(self.owned.owner_address, "Y")
+
+    def test_backfill_replays_the_recovery(self):
+        from io import StringIO
+        out = StringIO()
+        call_command("reprocess_vbtc_v2", stdout=out)
+        self.held.refresh_from_db()
+        self.assertEqual(self.held.addresses, {"O": Decimal("0.006"), "Y": Decimal("0.004")})
+        self.assertIn("1 recovery transaction(s)", out.getvalue())

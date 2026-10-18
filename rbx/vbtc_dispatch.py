@@ -31,6 +31,8 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from decimal import Decimal
 
+from django.db.models import Q
+
 from rbx.models import (
     Block,
     Recovery,
@@ -289,7 +291,7 @@ def route_envelope(tx):
 KEEP_STORED = "keep the stored row"
 
 
-def planned_settlement(token, tx):
+def planned_settlement(token, tx, old_owner=None, new_owner=None):
     """The settlement row tx calls for: (from_address, to_address, amount),
     None when it calls for no row, or KEEP_STORED.
 
@@ -306,8 +308,8 @@ def planned_settlement(token, tx):
     The block cannot hold a second Transfer() of the contract: the node
     checks each against the owner before the block
     (TransactionValidatorService.cs:981)."""
-    old_owner = tx.from_address
-    new_owner = tx.to_address
+    old_owner = tx.from_address if old_owner is None else old_owner
+    new_owner = tx.to_address if new_owner is None else new_owner
     if not old_owner or old_owner == new_owner:
         return None
     stored = VbtcV2TokenTransfer.objects.filter(token=token, transaction=tx).exists()
@@ -329,27 +331,7 @@ def apply_ownership_transfer(token, tx):
     (see planned_settlement), rewritten on replay so that a backfill corrects
     a row an earlier run got wrong."""
     new_owner = tx.to_address
-    plan = planned_settlement(token, tx)
-    if plan is KEEP_STORED:
-        logging.warning(
-            f"V2 ownership transfer {tx.hash} ({token.sc_identifier}): the order "
-            f"of this transfer and other activity on the contract around block "
-            f"{tx.height} is not stored; the settlement is left as it is stored."
-        )
-    elif plan is None:
-        VbtcV2TokenTransfer.objects.filter(token=token, transaction=tx).delete()
-    else:
-        from_address, to_address, amount = plan
-        VbtcV2TokenTransfer.objects.update_or_create(
-            token=token,
-            transaction=tx,
-            defaults={
-                "from_address": from_address,
-                "to_address": to_address,
-                "amount": amount,
-                "created_at": tx.date_crafted,
-            },
-        )
+    _write_settlement(token, tx, planned_settlement(token, tx), "V2 ownership transfer")
     if is_reserve_address(tx.from_address):
         # The node marks the recipient as next owner and moves the owner only
         # when the transfer unlocks without a callback (settle_pending_owners).
@@ -373,6 +355,29 @@ def apply_ownership_transfer(token, tx):
             _move_owner(token, new_owner, tx)
         return
     _move_owner(token, new_owner, tx)
+
+
+def _write_settlement(token, tx, plan, what):
+    if plan is KEEP_STORED:
+        logging.warning(
+            f"{what} {tx.hash} ({token.sc_identifier}): the order "
+            f"of this transaction and other activity on the contract around block "
+            f"{tx.height} is not stored; the settlement is left as it is stored."
+        )
+    elif plan is None:
+        VbtcV2TokenTransfer.objects.filter(token=token, transaction=tx).delete()
+    else:
+        from_address, to_address, amount = plan
+        VbtcV2TokenTransfer.objects.update_or_create(
+            token=token,
+            transaction=tx,
+            defaults={
+                "from_address": from_address,
+                "to_address": to_address,
+                "amount": amount,
+                "created_at": tx.date_crafted,
+            },
+        )
 
 
 def _called_back_on_chain(tx):
@@ -472,6 +477,55 @@ def void_reserve_transfer(original_tx):
         original_tx.save(update_fields=["voided_from_callback"])
 
 
+
+
+def apply_recovery(tx, recovery_address):
+    """Recover() of a reserve account, after its in-flight sends have been
+    redirected (redirect_reserve_transfer). The node (RecoverReserveAccountTx)
+    gives every contract the reserve owns to the recovery address, a pending
+    Transfer() of one included, and then sweeps the reserve's vBTC on every
+    contract where it holds some to the recovery address.
+
+    Spyglass writes one row per contract for tx, from the ledger as it stood
+    at tx: the ownership settlement (planned_settlement) for a vault the
+    reserve owns, the reserve's whole entry for one it only holds. A replay
+    (reprocess_vbtc_v2 rebuilds the owners in order) plans the same rows."""
+    reserve = tx.from_address
+    if not is_reserve_address(reserve) or not recovery_address or recovery_address == reserve:
+        return
+
+    for token in VbtcV2Token.objects.filter(
+        pending_owner_transaction__from_address=reserve
+    ).select_related("pending_owner_transaction"):
+        pending_tx = token.pending_owner_transaction
+        if not pending_tx.voided_from_callback:
+            # Recovered, not applied: the transfer never takes effect, and
+            # its settlement row is never counted.
+            pending_tx.voided_from_callback = True
+            pending_tx.save(update_fields=["voided_from_callback"])
+        _clear_pending_owner(token)
+
+    owned = list(VbtcV2Token.objects.filter(owner_address=reserve))
+    for token in owned:
+        plan = planned_settlement(token, tx, old_owner=reserve, new_owner=recovery_address)
+        _write_settlement(token, tx, plan, "Recover()")
+        _move_owner(token, recovery_address, tx)
+
+    held = (
+        VbtcV2Token.objects.filter(
+            Q(vbtcv2tokentransfer__from_address=reserve) | Q(vbtcv2tokentransfer__to_address=reserve)
+        )
+        .exclude(pk__in=[token.pk for token in owned])
+        .distinct()
+    )
+    for token in held:
+        entry = token.ledger_entries(before=tx).get(reserve, Decimal(0))
+        if entry > 0:
+            _write_settlement(token, tx, (reserve, recovery_address, entry), "Recover()")
+        else:
+            VbtcV2TokenTransfer.objects.filter(token=token, transaction=tx).delete()
+
+
 def redirect_reserve_transfer(original_tx, recovery_address, recovered_at):
     """Recover() with a pending reserve vBTC send in flight: the node applies
     the pair to the recovery address immediately (StateData.cs:1202-1222).
@@ -482,6 +536,14 @@ def redirect_reserve_transfer(original_tx, recovery_address, recovered_at):
     )
     original_tx.unlock_time = recovered_at
     original_tx.save(update_fields=["unlock_time"])
+
+
+def recovery_address_of(tx):
+    """The RecoveryAddress of a Recover() (type RESERVE), else None."""
+    payload = decode_data(tx.data)
+    if net_string(field(payload, "Function")) != "Recover()":
+        return None
+    return net_string(field(payload, "RecoveryAddress"))
 
 
 # --- withdrawal requests (type 27) -----------------------------------------

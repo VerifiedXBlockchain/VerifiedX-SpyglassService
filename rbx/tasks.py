@@ -890,6 +890,8 @@ def process_transaction(tx: Transaction):
                     nft.owner_address = new_address
                     nft.save()
 
+            vbtc_dispatch.apply_recovery(tx, new_address)
+
             recovery = Recovery(
                 original_address=original_address,
                 new_address=new_address,

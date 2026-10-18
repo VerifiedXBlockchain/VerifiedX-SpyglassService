@@ -10,7 +10,9 @@ from rbx.vbtc_dispatch import (
     OWNERSHIP_TRANSFER_FUNCTION,
     OWNERSHIP_TRANSFER_TYPES,
     SC_ENVELOPE_TYPES,
+    apply_recovery,
     planned_settlement,
+    recovery_address_of,
     replaying,
 )
 from rbx.vbtc_gates import field, net_string, parse_envelope
@@ -88,18 +90,31 @@ class Command(BaseCommand):
             if envelope_hashes:
                 selected |= Q(hash__in=envelope_hashes)
 
+        # Recover() moves the vaults a reserve owns and sweeps its vBTC; only
+        # that part is replayed (the rest of the RESERVE handler is not
+        # idempotent).
+        recoveries = set()
+        if not tx_type:
+            for tx in Transaction.objects.filter(type=Transaction.Type.RESERVE).only("hash", "data"):
+                if recovery_address_of(tx):
+                    recoveries.add(tx.hash)
+            if recoveries:
+                selected |= Q(hash__in=recoveries)
+
         # Block by block. The order inside a block is not stored, so an
-        # ownership transfer goes last in its block: the rows it has to see
-        # to know that it shares the block are back in the table by then.
+        # ownership transfer or a recovery goes last in its block: the rows
+        # it has to see to know that it shares the block are back in the
+        # table by then.
         txs = sorted(
             Transaction.objects.filter(selected),
-            key=lambda tx: (tx.height, tx.hash in ownership_transfers, tx.hash),
+            key=lambda tx: (tx.height, tx.hash in ownership_transfers or tx.hash in recoveries, tx.hash),
         )
         count = len(txs)
 
         self.stdout.write(
             f"Found {count} transaction(s) to reprocess "
-            f"({len(envelope_hashes)} envelope transaction(s) included)."
+            f"({len(envelope_hashes)} envelope transaction(s) included, "
+            f"{len(recoveries)} recovery transaction(s))."
         )
 
         if dry_run:
@@ -119,7 +134,10 @@ class Command(BaseCommand):
                     self.stdout.write(
                         f"Processing {tx.hash} (type={tx.type}, height={tx.height})..."
                     )
-                    process_transaction(tx)
+                    if tx.hash in recoveries:
+                        apply_recovery(tx, recovery_address_of(tx))
+                    else:
+                        process_transaction(tx)
                     processed += 1
                 except Exception as e:
                     errors += 1
