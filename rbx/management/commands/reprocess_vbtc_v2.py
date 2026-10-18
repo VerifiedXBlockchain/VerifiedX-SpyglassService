@@ -17,6 +17,7 @@ from rbx.vbtc_dispatch import (
     maturity_heights,
     settle_matured_reserve_sends,
     planned_settlement,
+    reconcile_all_watched_vaults,
     recovery_address_of,
     replaying,
 )
@@ -200,6 +201,10 @@ class Command(BaseCommand):
                     self.stderr.write(f"  ERROR processing {tx.hash}: {e}")
 
             judge_through(float("inf"))
+
+        if not tx_type:
+            # The outcomes of watched vaults' withdrawals come from the node.
+            reconcile_all_watched_vaults()
 
         self.stdout.write(
             f"Done. Processed: {processed}, Errors: {errors}, Total: {count}"

@@ -2,6 +2,7 @@ from time import sleep
 from django.core.management.base import BaseCommand
 from btc.btc_client import BtcClient
 from rbx.models import VbtcV2Token
+from rbx.vbtc_dispatch import reconcile_all_watched_vaults
 from tqdm import tqdm
 
 """
@@ -38,3 +39,7 @@ class Command(BaseCommand):
                 # what keeps us off their ban lists in the first place.
                 sleep(2)
                 progress.update()
+
+        # An expiry or a release closes a watched vault's withdrawal with no
+        # transaction to announce it: the sweep asks the node.
+        reconcile_all_watched_vaults()

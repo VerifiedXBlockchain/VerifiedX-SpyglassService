@@ -14,7 +14,7 @@ import json
 import uuid
 from phonenumber_field.modelfields import PhoneNumberField
 from django.contrib.postgres.fields import ArrayField
-from rbx.vbtc_gates import escrow_applies, field, net_string, parse_envelope
+from rbx.vbtc_gates import bitcoin_attestation_record_height, escrow_applies, field, net_string, parse_envelope
 from rbx import forged_vfx_burn
 
 # class MasterNodeManager(models.Manager):
@@ -193,6 +193,11 @@ class Transaction(models.Model):
         VBTC_BRIDGE_EXIT_TO_BTC = 40
         VBTC_BRIDGE_EXIT_TO_BTC_COMPLETE = 41
         VBTC_BRIDGE_EXIT_TO_BTC_FAIL = 42
+        # Bitcoin facts in consensus (VerifiedXCore/Models/Transaction.cs).
+        VBTC_V2_BTC_REPORT = 43
+        VBTC_V2_COIN_PIN = 44
+        VBTC_V2_BTC_REORG = 45
+        VBTC_V2_VAULT_REKEY = 46
 
     # The types whose Amount Core credits to the recipient (StateData for TX, PrivateTxLedgerService for a VFX
     # unshield). Every other type's Amount leaves the sender and is credited to no one.
@@ -349,6 +354,14 @@ class Transaction(models.Model):
             return "vBTC Bridge Exit to BTC Complete"
         if self.type == Transaction.Type.VBTC_BRIDGE_EXIT_TO_BTC_FAIL:
             return "vBTC Bridge Exit to BTC Failed"
+        if self.type == Transaction.Type.VBTC_V2_BTC_REPORT:
+            return "vBTC Bitcoin Report"
+        if self.type == Transaction.Type.VBTC_V2_COIN_PIN:
+            return "vBTC Withdrawal Fee Bump"
+        if self.type == Transaction.Type.VBTC_V2_BTC_REORG:
+            return "vBTC Bitcoin Rewind"
+        if self.type == Transaction.Type.VBTC_V2_VAULT_REKEY:
+            return "vBTC Vault Rekey"
 
         return f"{self.type}"
 
@@ -1201,6 +1214,15 @@ class VbtcV2Token(models.Model):
     def __str__(self):
         return f"{self.sc_identifier} ({self.deposit_address})"
 
+    @property
+    def is_watched(self):
+        """Whether the chain watches this vault's Bitcoin: Core registers a
+        vault created from the recording height on (BtcAttestApply
+        .RegisterVaultIfAny). Its withdrawals settle from Bitcoin reports,
+        read from the node (vbtc_dispatch.reconcile_watched_withdrawals)."""
+        mint = self.nft.mint_transaction if self.nft_id else None
+        return mint is not None and mint.height >= bitcoin_attestation_record_height()
+
     def pending_owner_settled(self, as_of=None):
         """Whether the pending reserve transfer has taken effect at as_of
         (default now): its unlock time is before as_of, as the node settles
@@ -1322,12 +1344,16 @@ class VbtcV2Token(models.Model):
         for w in self._requests(before):
             status = self._status(w, before)
             if escrow_applies(w.request_transaction.height):
-                debit = status != VbtcV2WithdrawalRequest.Status.CANCELLED
+                if status != VbtcV2WithdrawalRequest.Status.CANCELLED:
+                    debit = w.amount
+                else:
+                    # A release refunds its amount less its Bitcoin fee.
+                    debit = w.release_fee
             else:
-                debit = status == VbtcV2WithdrawalRequest.Status.COMPLETED
+                debit = w.amount if status == VbtcV2WithdrawalRequest.Status.COMPLETED else Decimal(0)
             if debit:
                 entries[w.requestor_address] = (
-                    entries.get(w.requestor_address, Decimal(0)) - w.amount
+                    entries.get(w.requestor_address, Decimal(0)) - debit
                 )
 
         return entries
@@ -1431,8 +1457,9 @@ class VbtcV2Token(models.Model):
                 # refunds after the handover is not the incoming owner's to
                 # cover: the node credits the refund to the requestor, and the
                 # owner's balance is the backing less every other holder's
-                # entry. The handover settles as if it had never been placed.
-                pending -= w.amount
+                # entry. The handover settles as if it had never been placed,
+                # less a release's Bitcoin fee, which stays the requestor's.
+                pending -= w.amount - w.release_fee
         return self.ledger_entries(before).get(address, Decimal(0)) - pending
 
     def ownership_transfers(self, since_height=0):
@@ -1503,6 +1530,12 @@ class VbtcV2Token(models.Model):
         total_withdrawn = VbtcV2WithdrawalRequest.objects.filter(
             token=self, status=VbtcV2WithdrawalRequest.Status.COMPLETED
         ).aggregate(total=Sum("amount"))["total"] or Decimal(0)
+        # The Bitcoin fee of a release left the vault and was charged to its
+        # requester (Core's ReleaseFeeSats in OwnerAddBackBtc).
+        for w in VbtcV2WithdrawalRequest.objects.filter(
+            token=self, status=VbtcV2WithdrawalRequest.Status.CANCELLED, refunded_amount__isnull=False
+        ):
+            total_withdrawn += w.release_fee
 
         # Owner anchor = global_balance (actual BTC on deposit) + total_withdrawn
         owner = self.current_owner()
@@ -1748,6 +1781,15 @@ class VbtcV2WithdrawalRequest(models.Model):
     created_at = models.DateTimeField()
     completed_at = models.DateTimeField(blank=True, null=True)
     cancelled_at = models.DateTimeField(blank=True, null=True)
+    # What a closed request gave back, when the node refunded less than its
+    # amount (a release keeps its Bitcoin fee). Null: the whole amount.
+    refunded_amount = models.DecimalField(decimal_places=16, max_digits=32, blank=True, null=True)
+
+    @property
+    def release_fee(self):
+        if self.refunded_amount is None:
+            return Decimal(0)
+        return max(self.amount - self.refunded_amount, Decimal(0))
 
     def __str__(self):
         return f"{self.token.sc_identifier} withdrawal [{self.status}]"

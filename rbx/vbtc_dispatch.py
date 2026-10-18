@@ -805,6 +805,11 @@ def apply_complete(tx):
     token = _token(sc_uid, tx, what)
     if token is None:
         return
+    if token.is_watched:
+        # StateData.CompleteVBTCV2Withdrawal: a watched vault's withdrawals
+        # are completed by the Bitcoin report that shows their transaction.
+        logging.warning(f"{what} {tx.hash}: {sc_uid} is completed by Bitcoin, not by this transaction.")
+        return
     withdrawal = _request_for(token, request_hash)
     if withdrawal is None:
         logging.error(
@@ -867,6 +872,9 @@ def apply_cancel(tx):
             f"{withdrawal.requestor_address}; the node ignores it."
         )
         return
+    if token.is_watched:
+        _close_watched_on_cancel(tx, what, withdrawal)
+        return
     if vbtc_cancellation.rules_active(tx.height):
         _apply_cancel_by_rules(tx, what, withdrawal)
         return
@@ -886,6 +894,114 @@ def apply_cancel(tx):
         )
         return
     _record_cancel(tx, what, withdrawal)
+
+
+def _close_watched_on_cancel(tx, what, withdrawal):
+    """BtcWithdrawals: on a watched vault a cancel closes the request at
+    once and refunds it, with no vote; admission refuses one unless the
+    request is still waiting, so a mined one closed it."""
+    if withdrawal.status in VbtcV2WithdrawalRequest.TERMINAL_STATUSES:
+        if withdrawal.cancel_transaction_id != tx.hash:
+            logging.error(f"{what} {tx.hash}: withdrawal {withdrawal.pk} is already {withdrawal.status}.")
+        return
+    withdrawal.status = VbtcV2WithdrawalRequest.Status.CANCELLED
+    withdrawal.cancel_transaction = tx
+    withdrawal.cancelled_at = tx.date_crafted
+    withdrawal.refunded_amount = None
+    withdrawal.save(update_fields=["status", "cancel_transaction", "cancelled_at", "refunded_amount"])
+    withdrawal.token.recompute_pending_withdrawal()
+    _replan_settlements_since(withdrawal.token, withdrawal.request_transaction)
+
+
+def reconcile_watched_withdrawals(token):
+    """A watched vault's open requests take their outcome from the node's
+    GetWithdrawalHistory, which reads the tables every node writes from
+    blocks. Paid: COMPLETED with the Bitcoin txid and the report that
+    completed it. Closed without payment: CANCELLED at the closing block,
+    with the refund the node gave. A row whose report or closing block is
+    not indexed yet waits for the next pass. A node that does not answer
+    changes nothing. Returns the number of rows settled."""
+    from rbx.client import get_vbtc_v2_withdrawal_history
+
+    open_rows = {
+        w.request_transaction_id: w
+        for w in token.withdrawal_requests.filter(status__in=VbtcV2WithdrawalRequest.ACTIVE_STATUSES)
+        .select_related("request_transaction")
+    }
+    if not open_rows:
+        return 0
+    data = get_vbtc_v2_withdrawal_history(token.sc_identifier)
+    paid = data.get("WithdrawalHistory") if isinstance(data, dict) else None
+    closed = data.get("Refunded") if isinstance(data, dict) else None
+    if not isinstance(data, dict) or not data.get("Success") or not isinstance(paid, list) or not isinstance(closed, list):
+        logging.error(
+            f"Watched vault {token.sc_identifier}: no withdrawal history from the node "
+            f"({data.get('Message') if isinstance(data, dict) else data!r}); its open withdrawals are left as they are."
+        )
+        return 0
+
+    settled = 0
+    replan_from = None
+    for entry in paid:
+        withdrawal = open_rows.get(entry.get("RequestHash")) if isinstance(entry, dict) else None
+        if withdrawal is None:
+            _log_unknown(token, entry)
+            continue
+        report = Transaction.objects.filter(hash=entry.get("CompletionHash") or "").first()
+        txid = entry.get("BTCTransactionHash")
+        if report is None or not txid:
+            continue
+        withdrawal.status = VbtcV2WithdrawalRequest.Status.COMPLETED
+        withdrawal.btc_transaction_hash = txid
+        withdrawal.completion_transaction = report
+        withdrawal.completed_at = report.date_crafted
+        withdrawal.save(update_fields=["status", "btc_transaction_hash", "completion_transaction", "completed_at"])
+        settled += 1
+    for entry in closed:
+        withdrawal = open_rows.get(entry.get("RequestHash")) if isinstance(entry, dict) else None
+        if withdrawal is None:
+            _log_unknown(token, entry)
+            continue
+        if withdrawal.status in VbtcV2WithdrawalRequest.TERMINAL_STATUSES:
+            continue
+        closed_at = entry.get("ClosedAtBlock")
+        block = Block.objects.filter(height=closed_at).first() if closed_at is not None else None
+        refunded = net_decimal(entry.get("Refunded"))
+        if block is None or refunded is None:
+            continue
+        withdrawal.status = VbtcV2WithdrawalRequest.Status.CANCELLED
+        withdrawal.cancelled_at = block.date_crafted
+        withdrawal.refunded_amount = refunded
+        withdrawal.save(update_fields=["status", "cancelled_at", "refunded_amount"])
+        settled += 1
+        if replan_from is None or withdrawal.request_transaction.height < replan_from.height:
+            replan_from = withdrawal.request_transaction
+    if settled:
+        token.recompute_pending_withdrawal()
+    if replan_from is not None:
+        _replan_settlements_since(token, replan_from)
+    return settled
+
+
+def _log_unknown(token, entry):
+    if not isinstance(entry, dict):
+        logging.error(f"Watched vault {token.sc_identifier}: unreadable withdrawal history entry {entry!r}.")
+        return
+    request = entry.get("RequestHash")
+    if not token.withdrawal_requests.filter(request_transaction_id=request).exists():
+        logging.error(f"Watched vault {token.sc_identifier}: the node lists request {request}, which Spyglass does not hold.")
+
+
+def reconcile_all_watched_vaults():
+    """Every watched vault with an open request."""
+    settled = 0
+    tokens = VbtcV2Token.objects.filter(
+        withdrawal_requests__status__in=VbtcV2WithdrawalRequest.ACTIVE_STATUSES
+    ).distinct()
+    for token in tokens:
+        if token.is_watched:
+            settled += reconcile_watched_withdrawals(token)
+    return settled
 
 
 def _record_cancel(tx, what, withdrawal):

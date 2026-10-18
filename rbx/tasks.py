@@ -479,6 +479,8 @@ UNINDEXED_TX_TYPES = frozenset(
         Transaction.Type.VFX_UNSHIELD,
         Transaction.Type.VFX_PRIVATE_TRANSFER,
         Transaction.Type.VBTC_PRIVATE_TRANSFER,
+        # A fee bump moves no balance.
+        Transaction.Type.VBTC_V2_COIN_PIN,
     }
 )
 
@@ -1170,6 +1172,15 @@ def process_transaction(tx: Transaction):
 
     elif tx.type == Transaction.Type.VBTC_V2_WITHDRAWAL_CANCEL:
         vbtc_dispatch.apply_cancel(tx)
+
+    elif tx.type in (
+        Transaction.Type.VBTC_V2_BTC_REPORT,
+        Transaction.Type.VBTC_V2_BTC_REORG,
+        Transaction.Type.VBTC_V2_VAULT_REKEY,
+    ):
+        # Bitcoin moved in consensus: the watched vaults' open withdrawals
+        # take their outcome from the node.
+        vbtc_dispatch.reconcile_all_watched_vaults()
 
     elif tx.type == Transaction.Type.VBTC_V2_WITHDRAWAL_VOTE:
         vbtc_dispatch.apply_vote(tx)

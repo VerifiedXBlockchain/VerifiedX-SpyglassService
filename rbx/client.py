@@ -1232,6 +1232,13 @@ def _vbtc_v2_request(method, path, payload=None, timeout=30):
     return result
 
 
+def get_vbtc_v2_withdrawal_history(sc_uid: str):
+    """A vault's withdrawals as the chain settled them: paid (WithdrawalHistory,
+    with the Bitcoin txid and the report that completed each) and closed
+    without payment (Refunded, with the refund and the closing block)."""
+    return _vbtc_v2_request("get", f"vbtcapi/vbtc/GetWithdrawalHistory/{sc_uid}")
+
+
 # MPC Ceremony (DKG)
 
 def prepare_vbtc_v2_ceremony(owner_address: str):
