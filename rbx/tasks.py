@@ -848,7 +848,9 @@ def process_transaction(tx: Transaction):
                     & Q(voided_from_callback=False)
                     & Q(
                         Q(unlock_time__isnull=False)
-                        & Q(unlock_time__gt=tx.date_crafted)
+                        # Still pending at the recovery's second: the node
+                        # settles a send only in a block stamped after it.
+                        & Q(unlock_time__gte=tx.date_crafted)
                     )
                 )
             )

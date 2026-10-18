@@ -1460,11 +1460,7 @@ class VbtcV2Token(models.Model):
         def before_tx(event):
             return event.pk != tx.pk and (event.height, event.hash) < (tx.height, tx.hash)
 
-        recoveries = (
-            Transaction.objects.filter(type=Transaction.Type.RESERVE, height__lte=tx.height)
-            .annotate(data_text=Cast("data", models.TextField()))
-            .filter(data_text__contains="Recover()")
-        )
+        recoveries = Transaction.objects.filter(type=Transaction.Type.RESERVE, height__lte=tx.height)
         events = sorted(
             [e for e in self.ownership_transfers() if before_tx(e)]
             + [e for e in recoveries if before_tx(e) and recovery_address_of(e)],

@@ -630,6 +630,17 @@ class ReserveTransferTests(TestCase):
         self.assertEqual(self.token.addresses["Recovered"], Decimal("0.005"))  # the redirected send and the sweep of the rest
         self.assertEqual(Address.objects.filter(address="Recovered").count(), 1)
 
+    def test_send_unlocking_at_the_recovery_second_is_redirected(self):
+        recovery = make_tx(
+            self.block, "rc1", Transaction.Type.RESERVE, from_address="xRBXreserve",
+            data={"Function": "Recover()", "RecoveryAddress": "Recovered"},
+        )
+        self.tx.unlock_time = recovery.date_crafted
+        self.tx.save(update_fields=["unlock_time"])
+        process_transaction(recovery)
+        self.assertEqual(VbtcV2TokenTransfer.objects.get(transaction=self.tx).to_address, "Recovered")
+        self.assertNotIn("R", self.token.addresses)
+
     def test_recovery_transaction_routes_to_the_redirect(self):
         self.recover()
         row = VbtcV2TokenTransfer.objects.get(transaction=self.tx)
@@ -1160,8 +1171,11 @@ class RecoveryOfVbtcTests(TestCase):
             self.block, "ot1", Transaction.Type.NFT_TX, from_address=self.RESERVE, to_address="P",
             data=[{"Function": "Transfer()", "ContractUID": "sc:owned"}],
         )
-        transfer.unlock_time = timezone.now() + timedelta(hours=1)
+        # Unlocked before the recovery's block, which is the first stamped
+        # after the unlock: the recovery came before the transfer applied.
+        transfer.unlock_time = self.block.date_crafted
         transfer.save(update_fields=["unlock_time"])
+        self.assertGreater(self.recovery.block.date_crafted, transfer.unlock_time)
         type(self.owned).objects.filter(pk=self.owned.pk).update(owner_address="P")
         call_command("reprocess_vbtc_v2", stdout=StringIO())
         self.owned.refresh_from_db()
@@ -1169,6 +1183,7 @@ class RecoveryOfVbtcTests(TestCase):
         self.assertTrue(transfer.voided_from_callback)
         self.assertEqual(self.owned.owner_address, "Y")
         self.assertEqual(self.owned.current_owner(), "Y")
+        self.assertEqual(self.owned.addresses, {"Y": Decimal("0.007"), "H": Decimal("0.003")})
 
 
 @TESTNET
