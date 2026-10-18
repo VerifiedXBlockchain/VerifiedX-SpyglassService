@@ -1,3 +1,5 @@
+import logging
+
 from tqdm import tqdm
 from django.db.models import Q, Sum
 from django.core.management.base import BaseCommand
@@ -71,14 +73,24 @@ def fix_blocks(heights):
     transaction the bridge state is rebuilt from every bridge transaction."""
     bridge = list(BRIDGE_TYPES)
     touched = Transaction.objects.filter(height__in=heights, type__in=bridge).exists()
+    sync_error = None
     try:
         for h in heights:
             print(f"Fixing {h}")
             Transaction.objects.filter(height=h).delete()
             sync_block(h)
-    finally:
-        # Also when a sync fails partway: the blocks already synced again
-        # would otherwise keep their second draws.
-        if touched or Transaction.objects.filter(height__in=heights, type__in=bridge).exists():
-            print("Rebuilding the vBTC bridge state")
+    except Exception as e:
+        sync_error = e
+    # Also when a sync failed partway: the blocks already synced again would
+    # otherwise keep their second draws.
+    if touched or Transaction.objects.filter(height__in=heights, type__in=bridge).exists():
+        print("Rebuilding the vBTC bridge state")
+        try:
             rebuild_bridge_state()
+        except Exception:
+            logging.exception("Rebuilding the vBTC bridge state failed")
+            if sync_error is None:
+                raise
+            logging.error("The re-sync had failed first; that error follows.")
+    if sync_error is not None:
+        raise sync_error

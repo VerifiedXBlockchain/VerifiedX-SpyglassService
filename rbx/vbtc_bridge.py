@@ -69,7 +69,7 @@ SHIELD_TYPES = frozenset({Transaction.Type.VBTC_SHIELD, Transaction.Type.VBTC_UN
 BRIDGE_STATE_LOCK = 0x76627463  # "vbtc"
 
 
-def _lock_bridge_state():
+def lock_bridge_state():
     """Held to the end of the enclosing transaction: a rebuild and a block
     sync never write the bridge state at the same time."""
     if connection.vendor == "postgresql":
@@ -83,7 +83,7 @@ def route(tx):
     if handler is None:
         return False
     with atomic():
-        _lock_bridge_state()
+        lock_bridge_state()
         moves = handler(tx) or {}
         _write_moves(tx, moves)
     return True
@@ -169,14 +169,15 @@ def rebuild_bridge_state():
     transaction again, in the chain's order where it matters. For a block
     synced again (validate_transactions --fix): the locks of earlier blocks
     would otherwise keep what the deleted transactions drew."""
-    txs = list(Transaction.objects.filter(type__in=list(BRIDGE_TYPES | SHIELD_TYPES)))
-    txs, unresolved = in_chain_order(txs, shared_bridge_blocks(txs), lambda tx: (tx.hash,))
-    for height in unresolved:
-        logging.warning(f"Bridge state rebuilt with block {height} in hash order; the node gave no order.")
-    # One transaction under the bridge lock: a block synced meanwhile waits
-    # for the rebuild instead of finding the state half built.
+    # One transaction under the bridge lock, the transactions read inside
+    # it: a block synced meanwhile either committed before the lock and is
+    # replayed, or waits for the rebuild.
     with atomic():
-        _lock_bridge_state()
+        lock_bridge_state()
+        txs = list(Transaction.objects.filter(type__in=list(BRIDGE_TYPES | SHIELD_TYPES)))
+        txs, unresolved = in_chain_order(txs, shared_bridge_blocks(txs), lambda tx: (tx.hash,))
+        for height in unresolved:
+            logging.warning(f"Bridge state rebuilt with block {height} in hash order; the node gave no order.")
         reset_bridge_state()
         for tx in txs:
             route(tx)

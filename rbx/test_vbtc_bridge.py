@@ -418,6 +418,7 @@ class BridgeResyncFailureTests(BridgeCase):
                 patch("rbx.client.get_block", return_value=None):
             with self.assertRaises(RuntimeError):
                 fix_blocks([unlock.height, other.height])
+        self.assertEqual(VbtcV2BridgeLock.objects.get(lock_id="L1").unlocked_amount, Decimal("0.002"))
         self.assertEqual(self.remaining(), Decimal("0.001"))
         self.assertEqual(self.addresses()["D"], Decimal("0.002"))
 
@@ -433,3 +434,47 @@ class ChainOrderTests(TestCase):
             ordered, unresolved = in_chain_order(txs, [5], lambda tx: (tx.hash,), last=lambda tx: tx.hash == "own")
         self.assertEqual([tx.hash for tx in ordered], ["pb", "pa", "own"])
         self.assertEqual(unresolved, [])
+
+
+@TESTNET
+class BridgeRebuildRaceTests(BridgeCase):
+    def setUp(self):
+        super().setUp()
+        self.lock()
+
+    def committed_while_waiting_for_the_lock(self):
+        """Stands in for a block the live sync commits just before the
+        rebuild gets the bridge lock."""
+        from rbx import vbtc_bridge
+
+        real = vbtc_bridge.lock_bridge_state
+        done = []
+
+        def lock_then_commit():
+            if not done:
+                done.append(True)
+                make_tx(make_block(height=70), "late", T.VBTC_BRIDGE_POOL_UNLOCK, from_address="Caster", to_address="Caster", data={
+                    "TotalAmount": 0.001, "TotalAmountSats": 100000, "VfxDestinationAddress": "Late",
+                    "ExitBurnTxHash": "burn-late", "Allocations": [{"LockId": "L1", "UnlockAmount": 0.001}],
+                })
+            real()
+
+        return patch("rbx.vbtc_bridge.lock_bridge_state", side_effect=lock_then_commit)
+
+    def test_rebuild_replays_a_pool_unlock_committed_before_it_took_the_lock(self):
+        from rbx.vbtc_bridge import rebuild_bridge_state
+
+        with self.committed_while_waiting_for_the_lock(), patch("rbx.client.get_block", return_value=None):
+            rebuild_bridge_state()
+        self.assertEqual(self.addresses()["Late"], Decimal("0.001"))
+        self.assertEqual(self.remaining(), Decimal("0.002"))
+
+    def test_backfill_reads_the_transactions_under_the_lock(self):
+        with patch("rbx.management.commands.reprocess_vbtc_v2.lock_bridge_state") as lock:
+            lock.side_effect = lambda: make_tx(
+                make_block(height=71), "late", T.VBTC_BRIDGE_POOL_UNLOCK, from_address="Caster", to_address="Caster", data={
+                    "TotalAmount": 0.001, "TotalAmountSats": 100000, "VfxDestinationAddress": "Late",
+                    "ExitBurnTxHash": "burn-late", "Allocations": [{"LockId": "L1", "UnlockAmount": 0.001}],
+                })
+            call_command("reprocess_vbtc_v2", stdout=StringIO(), stderr=StringIO())
+        self.assertEqual(self.addresses()["Late"], Decimal("0.001"))

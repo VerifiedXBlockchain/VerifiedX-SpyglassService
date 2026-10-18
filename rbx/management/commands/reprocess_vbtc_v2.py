@@ -1,5 +1,6 @@
 from django.core.management.base import BaseCommand
 from django.db.models import Q
+from django.db.transaction import atomic
 
 from rbx.models import Transaction, VbtcV2Token
 from rbx.tasks import process_transaction
@@ -16,7 +17,14 @@ from rbx.vbtc_dispatch import (
     recovery_address_of,
     replaying,
 )
-from rbx.vbtc_bridge import BRIDGE_TYPES, SHIELD_TYPES, in_chain_order, reset_bridge_state, shared_bridge_blocks
+from rbx.vbtc_bridge import (
+    BRIDGE_TYPES,
+    SHIELD_TYPES,
+    in_chain_order,
+    lock_bridge_state,
+    reset_bridge_state,
+    shared_bridge_blocks,
+)
 from rbx.vbtc_gates import field, net_string, parse_envelope
 
 
@@ -66,6 +74,17 @@ class Command(BaseCommand):
         )
 
     def handle(self, *args, **options):
+        if options.get("dry_run") or options.get("type"):
+            self.run(**options)
+            return
+        # A full run clears the bridge state and rebuilds it: it holds the
+        # bridge lock from before it reads the transactions to the end, so a
+        # block synced meanwhile is either read here or waits for the run.
+        with atomic():
+            lock_bridge_state()
+            self.run(**options)
+
+    def run(self, **options):
         tx_type = options.get("type")
         dry_run = options.get("dry_run", False)
         skip_envelopes = options.get("skip_envelopes", False)
@@ -149,10 +168,13 @@ class Command(BaseCommand):
                     self.stdout.write(
                         f"Processing {tx.hash} (type={tx.type}, height={tx.height})..."
                     )
-                    if tx.hash in recoveries:
-                        apply_recovery(tx, recovery_address_of(tx))
-                    else:
-                        process_transaction(tx)
+                    # A savepoint each: one failing transaction does not
+                    # abort the run's own.
+                    with atomic():
+                        if tx.hash in recoveries:
+                            apply_recovery(tx, recovery_address_of(tx))
+                        else:
+                            process_transaction(tx)
                     processed += 1
                 except Exception as e:
                     errors += 1
