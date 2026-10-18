@@ -1824,20 +1824,6 @@ class UnhandledTransactionTypeTests(TestCase):
     def setUp(self):
         self.block = make_block()
 
-    def test_unhandled_type_is_logged(self):
-        tx = make_tx(
-            self.block, "bridge-exit",
-            Transaction.Type.VBTC_BRIDGE_EXIT_TO_BTC,
-        )
-
-        with self.assertLogs(level="WARNING") as logs:
-            process_transaction(tx)
-
-        self.assertTrue(
-            any("No handler for transaction type 40" in line for line in logs.output),
-            logs.output,
-        )
-
     def test_unknown_ordinal_is_logged(self):
         tx = make_tx(self.block, "future-type", 99)
 

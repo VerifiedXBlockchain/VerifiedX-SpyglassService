@@ -1453,6 +1453,11 @@ class VbtcV2Token(models.Model):
         # Pre-filter, entries always sum to global_balance. A negative entry
         # therefore means the displayed total exceeds the BTC backing —
         # that's ledger corruption, not display noise. Alarm before hiding.
+        # The node's sink "-" and source "+" (bridge locks and unlocks,
+        # shields and unshields) are not holders.
+        for pseudo in ("-", "+"):
+            entries.pop(pseudo, None)
+
         negatives = {a: str(b) for a, b in entries.items() if b < 0}
         if negatives:
             logging.warning(
@@ -1553,6 +1558,58 @@ class VbtcV2TokenTransfer(models.Model):
 
     def __str__(self):
         return f"{self.from_address} => {self.to_address} [{self.amount}]"
+
+
+# Base-bridge state as the node keeps it outside the contract ledger
+# (VBTCBridgeLockState, VBTCBridgeBtcExitState, VBTCBridgeConsumedBurn). The
+# ledger moves themselves are VbtcV2TokenTransfer rows against the node's
+# sink "-" and source "+" (rbx/vbtc_bridge.py).
+class VbtcV2BridgeLock(models.Model):
+    lock_id = models.CharField(max_length=128, unique=True)
+    token = models.ForeignKey(VbtcV2Token, on_delete=models.CASCADE, related_name="bridge_locks")
+    owner_address = models.CharField(max_length=64, db_index=True)
+    amount = models.DecimalField(decimal_places=16, max_digits=32)
+    amount_sats = models.BigIntegerField()
+    unlocked_amount = models.DecimalField(decimal_places=16, max_digits=32, default=0)
+    unlocked_amount_sats = models.BigIntegerField(default=0)
+    is_unlocked = models.BooleanField(default=False)
+    is_blacklisted = models.BooleanField(default=False)
+    evm_destination = models.CharField(max_length=128)
+    lock_transaction = models.ForeignKey(Transaction, on_delete=models.CASCADE, related_name="+")
+    unlock_transaction = models.ForeignKey(
+        Transaction, blank=True, null=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    exit_burn_tx_hash = models.CharField(max_length=128, blank=True)
+
+    @property
+    def remaining_amount(self):
+        return self.amount - self.unlocked_amount
+
+    @property
+    def remaining_amount_sats(self):
+        return self.amount_sats - self.unlocked_amount_sats
+
+
+class VbtcV2BridgeExit(models.Model):
+    burn_tx_hash = models.CharField(max_length=128, unique=True)
+    exit_transaction = models.ForeignKey(Transaction, on_delete=models.CASCADE, related_name="+")
+    owner_address = models.CharField(max_length=64)
+    amount = models.DecimalField(decimal_places=16, max_digits=32)
+    btc_destination = models.CharField(max_length=128)
+    allocations = models.JSONField(default=list)
+    is_complete = models.BooleanField(default=False)
+    # The Bitcoin transaction, or "FAILED:<fail tx hash>" as the node marks a failed exit.
+    btc_tx_hash = models.CharField(max_length=128, blank=True)
+
+    @property
+    def failed(self):
+        return self.btc_tx_hash.startswith("FAILED:")
+
+
+class VbtcV2BridgeConsumedBurn(models.Model):
+    burn_tx_hash = models.CharField(max_length=128, unique=True)
+    kind = models.CharField(max_length=32)
+    transaction = models.ForeignKey(Transaction, on_delete=models.CASCADE, related_name="+")
 
 
 class VbtcV2WithdrawalRequest(models.Model):

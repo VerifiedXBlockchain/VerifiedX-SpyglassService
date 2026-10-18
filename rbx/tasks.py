@@ -23,7 +23,7 @@ from rbx.chain_contract import smart_contract_from_chain
 from rbx.client import get_master_nodes, get_block, get_nft, get_topics
 from shop.media import scp_down_folder, upload_to_s3
 from rbx.exceptions import RBXException
-from rbx import forged_vfx_burn, historical_reserve_reversals, vbtc_dispatch
+from rbx import forged_vfx_burn, historical_reserve_reversals, vbtc_bridge, vbtc_dispatch
 from rbx.models import (
     FungibleToken,
     FungibleTokenTx,
@@ -454,8 +454,9 @@ def expire_stale_withdrawals():
 
 # Types that reach process_transaction with nothing for it to index: plain
 # value transfers, validator lifecycle, topic voting, standard (non-tokenized)
-# smart contracts, the shielded-transaction family, and legacy V1 tokenization
-# burns and withdrawals.
+# smart contracts, the shielded transactions other than a vBTC shield or
+# unshield (rbx/vbtc_bridge.py), and legacy V1 tokenization burns and
+# withdrawals.
 #
 # Anything neither matched by a branch below nor listed here is a type nobody
 # wired up, and until now it looked exactly like a type nobody needed to —
@@ -479,8 +480,6 @@ UNINDEXED_TX_TYPES = frozenset(
         Transaction.Type.VFX_SHIELD,
         Transaction.Type.VFX_UNSHIELD,
         Transaction.Type.VFX_PRIVATE_TRANSFER,
-        Transaction.Type.VBTC_SHIELD,
-        Transaction.Type.VBTC_UNSHIELD,
         Transaction.Type.VBTC_PRIVATE_TRANSFER,
     }
 )
@@ -490,6 +489,9 @@ def process_transaction(tx: Transaction):
     # The legacy smart-contract envelope types can carry vBTC V2 functions;
     # the node routes them through its function switch before anything else.
     if vbtc_dispatch.route_envelope(tx):
+        return
+
+    if vbtc_bridge.route(tx):
         return
 
     if tx.type in [Transaction.Type.NFT_MINT, Transaction.Type.TKNZ_MINT, Transaction.Type.VBTC_V2_MINT]:

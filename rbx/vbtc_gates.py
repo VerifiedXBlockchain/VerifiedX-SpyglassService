@@ -32,9 +32,13 @@ _MAINNET = {
     "V2_TRANSFER_MULTI_HEIGHT": 7_281_000,
     "V2_WITHDRAWAL_OWNER_ADDBACK_FIX_HEIGHT": 7_281_000,
     "CANCELLATION_VOTE_RULES_HEIGHT": 7_400_500,
+    "BRIDGE_INTRA_BLOCK_GUARD_HEIGHT": 7_296_200,
+    # Globals.BitcoinAttestationRecordHeight, the fund-loss audit's activation.
+    "BITCOIN_ATTESTATION_RECORD_HEIGHT": 7_517_000,
 }
 _TESTNET = {k: 1 for k in _MAINNET}
 _TESTNET["CANCELLATION_VOTE_RULES_HEIGHT"] = 1_019_000
+_TESTNET["BITCOIN_ATTESTATION_RECORD_HEIGHT"] = 1_143_500
 
 
 def _gate(name):
@@ -60,6 +64,14 @@ def v2_withdrawal_owner_addback_fix_height():
 
 def cancellation_vote_rules_height():
     return _gate("CANCELLATION_VOTE_RULES_HEIGHT")
+
+
+def bridge_intra_block_guard_height():
+    return _gate("BRIDGE_INTRA_BLOCK_GUARD_HEIGHT")
+
+
+def bitcoin_attestation_record_height():
+    return _gate("BITCOIN_ATTESTATION_RECORD_HEIGHT")
 
 
 def escrow_applies(request_block_height):

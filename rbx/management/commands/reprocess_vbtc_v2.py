@@ -15,6 +15,7 @@ from rbx.vbtc_dispatch import (
     recovery_address_of,
     replaying,
 )
+from rbx.vbtc_bridge import BRIDGE_TYPES, SHIELD_TYPES, reset_bridge_state
 from rbx.vbtc_gates import field, net_string, parse_envelope
 
 
@@ -26,6 +27,10 @@ VBTC_V2_TYPES = [
     Transaction.Type.VBTC_V2_WITHDRAWAL_CANCEL,
     Transaction.Type.VBTC_V2_WITHDRAWAL_VOTE,
 ]
+
+# The bridge and shield types (rbx/vbtc_bridge.py). Their state outside the
+# ledger is cleared and rebuilt in order by a full run.
+BRIDGE_AND_SHIELD_TYPES = sorted(BRIDGE_TYPES | SHIELD_TYPES)
 
 # Functions inside the legacy smart-contract envelope types that move a vBTC
 # V2 ledger or its contract owner (rbx/vbtc_dispatch.py).
@@ -64,7 +69,7 @@ class Command(BaseCommand):
         dry_run = options.get("dry_run", False)
         skip_envelopes = options.get("skip_envelopes", False)
 
-        types = [tx_type] if tx_type else VBTC_V2_TYPES
+        types = [tx_type] if tx_type else VBTC_V2_TYPES + BRIDGE_AND_SHIELD_TYPES
         selected = Q(type__in=types)
 
         # The envelope types carry many unrelated transactions; keep only the
@@ -127,6 +132,9 @@ class Command(BaseCommand):
 
         processed = 0
         errors = 0
+
+        if not tx_type:
+            reset_bridge_state()
 
         with replaying():
             for tx in txs:
