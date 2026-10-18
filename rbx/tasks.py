@@ -23,6 +23,7 @@ from rbx.chain_contract import smart_contract_from_chain
 from rbx.client import get_master_nodes, get_block, get_nft, get_topics
 from shop.media import scp_down_folder, upload_to_s3
 from rbx.exceptions import RBXException
+from rbx.vbtc_gates import field, net_string, parse_envelope
 from rbx import forged_vfx_burn, historical_reserve_reversals, vbtc_bridge, vbtc_dispatch
 from rbx.models import (
     FungibleToken,
@@ -453,8 +454,7 @@ def expire_stale_withdrawals():
 
 
 # Types that reach process_transaction with nothing for it to index: plain
-# value transfers, validator lifecycle, topic voting, standard (non-tokenized)
-# smart contracts, the shielded transactions other than a vBTC shield or
+# value transfers, validator lifecycle, topic voting, the shielded transactions other than a vBTC shield or
 # unshield (rbx/vbtc_bridge.py), and legacy V1 tokenization burns and
 # withdrawals.
 #
@@ -468,9 +468,6 @@ UNINDEXED_TX_TYPES = frozenset(
         Transaction.Type.NODE,
         Transaction.Type.VOTE_TOPIC,
         Transaction.Type.VOTE,
-        Transaction.Type.SC_MINT,
-        Transaction.Type.SC_TX,
-        Transaction.Type.SC_BURN,
         Transaction.Type.TKNZ_BURN,
         Transaction.Type.TKNZ_WITHDRAWAL_REQUEST,
         Transaction.Type.TKNZ_WITHDRAWAL_COMPLETE,
@@ -485,6 +482,158 @@ UNINDEXED_TX_TYPES = frozenset(
 )
 
 
+# The fungible-token functions of the node's contract-call switch
+# (StateData.UpdateTreis). TokenDeploy() is indexed with the mints.
+TOKEN_FUNCTIONS = frozenset(
+    {
+        "TokenTransfer()",
+        "TokenMint()",
+        "TokenBurn()",
+        "TokenPause()",
+        "TokenBanAddress()",
+        "TokenContractOwnerChange()",
+        "TokenVoteTopicCreate()",
+        "TokenVoteTopicCast()",
+    }
+)
+
+
+def token_function_of(tx: Transaction):
+    """The token function tx calls, read as the node's dispatcher reads it,
+    or None. The node runs it under every contract-call envelope type."""
+    if tx.type not in vbtc_dispatch.SC_ENVELOPE_TYPES:
+        return None
+    payload, _ = parse_envelope(tx.data)
+    function = net_string(field(payload, "Function"))
+    return function if function in TOKEN_FUNCTIONS else None
+
+
+def process_token_function(tx: Transaction):
+    """A fungible-token function (TOKEN_FUNCTIONS), under whichever envelope
+    type carries it: the node dispatches on Function for every one of them
+    (StateData.UpdateTreis)."""
+
+    parsed, _ = parse_envelope(tx.data)
+
+    func = parsed["Function"]
+    sc_identifier = parsed["ContractUID"]
+
+    try:
+        token = FungibleToken.objects.get(sc_identifier=sc_identifier)
+    except FungibleToken.DoesNotExist:
+        print(f"FT doesn't exist with id of {sc_identifier}")
+        return
+
+    if func in ["TokenMint()", "TokenBurn()"]:
+
+        type = (
+            FungibleTokenTx.Type.MINT
+            if func == "TokenMint()"
+            else FungibleTokenTx.Type.BURN
+        )
+
+        from_address = parsed["FromAddress"]
+        amount = parsed["Amount"]
+
+        FungibleTokenTx.objects.update_or_create(
+            transaction=tx,
+            defaults={
+                "type": type,
+                "sc_identifier": sc_identifier,
+                "token": token,
+                "receiving_address": from_address,
+                "sending_address": None,
+                "amount": amount,
+            },
+        )
+
+    elif func == "TokenTransfer()":
+        from_address = parsed["FromAddress"]
+        to_address = parsed["ToAddress"]
+        amount = parsed["Amount"]
+
+        FungibleTokenTx.objects.update_or_create(
+            transaction=tx,
+            defaults={
+                "type": FungibleTokenTx.Type.TRANSFER,
+                "sc_identifier": sc_identifier,
+                "token": token,
+                "receiving_address": to_address,
+                "sending_address": from_address,
+                "amount": amount,
+            },
+        )
+
+    elif func == "TokenContractOwnerChange()":
+        from_address = parsed["FromAddress"]
+        to_address = parsed["ToAddress"]
+
+        token.owner_address = to_address
+        token.save()
+
+    elif func == "TokenPause()":
+        token.is_paused = parsed["Pause"]
+        token.save()
+    elif func == "TokenBanAddress()":
+        address = parsed["BanAddress"]
+        if address not in token.banned_addresses:
+            token.banned_addresses.append(address)
+            token.save()
+
+    elif func == "TokenVoteTopicCreate()":
+        sc_identifier = parsed["ContractUID"]
+        from_address = parsed["FromAddress"]
+        topic_data = parsed["TokenVoteTopic"]
+
+        try:
+            topic = TokenVoteTopic.objects.get(
+                sc_identifier=sc_identifier, topic_id=topic_data["TopicUID"]
+            )
+        except TokenVoteTopic.DoesNotExist:
+            topic = TokenVoteTopic(
+                sc_identifier=sc_identifier, topic_id=topic_data["TopicUID"]
+            )
+
+        try:
+            token = FungibleToken.objects.get(sc_identifier=sc_identifier)
+        except FungibleToken.DoesNotExist:
+            print(
+                f"token with sc_identifier of {sc_identifier} not found when creating vote topic."
+            )
+            return
+
+        topic.token = token
+        topic.from_address = from_address
+        topic.topic_id = topic_data["TopicUID"]
+        topic.name = topic_data["TopicName"]
+        topic.description = topic_data["TopicDescription"]
+        topic.vote_requirement = topic_data["MinimumVoteRequirement"]
+        topic.created_at = timezone.make_aware(
+            datetime.fromtimestamp(topic_data["TopicCreateDate"])
+        )
+        topic.voting_ends_at = timezone.make_aware(
+            datetime.fromtimestamp(topic_data["VotingEndDate"])
+        )
+
+        topic.save()
+
+    elif func == "TokenVoteTopicCast()":
+        topic_id = parsed["TopicUID"]
+        try:
+            topic = TokenVoteTopic.objects.get(topic_id=topic_id)
+
+        except TokenVoteTopic.DoesNotExist:
+            print(f"TokenVoteTopic with topic id of {topic_id} not found.")
+            return
+
+        TokenVoteTopicVote.objects.get_or_create(
+            topic=topic,
+            address=parsed["FromAddress"],
+            created_at=tx.date_crafted,
+            defaults={"value": parsed["VoteType"] == 1},
+        )
+
+
 def process_transaction(tx: Transaction):
     # The legacy smart-contract envelope types can carry vBTC V2 functions;
     # the node routes them through its function switch before anything else.
@@ -492,6 +641,10 @@ def process_transaction(tx: Transaction):
         return
 
     if vbtc_bridge.route(tx):
+        return
+
+    if token_function_of(tx):
+        process_token_function(tx)
         return
 
     if tx.type in [Transaction.Type.NFT_MINT, Transaction.Type.TKNZ_MINT, Transaction.Type.VBTC_V2_MINT]:
@@ -915,125 +1068,8 @@ def process_transaction(tx: Transaction):
         Transaction.Type.FTKN_BURN,
         Transaction.Type.FTKN_MINT,
     ]:
-
-        parsed = json.loads(tx.data)
-
-        if isinstance(parsed, list):
-            parsed = parsed[0]
-
-        func = parsed["Function"]
-        sc_identifier = parsed["ContractUID"]
-
-        try:
-            token = FungibleToken.objects.get(sc_identifier=sc_identifier)
-        except FungibleToken.DoesNotExist:
-            print(f"FT doesn't exist with id of {sc_identifier}")
-            return
-
-        if func in ["TokenMint()", "TokenBurn()"]:
-
-            type = (
-                FungibleTokenTx.Type.MINT
-                if func == "TokenMint()"
-                else FungibleTokenTx.Type.BURN
-            )
-
-            from_address = parsed["FromAddress"]
-            amount = parsed["Amount"]
-
-            ftt = FungibleTokenTx(
-                type=type,
-                sc_identifier=sc_identifier,
-                token=token,
-                receiving_address=from_address,
-                sending_address=None,
-                amount=amount,
-            )
-
-            ftt.save()
-
-        elif func == "TokenTransfer()":
-            from_address = parsed["FromAddress"]
-            to_address = parsed["ToAddress"]
-            amount = parsed["Amount"]
-
-            ftt = FungibleTokenTx(
-                type=FungibleTokenTx.Type.TRANSFER,
-                sc_identifier=sc_identifier,
-                token=token,
-                receiving_address=to_address,
-                sending_address=from_address,
-                amount=amount,
-            )
-            ftt.save()
-
-        elif func == "TokenContractOwnerChange()":
-            from_address = parsed["FromAddress"]
-            to_address = parsed["ToAddress"]
-
-            token.owner_address = to_address
-            token.save()
-
-        elif func == "TokenPause()":
-            token.is_paused = parsed["Pause"]
-            token.save()
-        elif func == "TokenBanAddress()":
-            address = parsed["BanAddress"]
-            token.banned_addresses.append(address)
-            token.save()
-
-        elif func == "TokenVoteTopicCreate()":
-            sc_identifier = parsed["ContractUID"]
-            from_address = parsed["FromAddress"]
-            topic_data = parsed["TokenVoteTopic"]
-
-            try:
-                topic = TokenVoteTopic.objects.get(
-                    sc_identifier=sc_identifier, topic_id=topic_data["TopicUID"]
-                )
-            except TokenVoteTopic.DoesNotExist:
-                topic = TokenVoteTopic(
-                    sc_identifier=sc_identifier, topic_id=topic_data["TopicUID"]
-                )
-
-            try:
-                token = FungibleToken.objects.get(sc_identifier=sc_identifier)
-            except FungibleToken.DoesNotExist:
-                print(
-                    f"token with sc_identifier of {sc_identifier} not found when creating vote topic."
-                )
-                return
-
-            topic.token = token
-            topic.from_address = from_address
-            topic.topic_id = topic_data["TopicUID"]
-            topic.name = topic_data["TopicName"]
-            topic.description = topic_data["TopicDescription"]
-            topic.vote_requirement = topic_data["MinimumVoteRequirement"]
-            topic.created_at = timezone.make_aware(
-                datetime.fromtimestamp(topic_data["TopicCreateDate"])
-            )
-            topic.voting_ends_at = timezone.make_aware(
-                datetime.fromtimestamp(topic_data["VotingEndDate"])
-            )
-
-            topic.save()
-
-        elif func == "TokenVoteTopicCast()":
-            topic_id = parsed["TopicUID"]
-            try:
-                topic = TokenVoteTopic.objects.get(topic_id=topic_id)
-
-            except TokenVoteTopic.DoesNotExist:
-                print(f"TokenVoteTopic with topic id of {topic_id} not found.")
-                return
-
-            TokenVoteTopicVote.objects.create(
-                topic=topic,
-                address=parsed["FromAddress"],
-                value=parsed["VoteType"] == 1,
-                created_at=tx.date_crafted,
-            )
+        # Any other function under these types: nothing is indexed for it.
+        pass
 
     elif tx.type == Transaction.Type.TKNZ_TX:
 

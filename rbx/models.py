@@ -1026,6 +1026,11 @@ class FungibleTokenTx(models.Model):
     receiving_address = models.CharField(max_length=64, blank=True, null=True, db_index=True)
     sending_address = models.CharField(max_length=64, blank=True, null=True, db_index=True)
     amount = models.DecimalField(decimal_places=16, max_digits=32)
+    # The transaction that applied it; rows indexed before this was recorded
+    # have none.
+    transaction = models.OneToOneField(
+        "Transaction", blank=True, null=True, on_delete=models.CASCADE, related_name="fungible_token_tx"
+    )
 
     def __str__(self):
         return f"{self.type} ({self.token})"
