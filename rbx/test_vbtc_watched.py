@@ -207,6 +207,7 @@ class LegacyVaultTests(WatchedVaultCase):
 
 EXIT = "rbx.client.get_vbtc_v2_bridge_exit"
 STATUS = "rbx.client.get_vbtc_v2_withdrawal_status"
+PIN = "rbx.client.get_vbtc_v2_withdrawal_pin"
 
 
 @WATCHING
@@ -291,17 +292,60 @@ class WatchedExitTests(WatchedVaultCase):
         self.assertTrue(lock.is_blacklisted)
         self.assertEqual(lock.remaining_amount, Decimal("0.002"))
 
-    def test_an_exit_expired_and_made_again_before_spyglass_hears_returns_the_old_locks(self):
-        from rbx.models import VbtcV2BridgeExit
+    def remake(self, part_state):
+        """Core failed x1 at a block start and the burn was exited again,
+        for 0.001, before Spyglass heard of the failure."""
+        pin = {"Success": True, "Withdrawal": {"State": part_state}} if part_state else {"Success": False}
+        with patch(PIN, return_value=pin):
+            self.tx("x2", T.VBTC_BRIDGE_EXIT_TO_BTC, {
+                "TotalAmount": 0.001, "TotalAmountSats": 100000, "BtcDestination": "bc1q", "BaseBurnTxHash": "b1",
+                "Allocations": [{"LockId": "L1", "SmartContractUID": "sc:w", "UnlockAmount": 0.001}]})
 
-        # Core expired x1 at a block start and the burn was exited again.
-        self.tx("x2", T.VBTC_BRIDGE_EXIT_TO_BTC, {
-            "TotalAmount": 0.002, "TotalAmountSats": 200000, "BtcDestination": "bc1q", "BaseBurnTxHash": "b1",
-            "Allocations": [{"LockId": "L1", "SmartContractUID": "sc:w", "UnlockAmount": 0.002}]})
+    def test_an_exit_expired_and_made_again_before_spyglass_hears_returns_the_old_locks(self):
+        from rbx.models import VbtcV2BridgeExit, VbtcV2BridgeLock
+
+        self.remake("Expired")
         exit = VbtcV2BridgeExit.objects.get(burn_key="b1")
         self.assertEqual(exit.exit_transaction_id, "x2")
-        # x1's 0.002 came back, x2 drew 0.002.
+        # x1's 0.002 came back, x2 drew 0.001.
+        self.assertEqual(self.remaining(), Decimal("0.002"))
+        self.assertFalse(VbtcV2BridgeLock.objects.get(lock_id="L1").is_blacklisted)
+
+    def test_an_exit_voided_and_made_again_takes_the_vaults_locks_out_of_use(self):
+        from rbx.models import VbtcV2BridgeLock
+
+        self.remake("Void")
+        lock = VbtcV2BridgeLock.objects.get(lock_id="L1")
+        self.assertTrue(lock.is_blacklisted)
+        self.assertEqual(lock.remaining_amount, Decimal("0.002"))
+
+    def test_an_expiry_already_applied_is_not_applied_again_on_the_new_exit(self):
+        self.sweep({"Success": True, "Exit": {"IsComplete": True, "Failed": True, "FailureRecord": "FAILED:expired@500", "Parts": []}})
+        self.assertEqual(self.remaining(), Decimal("0.003"))
+        # Another draw on L1, so a second give-back would show.
+        self.tx("pd", T.VBTC_BRIDGE_POOL_UNLOCK, {
+            "TotalAmount": 0.001, "TotalAmountSats": 100000, "VfxDestinationAddress": "D", "ExitBurnTxHash": "bd",
+            "Allocations": [{"LockId": "L1", "UnlockAmount": 0.001}]})
+        self.remake("Expired")
         self.assertEqual(self.remaining(), Decimal("0.001"))
+
+    def test_a_void_already_heard_is_not_applied_again_on_the_new_exit(self):
+        from rbx.models import VbtcV2BridgeExit
+
+        self.sweep({"Success": True, "Exit": {"IsComplete": False, "Failed": False,
+                                              "Parts": [{"SmartContractUID": "sc:w", "State": "Void"}]}})
+        self.assertEqual(self.remaining(), Decimal("0.003"))
+        self.assertFalse(VbtcV2BridgeExit.objects.get(burn_key="b1").is_complete)
+        # Another draw on L1, so a second give-back would show.
+        self.tx("pd", T.VBTC_BRIDGE_POOL_UNLOCK, {
+            "TotalAmount": 0.001, "TotalAmountSats": 100000, "VfxDestinationAddress": "D", "ExitBurnTxHash": "bd",
+            "Allocations": [{"LockId": "L1", "UnlockAmount": 0.001}]})
+        self.remake("Void")
+        self.assertEqual(self.remaining(), Decimal("0.001"))
+
+    def test_a_part_the_node_does_not_describe_is_taken_as_expired(self):
+        self.remake(None)
+        self.assertEqual(self.remaining(), Decimal("0.002"))
 
     def test_a_node_answer_about_another_exit_of_the_burn_changes_nothing(self):
         self.sweep({"Success": True, "Exit": {"ExitTxHash": "x9", "IsComplete": True, "Failed": True,
@@ -328,6 +372,10 @@ class LegacyExitTests(WatchedExitTests):
     test_a_voided_part_takes_its_locks_out_of_use_once = None
     test_a_node_that_does_not_answer_changes_nothing = None
     test_an_exit_expired_and_made_again_before_spyglass_hears_returns_the_old_locks = None
+    test_an_exit_voided_and_made_again_takes_the_vaults_locks_out_of_use = None
+    test_an_expiry_already_applied_is_not_applied_again_on_the_new_exit = None
+    test_a_void_already_heard_is_not_applied_again_on_the_new_exit = None
+    test_a_part_the_node_does_not_describe_is_taken_as_expired = None
     test_a_node_answer_about_another_exit_of_the_burn_changes_nothing = None
 
 
@@ -645,3 +693,28 @@ class ExitRewindFilterTests(WatchedExitTests):
         self.complete()
         self.reconcile({"Success": True, "Exit": {"ExitTxHash": "x1", "Failed": False, "Parts": []}}, True)
         self.assertTrue(self.exit().is_complete)
+
+
+@WATCHING
+class ReconcileIsolationTests(WatchedVaultCase):
+    def test_one_vault_raising_does_not_stop_the_others(self):
+        from rbx import vbtc_dispatch
+
+        other = make_token(owner="O2", global_balance="0.01", sc_identifier="sc:w2")
+        other.nft.mint_transaction = self.token.nft.mint_transaction
+        other.nft.save(update_fields=["mint_transaction"])
+        process_transaction(request_tx(make_block(height=13), "r2", "O2", "sc:w2", 0.001))
+        real = vbtc_dispatch.reconcile_watched_withdrawals
+
+        def flaky(token, after_rewind=False):
+            if token.sc_identifier == "sc:w":
+                raise RuntimeError("bad vault")
+            return real(token, after_rewind=after_rewind)
+
+        self.report()
+        entry = {"RequestHash": "r2", "CompletionHash": "rep1", "BTCTransactionHash": "T"}
+        with patch("rbx.vbtc_dispatch.reconcile_watched_withdrawals", side_effect=flaky), \
+                patch(HISTORY, return_value=history(paid=[entry])), patch(EXIT, return_value={"Success": False}):
+            with self.assertLogs(level="ERROR"):
+                vbtc_dispatch.reconcile_all_watched_vaults()
+        self.assertEqual(VbtcV2WithdrawalRequest.objects.get(request_transaction__hash="r2").status, Status.COMPLETED)

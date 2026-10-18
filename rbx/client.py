@@ -1248,6 +1248,15 @@ def get_vbtc_v2_withdrawal_status(sc_uid: str):
     return _vbtc_v2_request("get", f"vbtcapi/vbtc/GetWithdrawalStatus/{sc_uid}", timeout=NODE_READ_TIMEOUT)
 
 
+def get_vbtc_v2_withdrawal_pin(sc_uid: str, request_ref: str):
+    """One withdrawal (or exit part) of a watched vault, with its state."""
+    from urllib.parse import quote
+
+    return _vbtc_v2_request(
+        "get", f"vbtcapi/vbtc/GetWithdrawalPin/{sc_uid}/{quote(request_ref, safe='')}", timeout=NODE_READ_TIMEOUT
+    )
+
+
 def get_vbtc_v2_bridge_exit(base_burn_tx_hash: str):
     """The bridge exit the chain holds for a Base burn, with each watched
     vault's part."""

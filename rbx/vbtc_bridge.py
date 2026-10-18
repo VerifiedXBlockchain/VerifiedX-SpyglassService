@@ -495,27 +495,53 @@ def apply_exit(tx):
 
 
 def _expire_unheard_watched_exit(burn, tx):
-    """An exit on watched vaults is failed by rule at block start, with no
-    transaction (BtcWithdrawals.ExpireExit), and its failed record goes when
-    the burn is exited again (StateData.cs:3988). When that new exit is
-    mined before Spyglass has read the expiry from the node, the open record
-    it finds was expired: its locks are given back (once) and the record
-    goes, so the new exit draws its own."""
+    """Core lets a burn be exited again only once its exit on watched vaults
+    has failed by rule, with no transaction (BtcWithdrawals.ExpireExit,
+    VoidExitPart), and drops the failed record then (StateData.cs:3988).
+    When the new exit is mined before Spyglass has read the failure, the
+    open record it finds is settled first, part by part, from the node's
+    GetWithdrawalPin (each vault's part of the exit): a voided part's locks
+    are given back and taken out of use, an expired part's given back. The
+    record then goes, so the new exit draws its own. A part already applied
+    is not applied again; one the node does not describe is taken as
+    expired."""
     old = _exit(burn)
     if old is None or old.is_complete or not is_watched_exit(old) or old.exit_transaction_id == tx.pk:
         return
-    if "expired" not in old.applied_parts:
-        voided = {ref.split(":", 1)[1] for ref in old.applied_parts if ref.startswith("void:")}
-        for allocation in old.allocations:
-            lock = _lock(allocation.get("LockId", ""))
-            if lock is None or lock.token.sc_identifier in voided:
-                continue
-            _restore(lock, Decimal(str(allocation["UnlockAmount"])))
+    by_vault = {}
+    for allocation in old.allocations:
+        lock = _lock(allocation.get("LockId", ""))
+        if lock is not None:
+            by_vault.setdefault(lock.token.sc_identifier, []).append((lock, Decimal(str(allocation["UnlockAmount"]))))
+    applied = set(old.applied_parts)
+    for sc_uid, pairs in by_vault.items():
+        if f"void:{sc_uid}" in applied or "expired" in applied:
+            continue
+        state = _exit_part_state(old, sc_uid)
+        if state is None:
+            logging.warning(
+                f"Bridge exit {old.exit_transaction_id}: the node does not describe its part on {sc_uid}; "
+                f"taken as expired."
+            )
+        for lock, amount in pairs:
+            _restore(lock, amount, blacklist=state == "Void")
     logging.warning(
-        f"Bridge exit {old.exit_transaction_id} for burn {burn}: expired by rule before {tx.hash} exited the "
+        f"Bridge exit {old.exit_transaction_id} for burn {burn}: failed by rule before {tx.hash} exited the "
         f"burn again; its locks are given back."
     )
     old.delete()
+
+
+def _exit_part_state(exit, sc_uid):
+    """The state of one vault's part of an exit (Waiting, Pinned, Settled,
+    Void, Expired), or None. The part's key is ExitRefOf, which
+    GetWithdrawalPin reaches as RefOf("exit:<exit tx>@<height>", vault)."""
+    from rbx.client import get_vbtc_v2_withdrawal_pin
+
+    data = get_vbtc_v2_withdrawal_pin(sc_uid, f"exit:{exit.exit_transaction_id}@{exit.exit_transaction.height}")
+    withdrawal = data.get("Withdrawal") if isinstance(data, dict) and data.get("Success") else None
+    state = withdrawal.get("State") if isinstance(withdrawal, dict) else None
+    return state if isinstance(state, str) else None
 
 
 def _stored(allocations):
