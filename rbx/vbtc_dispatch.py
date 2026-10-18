@@ -454,8 +454,8 @@ def _sender_covers(row, cutoff, held, owner, pending):
     """DeferredVbtcTransferStillCovered: the owner of a vault the chain does
     not watch (`owner`, as the pass has it when it reaches the row) is
     covered; anyone else must hold the amount on the ledger as it stood at
-    `cutoff`. `held` carries the running figure per (contract, sender)
-    through one judging pass; `pending` is what to add back to the ledger's
+    `cutoff`. `held` carries the running figure per (contract, address)
+    through one judging pass; `pending` is what to add to the ledger's
     figure (sends the ledger already counts but that are judged in this
     pass)."""
     token = row.token
@@ -550,17 +550,29 @@ def settle_matured_reserve_sends(block):
             transaction__recovery_outstanding_transactions__isnull=True,
         ).select_related("transaction", "token")
     )
-    # The ledger at the end of the block already counts these sends (their
-    # unlock is before the cut-off); each is added back and applied in turn.
+    # The ledger at the end of the block already counts both sides of these
+    # sends (their unlock is before the cut-off); each is taken back out and
+    # applied in turn, so a send sorted first does not see the credit of one
+    # sorted after it. Every address is read before any refusal is saved:
+    # ledger_entries leaves a refused send out.
     pending = {}
     for row in due:
-        key = (row.token_id, row.from_address)
-        pending[key] = pending.get(key, Decimal(0)) + row.amount
+        if row.transaction.unlock_time < rules_from:
+            continue
+        sender, recipient = (row.token_id, row.from_address), (row.token_id, row.to_address)
+        pending[sender] = pending.get(sender, Decimal(0)) + row.amount
+        pending[recipient] = pending.get(recipient, Decimal(0)) - row.amount
     # Core settles the block's due ownership transfers and vBTC sends in one
     # pass, in (unlock, height, hash) order: a handover due earlier in the
     # pass has changed the owner when a send is reached.
     cutoff = _end_of(block)
     held, base, handovers = {}, {}, {}
+    entries = {}
+    for token_id, address in pending:
+        if token_id not in entries:
+            token = next(row.token for row in due if row.token_id == token_id)
+            entries[token_id] = token.ledger_entries(before=cutoff)
+        held[(token_id, address)] = entries[token_id].get(address, Decimal(0)) + pending[(token_id, address)]
     for row in sorted(due, key=_pass_order):
         tx = row.transaction
         if tx.unlock_time < rules_from:
@@ -571,6 +583,8 @@ def settle_matured_reserve_sends(block):
             handovers[token.pk] = _pending_handovers(token, previous, block.date_crafted)
         owner = _owner_in_pass(token, base[token.pk], handovers[token.pk], row)
         if _sender_covers(row, cutoff, held, owner, pending):
+            # Applied to the live state: a later send of the recipient sees it.
+            held[(row.token_id, row.to_address)] += row.amount
             continue
         logging.warning(
             f"Reserve vBTC send {tx.hash} of {row.amount} on {row.token.sc_identifier}: not covered by "
