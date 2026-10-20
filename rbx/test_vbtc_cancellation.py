@@ -128,6 +128,7 @@ class CancellationVoteRulesTests(TestCase):
         row = self.row()
         self.assertEqual(row.status, Status.CANCELLED)
         self.assertIsNotNone(row.cancelled_at)
+        self.assertEqual(row.closed_because, "Cancelled")
         self.assertEqual(self.token.addresses["U"], Decimal("0.004"))
         self.token.refresh_from_db()
         self.assertFalse(self.token.is_pending_withdrawal)

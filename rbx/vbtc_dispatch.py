@@ -984,7 +984,8 @@ def _close_watched_on_cancel(tx, what, withdrawal):
     withdrawal.cancel_transaction = tx
     withdrawal.cancelled_at = tx.date_crafted
     withdrawal.refunded_amount = None
-    withdrawal.save(update_fields=["status", "cancel_transaction", "cancelled_at", "refunded_amount"])
+    withdrawal.closed_because = "Cancelled"
+    withdrawal.save(update_fields=["status", "cancel_transaction", "cancelled_at", "refunded_amount", "closed_because"])
     withdrawal.token.recompute_pending_withdrawal()
     _replan_settlements_since(withdrawal.token, withdrawal.request_transaction)
 
@@ -1151,10 +1152,15 @@ def _apply_withdrawal_history(token, data):
         if block is None:
             _log_once(token, entry, f"waits for block {closed_at} to be synced")
             continue
+        outcome = entry.get("Outcome")
+        if outcome not in VbtcV2WithdrawalRequest.CLOSE_REASONS:
+            _log_once(token, entry, f"closed with an outcome Spyglass does not know ({outcome!r}); served as unknown")
+            outcome = ""
         withdrawal.status = VbtcV2WithdrawalRequest.Status.CANCELLED
         withdrawal.cancelled_at = block.date_crafted
         withdrawal.refunded_amount = refunded
-        withdrawal.save(update_fields=["status", "cancelled_at", "refunded_amount"])
+        withdrawal.closed_because = outcome
+        withdrawal.save(update_fields=["status", "cancelled_at", "refunded_amount", "closed_because"])
         settled += 1
         if replan_from is None or withdrawal.request_transaction.height < replan_from.height:
             replan_from = withdrawal.request_transaction
@@ -1228,7 +1234,49 @@ def refresh_watched_backing(token):
         settled_exit_btc=Decimal(paid) / Decimal(100_000_000),
         deposit_address=address,
     )
+    _store_pin_states(token, bitcoin.get("OpenWithdrawals"))
     return True
+
+
+PIN_STATES = ("Waiting", "Pinned")
+
+
+def _store_pin_states(token, open_withdrawals):
+    """Each open request's pin state as the node describes it, from the same
+    GetWithdrawalStatus answer as the backing: what is served for it, never
+    asked of the node in a request. An open request the node no longer lists
+    (closed there, not yet here) has its pin state cleared; it closes on the
+    next history pass. A view without the list leaves the rows as they are."""
+    if not isinstance(open_withdrawals, list):
+        key = (token.sc_identifier, "OpenWithdrawals")
+        if key not in _LOGGED:
+            _LOGGED.add(key)
+            logging.error(f"Watched vault {token.sc_identifier}: the node's Bitcoin view has no OpenWithdrawals list.")
+        return
+    listed = {}
+    for entry in open_withdrawals:
+        if not isinstance(entry, dict) or entry.get("Kind") != "Withdrawal":
+            continue
+        if entry.get("State") not in PIN_STATES or not entry.get("RequestHash"):
+            _log_once(token, entry, "has no usable pin state; it is left as it was")
+            continue
+        listed[entry["RequestHash"]] = entry
+    for withdrawal in token.withdrawal_requests.filter(status__in=VbtcV2WithdrawalRequest.ACTIVE_STATUSES):
+        entry = listed.get(withdrawal.request_transaction_id)
+        if entry is None:
+            fields = {"pin_state": "", "pin_txid": "", "pin_fee_rate": None, "releasing": False, "expires_at_height": None}
+        else:
+            pinned = entry["State"] == "Pinned"
+            txid = entry.get("BitcoinTxid")
+            expires = entry.get("ExpiresAtVfxHeight")
+            fields = {
+                "pin_state": entry["State"],
+                "pin_txid": txid if pinned and isinstance(txid, str) else "",
+                "pin_fee_rate": net_decimal(entry.get("FeeRate")) if pinned else None,
+                "releasing": pinned and entry.get("Releasing") is True,
+                "expires_at_height": expires if isinstance(expires, int) and not isinstance(expires, bool) else None,
+            }
+        VbtcV2WithdrawalRequest.objects.filter(pk=withdrawal.pk).update(**fields)
 
 
 def refresh_all_watched_backings():
@@ -1430,7 +1478,8 @@ def _settle(withdrawal, result):
             return
         withdrawal.status = VbtcV2WithdrawalRequest.Status.CANCELLED
         withdrawal.cancelled_at = result.decided_by.date_crafted
-        withdrawal.save(update_fields=["status", "cancelled_at"])
+        withdrawal.closed_because = "Cancelled"
+        withdrawal.save(update_fields=["status", "cancelled_at", "closed_because"])
         withdrawal.token.recompute_pending_withdrawal()
         _replan_settlements_since(withdrawal.token, withdrawal.request_transaction)
     elif result.outcome is vbtc_cancellation.Outcome.REJECTED:
@@ -1566,7 +1615,8 @@ def apply_vote(tx):
         return
     withdrawal.status = VbtcV2WithdrawalRequest.Status.CANCELLED
     withdrawal.cancelled_at = tx.date_crafted
-    withdrawal.save(update_fields=["status", "cancelled_at"])
+    withdrawal.closed_because = "Cancelled"
+    withdrawal.save(update_fields=["status", "cancelled_at", "closed_because"])
     withdrawal.token.recompute_pending_withdrawal()
     _replan_settlements_since(withdrawal.token, withdrawal.request_transaction)
 

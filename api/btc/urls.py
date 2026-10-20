@@ -11,6 +11,7 @@ from .views import (
     VbtcV2ListView,
     VbtcV2DetailView,
     VbtcV2TransfersView,
+    VbtcV2HeightsView,
     VbtcV2WithdrawalsView,
     VbtcV2CeremonyPrepareView,
     VbtcV2CeremonyExecuteView,
@@ -68,6 +69,7 @@ urlpatterns = [
     path("vbtc-v2/beacon-upload/<str:sc_identifier>/<str:to_address>/<path:signature>/", VbtcV2BeaconUploadView.as_view()),
     path("vbtc-v2/ownership-transfer/<str:sc_identifier>/<str:to_address>/<path:locator>/", VbtcV2OwnershipTransferDataView.as_view()),
     # Read endpoints (catch-all last)
+    path("vbtc-v2/heights/", VbtcV2HeightsView.as_view()),
     path("vbtc-v2/detail/<str:sc_identifier>/", VbtcV2DetailView.as_view()),
     path("vbtc-v2/transfers/<str:sc_identifier>/", VbtcV2TransfersView.as_view()),
     path("vbtc-v2/withdrawals/<str:sc_identifier>/", VbtcV2WithdrawalsView.as_view()),

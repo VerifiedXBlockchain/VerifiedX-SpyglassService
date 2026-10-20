@@ -40,6 +40,43 @@ class VbtcV2WithdrawalRequestSerializer(serializers.ModelSerializer):
     completion_transaction_hash = serializers.CharField(
         source="completion_transaction.hash", read_only=True, default=None
     )
+    # An open request on a watched vault, as the node last described it
+    # (stored by the indexer; see VbtcV2WithdrawalRequest.pin_state). Null
+    # once the request has closed, or before the node has been read.
+    pin_state = serializers.SerializerMethodField()
+    pin_txid = serializers.SerializerMethodField()
+    pin_fee_rate = serializers.SerializerMethodField()
+    releasing = serializers.SerializerMethodField()
+    expires_at_height = serializers.SerializerMethodField()
+
+    def _open_pin(self, withdrawal):
+        return withdrawal.status in VbtcV2WithdrawalRequest.ACTIVE_STATUSES and bool(withdrawal.pin_state)
+
+    def get_pin_state(self, withdrawal):
+        return withdrawal.pin_state if self._open_pin(withdrawal) else None
+
+    def get_pin_txid(self, withdrawal):
+        return (withdrawal.pin_txid or None) if self._open_pin(withdrawal) else None
+
+    def get_pin_fee_rate(self, withdrawal):
+        if not self._open_pin(withdrawal) or withdrawal.pin_fee_rate is None:
+            return None
+        return float(withdrawal.pin_fee_rate)
+
+    def get_releasing(self, withdrawal):
+        return withdrawal.releasing if self._open_pin(withdrawal) else None
+
+    def get_expires_at_height(self, withdrawal):
+        return withdrawal.expires_at_height if self._open_pin(withdrawal) else None
+
+    # Why a closed request closed without payment (Cancelled, Released,
+    # Expired or Void); null while open, when paid, or when not known.
+    closed_because = serializers.SerializerMethodField()
+
+    def get_closed_because(self, withdrawal):
+        if withdrawal.status != VbtcV2WithdrawalRequest.Status.CANCELLED:
+            return None
+        return withdrawal.closed_because or None
 
     class Meta:
         model = VbtcV2WithdrawalRequest
@@ -60,6 +97,16 @@ class VbtcV2WithdrawalRequestSerializer(serializers.ModelSerializer):
             "completion_transaction_hash",
             "created_at",
             "completed_at",
+            "pin_state",
+            "pin_txid",
+            "pin_fee_rate",
+            "releasing",
+            "expires_at_height",
+            "closed_because",
+            # What a closed request gave back when the node refunded less
+            # than its amount (a release keeps its Bitcoin fee); null: the
+            # whole amount (VbtcV2WithdrawalRequest.refunded_amount).
+            "refunded_amount",
         )
 
 
@@ -98,6 +145,9 @@ class VbtcV2TokenSerializer(serializers.ModelSerializer):
     # until then the recipient is only the pending owner.
     owner_address = serializers.CharField(source="current_owner", read_only=True)
     pending_owner_address = serializers.SerializerMethodField()
+    # Minted from the recording height on: the chain watches the vault's
+    # Bitcoin (VbtcV2Token.is_watched). Callers select nft__mint_transaction.
+    is_watched = serializers.BooleanField(read_only=True)
 
     def get_pending_owner_address(self, token):
         tx = token.pending_owner_transaction
@@ -119,6 +169,7 @@ class VbtcV2TokenSerializer(serializers.ModelSerializer):
             "description",
             "owner_address",
             "pending_owner_address",
+            "is_watched",
             "image_url",
             "deposit_address",
             "frost_group_public_key",
