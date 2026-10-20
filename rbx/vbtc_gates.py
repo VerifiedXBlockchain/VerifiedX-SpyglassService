@@ -38,11 +38,21 @@ _MAINNET = {
     # still the unset placeholder: set this to the launch height when Core's
     # is set (the placeholder keeps the rules inactive).
     "FUND_LOSS_AUDIT_HEIGHT": 999_999_999,
+    # Globals.BitcoinAttestationHeight: from it, vaults minted before the
+    # recording height are frozen (BtcLegacyFreeze). FundLossAuditHeight plus
+    # two weeks on mainnet, so a placeholder while that one is.
+    "BITCOIN_ATTESTATION_HEIGHT": 999_999_999 + 90_000,
 }
 _TESTNET = {k: 1 for k in _MAINNET}
 _TESTNET["CANCELLATION_VOTE_RULES_HEIGHT"] = 1_019_000
 # Globals.FundLossAuditTestnetHeight on testnet-staging f41b1ed7.
 _TESTNET["FUND_LOSS_AUDIT_HEIGHT"] = 1_172_000
+# Globals.BitcoinAttestationTestnetHeight on testnet-staging a1257325.
+_TESTNET["BITCOIN_ATTESTATION_HEIGHT"] = 1_192_500
+
+# Core's value for a height not set yet (Globals.FundLossAuditHeight on
+# mainnet). A height at or past it is not served: no such block is coming.
+UNSET_HEIGHT = 999_999_999
 
 
 def _gate(name):
@@ -76,6 +86,16 @@ def bridge_intra_block_guard_height():
 
 def bitcoin_attestation_record_height():
     return _gate("FUND_LOSS_AUDIT_HEIGHT")
+
+
+def bitcoin_attestation_height():
+    """Globals.BitcoinAttestationHeight: legacy vaults are frozen from it."""
+    return _gate("BITCOIN_ATTESTATION_HEIGHT")
+
+
+def served_height(height):
+    """A gate height as the API serves it: None while Core has not set it."""
+    return None if height >= UNSET_HEIGHT else height
 
 
 def fund_loss_audit_height():

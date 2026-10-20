@@ -8,7 +8,7 @@ from django.test import TestCase, override_settings
 from rest_framework.test import APIRequestFactory, force_authenticate
 
 from access.models import User
-from api.btc.views import VbtcV2DetailView, VbtcV2ListAllView
+from api.btc.views import VbtcV2DetailView, VbtcV2HeightsView, VbtcV2ListAllView
 from rbx.models import Transaction
 from rbx.tests import make_block, make_token, make_tx
 
@@ -66,3 +66,33 @@ class IsWatchedTests(TestCase):
             get(VbtcV2ListAllView, "/api/btc/vbtc-v2/")
         own = [q["sql"] for q in queries if 'FROM "rbx_transaction"' in q["sql"]]
         self.assertEqual(own, [])
+
+
+class HeightsTests(TestCase):
+    def heights(self):
+        return get(VbtcV2HeightsView, "/api/btc/vbtc-v2/heights/").data
+
+    @override_settings(VBTC_NETWORK="testnet")
+    def test_testnet_serves_cores_record_and_enforcement_heights(self):
+        make_block(height=1_171_480)
+        self.assertEqual(
+            self.heights(),
+            {"record_height": 1_172_000, "enforcement_height": 1_192_500, "latest_block_height": 1_171_480},
+        )
+
+    @override_settings(VBTC_NETWORK="mainnet")
+    def test_mainnet_serves_no_height_while_core_has_not_set_them(self):
+        heights = self.heights()
+        self.assertIsNone(heights["record_height"])
+        self.assertIsNone(heights["enforcement_height"])
+        self.assertIsNone(heights["latest_block_height"])
+
+    @override_settings(VBTC_NETWORK="mainnet", VBTC_FUND_LOSS_AUDIT_HEIGHT=7_600_000, VBTC_BITCOIN_ATTESTATION_HEIGHT=7_690_000)
+    def test_a_height_once_set_is_served(self):
+        heights = self.heights()
+        self.assertEqual((heights["record_height"], heights["enforcement_height"]), (7_600_000, 7_690_000))
+
+    def test_the_route_is_not_taken_for_an_address(self):
+        from django.urls import resolve
+
+        self.assertEqual(resolve("/api/btc/vbtc-v2/heights/").func.view_class, VbtcV2HeightsView)
