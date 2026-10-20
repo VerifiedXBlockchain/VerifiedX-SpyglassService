@@ -1,6 +1,7 @@
 """What the vBTC V2 read endpoints serve for 9.0: whether the chain watches
 a vault, the attestation heights, an open watched withdrawal's pin state,
 and why a closed one closed."""
+from decimal import Decimal
 from unittest.mock import patch
 
 from django.core.cache import cache
@@ -181,3 +182,72 @@ class PinStateTests(WatchedVaultCase):
         status.assert_not_called()
         pin.assert_not_called()
         self.assertEqual(data["withdrawal_requests"][0]["pin_txid"], "btcpin2")
+
+
+class ClosedBecauseTests(WatchedVaultCase):
+    def served(self):
+        from api.btc.serializers import VbtcV2WithdrawalRequestSerializer
+
+        return VbtcV2WithdrawalRequestSerializer(self.row()).data
+
+    def close(self, outcome, refunded=0.003):
+        make_block(height=20)
+        self.reconcile(history(refunded=[{"RequestHash": "r1", "Refunded": refunded, "ClosedAtBlock": 20, "Outcome": outcome}]))
+
+    def test_an_expired_request_says_so_with_its_refund(self):
+        self.close("Expired")
+        data = self.served()
+        self.assertEqual(data["closed_because"], "Expired")
+        self.assertEqual(Decimal(str(data["refunded_amount"])), Decimal("0.003"))
+
+    def test_a_released_request_says_so_and_serves_the_refund_less_its_bitcoin_fee(self):
+        self.close("Released", refunded=0.0029)
+        data = self.served()
+        self.assertEqual(data["closed_because"], "Released")
+        self.assertEqual(Decimal(str(data["refunded_amount"])), Decimal("0.0029"))
+
+    def test_a_void_request_says_so(self):
+        self.close("Void")
+        self.assertEqual(self.served()["closed_because"], "Void")
+
+    def test_an_outcome_spyglass_does_not_know_is_served_as_unknown(self):
+        with self.assertLogs(level="WARNING"):
+            self.close("Settled")
+        self.assertEqual(self.row().status, Status.CANCELLED)
+        self.assertIsNone(self.served()["closed_because"])
+
+    def test_a_watched_cancel_is_cancelled(self):
+        from rbx.tasks import process_transaction
+        from rbx.test_vbtc_dispatch import cancel_tx
+
+        process_transaction(cancel_tx(make_block(height=22), "x1", "U", "sc:w", "r1"))
+        self.assertEqual(self.row().status, Status.CANCELLED)
+        self.assertEqual(self.served()["closed_because"], "Cancelled")
+        self.assertIsNone(self.served()["refunded_amount"])
+
+    def test_an_open_or_paid_request_serves_no_reason(self):
+        self.assertIsNone(self.served()["closed_because"])
+        self.row().__class__.objects.filter(pk=self.row().pk).update(status=Status.COMPLETED, closed_because="Expired")
+        self.assertIsNone(self.served()["closed_because"])
+
+
+class ClosedBecauseMigrationTests(TestCase):
+    def test_rows_closed_by_a_cancel_are_marked_cancelled_and_others_left_unknown(self):
+        import importlib
+
+        from django.apps import apps as live_apps
+
+        from rbx.test_vbtc_dispatch import request_tx
+        from rbx.tasks import process_transaction
+
+        make_token(owner="O", global_balance="0.01", sc_identifier="sc:m")
+        block = make_block(height=10)
+        for name in ("a", "b"):
+            process_transaction(request_tx(block, name, "O", "sc:m", 0.001))
+        cancel = make_tx(make_block(height=11), "c", T.VBTC_V2_WITHDRAWAL_CANCEL, from_address="O")
+        VbtcV2WithdrawalRequest.objects.filter(request_transaction__hash="a").update(status="cancelled", cancel_transaction=cancel)
+        VbtcV2WithdrawalRequest.objects.filter(request_transaction__hash="b").update(status="cancelled")
+        migration = importlib.import_module("rbx.migrations.0082_vbtc_v2_withdrawal_closed_because")
+        migration.mark_cancelled_by_their_cancel(live_apps, None)
+        reasons = dict(VbtcV2WithdrawalRequest.objects.values_list("request_transaction__hash", "closed_because"))
+        self.assertEqual(reasons, {"a": "Cancelled", "b": ""})

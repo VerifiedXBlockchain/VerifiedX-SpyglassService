@@ -1853,6 +1853,12 @@ class VbtcV2WithdrawalRequest(models.Model):
     pin_fee_rate = models.DecimalField(decimal_places=8, max_digits=16, blank=True, null=True)
     releasing = models.BooleanField(default=False)
     expires_at_height = models.BigIntegerField(blank=True, null=True)
+    # Why a cancelled request closed without payment: Cancelled (by its
+    # requester: a watched vault's cancel, or an approved vote), or, on a
+    # watched vault, what the node's history says (VaultWithdrawalState):
+    # Released, Expired or Void. Blank: not known.
+    CLOSE_REASONS = ("Cancelled", "Released", "Expired", "Void")
+    closed_because = models.CharField(max_length=16, blank=True, default="")
 
     @property
     def release_fee(self):

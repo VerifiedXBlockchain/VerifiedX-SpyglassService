@@ -984,7 +984,8 @@ def _close_watched_on_cancel(tx, what, withdrawal):
     withdrawal.cancel_transaction = tx
     withdrawal.cancelled_at = tx.date_crafted
     withdrawal.refunded_amount = None
-    withdrawal.save(update_fields=["status", "cancel_transaction", "cancelled_at", "refunded_amount"])
+    withdrawal.closed_because = "Cancelled"
+    withdrawal.save(update_fields=["status", "cancel_transaction", "cancelled_at", "refunded_amount", "closed_because"])
     withdrawal.token.recompute_pending_withdrawal()
     _replan_settlements_since(withdrawal.token, withdrawal.request_transaction)
 
@@ -1151,10 +1152,15 @@ def _apply_withdrawal_history(token, data):
         if block is None:
             _log_once(token, entry, f"waits for block {closed_at} to be synced")
             continue
+        outcome = entry.get("Outcome")
+        if outcome not in VbtcV2WithdrawalRequest.CLOSE_REASONS:
+            _log_once(token, entry, f"closed with an outcome Spyglass does not know ({outcome!r}); served as unknown")
+            outcome = ""
         withdrawal.status = VbtcV2WithdrawalRequest.Status.CANCELLED
         withdrawal.cancelled_at = block.date_crafted
         withdrawal.refunded_amount = refunded
-        withdrawal.save(update_fields=["status", "cancelled_at", "refunded_amount"])
+        withdrawal.closed_because = outcome
+        withdrawal.save(update_fields=["status", "cancelled_at", "refunded_amount", "closed_because"])
         settled += 1
         if replan_from is None or withdrawal.request_transaction.height < replan_from.height:
             replan_from = withdrawal.request_transaction
@@ -1472,7 +1478,8 @@ def _settle(withdrawal, result):
             return
         withdrawal.status = VbtcV2WithdrawalRequest.Status.CANCELLED
         withdrawal.cancelled_at = result.decided_by.date_crafted
-        withdrawal.save(update_fields=["status", "cancelled_at"])
+        withdrawal.closed_because = "Cancelled"
+        withdrawal.save(update_fields=["status", "cancelled_at", "closed_because"])
         withdrawal.token.recompute_pending_withdrawal()
         _replan_settlements_since(withdrawal.token, withdrawal.request_transaction)
     elif result.outcome is vbtc_cancellation.Outcome.REJECTED:
@@ -1608,7 +1615,8 @@ def apply_vote(tx):
         return
     withdrawal.status = VbtcV2WithdrawalRequest.Status.CANCELLED
     withdrawal.cancelled_at = tx.date_crafted
-    withdrawal.save(update_fields=["status", "cancelled_at"])
+    withdrawal.closed_because = "Cancelled"
+    withdrawal.save(update_fields=["status", "cancelled_at", "closed_because"])
     withdrawal.token.recompute_pending_withdrawal()
     _replan_settlements_since(withdrawal.token, withdrawal.request_transaction)
 

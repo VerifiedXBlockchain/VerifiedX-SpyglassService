@@ -69,6 +69,15 @@ class VbtcV2WithdrawalRequestSerializer(serializers.ModelSerializer):
     def get_expires_at_height(self, withdrawal):
         return withdrawal.expires_at_height if self._open_pin(withdrawal) else None
 
+    # Why a closed request closed without payment (Cancelled, Released,
+    # Expired or Void); null while open, when paid, or when not known.
+    closed_because = serializers.SerializerMethodField()
+
+    def get_closed_because(self, withdrawal):
+        if withdrawal.status != VbtcV2WithdrawalRequest.Status.CANCELLED:
+            return None
+        return withdrawal.closed_because or None
+
     class Meta:
         model = VbtcV2WithdrawalRequest
         fields = (
@@ -93,6 +102,11 @@ class VbtcV2WithdrawalRequestSerializer(serializers.ModelSerializer):
             "pin_fee_rate",
             "releasing",
             "expires_at_height",
+            "closed_because",
+            # What a closed request gave back when the node refunded less
+            # than its amount (a release keeps its Bitcoin fee); null: the
+            # whole amount (VbtcV2WithdrawalRequest.refunded_amount).
+            "refunded_amount",
         )
 
 
