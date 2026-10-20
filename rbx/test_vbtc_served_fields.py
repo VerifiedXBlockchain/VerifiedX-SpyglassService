@@ -9,10 +9,12 @@ from rest_framework.test import APIRequestFactory, force_authenticate
 
 from access.models import User
 from api.btc.views import VbtcV2DetailView, VbtcV2HeightsView, VbtcV2ListAllView
-from rbx.models import Transaction
+from rbx.models import Transaction, VbtcV2WithdrawalRequest
+from rbx.test_vbtc_watched import WatchedVaultCase, history
 from rbx.tests import make_block, make_token, make_tx
 
 T = Transaction.Type
+Status = VbtcV2WithdrawalRequest.Status
 RECORD_AT_100 = override_settings(VBTC_NETWORK="testnet", VBTC_FUND_LOSS_AUDIT_HEIGHT=100)
 STATUS = "rbx.client.get_vbtc_v2_withdrawal_status"
 
@@ -96,3 +98,86 @@ class HeightsTests(TestCase):
         from django.urls import resolve
 
         self.assertEqual(resolve("/api/btc/vbtc-v2/heights/").func.view_class, VbtcV2HeightsView)
+
+
+def node_view(*open_withdrawals, held_sats=1_000_000):
+    return {"Success": True, "Attested": True, "Bitcoin": {
+        "HeldSats": held_sats, "PaidOutForBridgeExitsSats": 0, "DepositAddress": "bc1w",
+        "OpenWithdrawals": list(open_withdrawals)}}
+
+
+def described(state, request_hash="r1", **extra):
+    return {"RequestHash": request_hash, "Kind": "Withdrawal", "State": state, **extra}
+
+
+class PinStateTests(WatchedVaultCase):
+    """setUp: watched vault sc:w with open request r1 (rbx.test_vbtc_watched)."""
+
+    def read_node(self, view):
+        from rbx.vbtc_dispatch import refresh_watched_backing
+
+        with patch(STATUS, return_value=view):
+            return refresh_watched_backing(self.token)
+
+    def served(self):
+        from api.btc.serializers import VbtcV2WithdrawalRequestSerializer
+
+        return VbtcV2WithdrawalRequestSerializer(self.row()).data
+
+    def test_a_waiting_request_is_stored_with_the_block_it_expires_at(self):
+        self.assertTrue(self.read_node(node_view(described("Waiting", FeeRate=5, ExpiresAtVfxHeight=371, BitcoinTxid=None))))
+        data = self.served()
+        self.assertEqual(data["pin_state"], "Waiting")
+        self.assertEqual(data["expires_at_height"], 371)
+        self.assertIsNone(data["pin_txid"])
+        self.assertIsNone(data["pin_fee_rate"])
+        self.assertFalse(data["releasing"])
+
+    def test_a_pinned_request_is_stored_with_its_newest_pin(self):
+        self.read_node(node_view(described("Pinned", FeeRate=12, BitcoinTxid="btcpin2", Releasing=False, ExpiresAtVfxHeight=None)))
+        data = self.served()
+        self.assertEqual((data["pin_state"], data["pin_txid"], data["pin_fee_rate"]), ("Pinned", "btcpin2", 12.0))
+        self.assertIsNone(data["expires_at_height"])
+
+    def test_a_pending_release_is_stored(self):
+        self.read_node(node_view(described("Pinned", FeeRate=3, BitcoinTxid="btcrelease", Releasing=True)))
+        self.assertTrue(self.served()["releasing"])
+
+    def test_a_request_the_node_no_longer_lists_has_its_pin_state_cleared(self):
+        self.read_node(node_view(described("Pinned", FeeRate=12, BitcoinTxid="btcpin2")))
+        self.read_node(node_view())
+        data = self.served()
+        self.assertIsNone(data["pin_state"])
+        self.assertIsNone(data["pin_txid"])
+
+    def test_a_view_without_the_list_leaves_the_pin_state(self):
+        self.read_node(node_view(described("Pinned", FeeRate=12, BitcoinTxid="btcpin2")))
+        view = node_view()
+        del view["Bitcoin"]["OpenWithdrawals"]
+        with self.assertLogs(level="ERROR"):
+            self.read_node(view)
+        self.assertEqual(self.served()["pin_txid"], "btcpin2")
+
+    def test_a_bridge_exit_part_or_an_unreadable_state_is_not_taken_for_the_request(self):
+        self.read_node(node_view(
+            {"RequestHash": "r1", "Kind": "BridgeExit", "State": "Pinned", "BitcoinTxid": "exit"},
+            described("Settled"),
+        ))
+        self.assertIsNone(self.served()["pin_state"])
+
+    def test_a_closed_request_serves_no_pin_state(self):
+        self.read_node(node_view(described("Pinned", FeeRate=12, BitcoinTxid="btcpin2")))
+        make_block(height=20)
+        self.reconcile(history(refunded=[{"RequestHash": "r1", "Refunded": 0.003, "ClosedAtBlock": 20, "Outcome": "Expired"}]))
+        self.assertEqual(self.row().status, Status.CANCELLED)
+        self.assertIsNone(self.served()["pin_state"])
+        self.assertIsNone(self.served()["pin_txid"])
+
+    def test_the_detail_serves_the_stored_pin_state_without_asking_the_node_per_withdrawal(self):
+        self.read_node(node_view(described("Pinned", FeeRate=12, BitcoinTxid="btcpin2")))
+        cache.set(f"vbtcv2:balance_refresh:{self.token.sc_identifier}", 1, timeout=15)  # within the refresh window
+        with patch(STATUS) as status, patch("rbx.client.get_vbtc_v2_withdrawal_pin") as pin:
+            data = get(VbtcV2DetailView, "/api/btc/vbtc-v2/detail/sc:w/", sc_identifier="sc:w").data
+        status.assert_not_called()
+        pin.assert_not_called()
+        self.assertEqual(data["withdrawal_requests"][0]["pin_txid"], "btcpin2")

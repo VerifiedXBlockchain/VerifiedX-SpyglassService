@@ -1841,6 +1841,18 @@ class VbtcV2WithdrawalRequest(models.Model):
     # What a closed request gave back, when the node refunded less than its
     # amount (a release keeps its Bitcoin fee). Null: the whole amount.
     refunded_amount = models.DecimalField(decimal_places=16, max_digits=32, blank=True, null=True)
+    # A watched vault's open request as the node last described it
+    # (GetWithdrawalStatus Bitcoin.OpenWithdrawals, read with the backing by
+    # vbtc_dispatch.refresh_watched_backing): Waiting for its Bitcoin
+    # transaction to be fixed, or Pinned to one. pin_txid and pin_fee_rate
+    # are the newest live pin's; releasing, a release is pinned for it;
+    # expires_at_height, the block it closes at if still waiting. Blank or
+    # null: not read yet, or not a watched vault's open request.
+    pin_state = models.CharField(max_length=16, blank=True, default="")
+    pin_txid = models.CharField(max_length=128, blank=True, default="")
+    pin_fee_rate = models.DecimalField(decimal_places=8, max_digits=16, blank=True, null=True)
+    releasing = models.BooleanField(default=False)
+    expires_at_height = models.BigIntegerField(blank=True, null=True)
 
     @property
     def release_fee(self):

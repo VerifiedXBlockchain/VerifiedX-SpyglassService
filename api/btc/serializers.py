@@ -40,6 +40,34 @@ class VbtcV2WithdrawalRequestSerializer(serializers.ModelSerializer):
     completion_transaction_hash = serializers.CharField(
         source="completion_transaction.hash", read_only=True, default=None
     )
+    # An open request on a watched vault, as the node last described it
+    # (stored by the indexer; see VbtcV2WithdrawalRequest.pin_state). Null
+    # once the request has closed, or before the node has been read.
+    pin_state = serializers.SerializerMethodField()
+    pin_txid = serializers.SerializerMethodField()
+    pin_fee_rate = serializers.SerializerMethodField()
+    releasing = serializers.SerializerMethodField()
+    expires_at_height = serializers.SerializerMethodField()
+
+    def _open_pin(self, withdrawal):
+        return withdrawal.status in VbtcV2WithdrawalRequest.ACTIVE_STATUSES and bool(withdrawal.pin_state)
+
+    def get_pin_state(self, withdrawal):
+        return withdrawal.pin_state if self._open_pin(withdrawal) else None
+
+    def get_pin_txid(self, withdrawal):
+        return (withdrawal.pin_txid or None) if self._open_pin(withdrawal) else None
+
+    def get_pin_fee_rate(self, withdrawal):
+        if not self._open_pin(withdrawal) or withdrawal.pin_fee_rate is None:
+            return None
+        return float(withdrawal.pin_fee_rate)
+
+    def get_releasing(self, withdrawal):
+        return withdrawal.releasing if self._open_pin(withdrawal) else None
+
+    def get_expires_at_height(self, withdrawal):
+        return withdrawal.expires_at_height if self._open_pin(withdrawal) else None
 
     class Meta:
         model = VbtcV2WithdrawalRequest
@@ -60,6 +88,11 @@ class VbtcV2WithdrawalRequestSerializer(serializers.ModelSerializer):
             "completion_transaction_hash",
             "created_at",
             "completed_at",
+            "pin_state",
+            "pin_txid",
+            "pin_fee_rate",
+            "releasing",
+            "expires_at_height",
         )
 
 
