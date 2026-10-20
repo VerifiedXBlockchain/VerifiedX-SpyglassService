@@ -98,6 +98,9 @@ class VbtcV2TokenSerializer(serializers.ModelSerializer):
     # until then the recipient is only the pending owner.
     owner_address = serializers.CharField(source="current_owner", read_only=True)
     pending_owner_address = serializers.SerializerMethodField()
+    # Minted from the recording height on: the chain watches the vault's
+    # Bitcoin (VbtcV2Token.is_watched). Callers select nft__mint_transaction.
+    is_watched = serializers.BooleanField(read_only=True)
 
     def get_pending_owner_address(self, token):
         tx = token.pending_owner_transaction
@@ -119,6 +122,7 @@ class VbtcV2TokenSerializer(serializers.ModelSerializer):
             "description",
             "owner_address",
             "pending_owner_address",
+            "is_watched",
             "image_url",
             "deposit_address",
             "frost_group_public_key",

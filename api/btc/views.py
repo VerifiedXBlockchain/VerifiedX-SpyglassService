@@ -194,7 +194,7 @@ class VbtcDetailView(RetrieveAPIView):
 class VbtcV2ListAllView(GenericAPIView):
 
     def get(self, request, *args, **kwargs):
-        tokens = VbtcV2Token.objects.all().order_by("-created_at")
+        tokens = VbtcV2Token.objects.select_related("nft__mint_transaction").order_by("-created_at")
         results = VbtcV2TokenSerializer(tokens, many=True).data
         return Response({"results": results}, status=200)
 
@@ -221,7 +221,7 @@ class VbtcV2ListView(GenericAPIView):
 
         tokens = VbtcV2Token.objects.filter(
             sc_identifier__in=sc_identifiers
-        ).order_by("-created_at")
+        ).select_related("nft__mint_transaction").order_by("-created_at")
 
         results = VbtcV2TokenSerializer(tokens, many=True).data
         return Response({"results": results}, status=200)
@@ -229,7 +229,7 @@ class VbtcV2ListView(GenericAPIView):
 
 class VbtcV2DetailView(RetrieveAPIView):
     serializer_class = VbtcV2TokenSerializer
-    queryset = VbtcV2Token.objects.all()
+    queryset = VbtcV2Token.objects.select_related("nft__mint_transaction")
     lookup_field = "sc_identifier"
 
     def get(self, request, *args, **kwargs):
