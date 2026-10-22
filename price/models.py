@@ -26,6 +26,13 @@ class CoinPrice(models.Model):
         return f"{self.coin_type}: ${self.usdt_price} ({self.last_updated})"
 
     @property
+    def is_stale(self):
+        """True when this sample is too old to be shown as the current price."""
+
+        age = timezone.now() - self.last_updated
+        return age > timezone.timedelta(seconds=settings.PRICE_STALE_AFTER_SECONDS)
+
+    @property
     def percent_change_1h(self):
 
         try:

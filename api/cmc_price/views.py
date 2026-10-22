@@ -80,6 +80,7 @@ class PriceHistoryView(GenericAPIView):
                 "success": True,
                 "message": "success",
                 "data": data,
+                "stale": not results or results[0].is_stale,
             },
             status=200,
         )

@@ -1,7 +1,10 @@
+import uuid
 from decimal import Decimal
 from unittest.mock import patch
 
-from django.test import TestCase
+from django.test import TestCase, override_settings
+from django.utils import timezone
+from rest_framework.test import APIClient
 
 from price.models import CoinPrice
 from price.utils import PriceUnavailable, update_price, update_prices
@@ -86,3 +89,64 @@ class UpdatePricesTests(TestCase):
 
         vfx = CoinPrice.objects.get(coin_type=CoinPrice.CoinType.VFX)
         self.assertEqual(vfx.usdt_price, Decimal("0.42"))
+
+
+def sample(coin_type, price, age):
+    return CoinPrice.objects.create(
+        coin_type=coin_type,
+        usdt_price=Decimal(price),
+        volume_24h=Decimal("1"),
+        percent_change_24h=Decimal("0"),
+        last_updated=timezone.now() - age,
+    )
+
+
+@override_settings(PRICE_STALE_AFTER_SECONDS=60 * 60)
+class StalePriceTests(TestCase):
+    """A coin whose market went away keeps its last row; the API must say the
+    row is old rather than serve it as the current price."""
+
+    def get(self, path):
+        # The views are wrapped in cache_page; a unique query string keeps one
+        # test's response from being served to the next.
+        return APIClient().get(f"{path}?t={uuid.uuid4().hex}").json()
+
+    def test_a_recent_sample_is_not_stale(self):
+        sample(CoinPrice.CoinType.BTC, "63124.66", timezone.timedelta(minutes=5))
+
+        latest = self.get("/api/cmc-price/btc/")
+        history = self.get("/api/cmc-price/btc/history/")
+
+        self.assertFalse(latest["data"]["stale"])
+        self.assertFalse(history["stale"])
+
+    def test_a_sample_older_than_the_bound_is_stale(self):
+        sample(CoinPrice.CoinType.VFX, "37.9999", timezone.timedelta(days=85))
+
+        latest = self.get("/api/cmc-price/vfx/")
+        history = self.get("/api/cmc-price/vfx/history/")
+
+        self.assertTrue(latest["data"]["stale"])
+        self.assertEqual(latest["data"]["usdt_price"], 37.9999)
+        self.assertTrue(history["stale"])
+        self.assertEqual(len(history["data"]), 1)
+
+    def test_staleness_follows_the_newest_sample(self):
+        sample(CoinPrice.CoinType.VFX, "49.9999", timezone.timedelta(days=88))
+        sample(CoinPrice.CoinType.VFX, "0.42", timezone.timedelta(minutes=10))
+
+        self.assertFalse(self.get("/api/cmc-price/vfx/")["data"]["stale"])
+        self.assertFalse(self.get("/api/cmc-price/vfx/history/")["stale"])
+
+    def test_one_coin_going_stale_does_not_mark_the_other(self):
+        sample(CoinPrice.CoinType.VFX, "37.9999", timezone.timedelta(days=85))
+        sample(CoinPrice.CoinType.BTC, "63124.66", timezone.timedelta(minutes=5))
+
+        self.assertTrue(self.get("/api/cmc-price/vfx/")["data"]["stale"])
+        self.assertFalse(self.get("/api/cmc-price/btc/")["data"]["stale"])
+
+    def test_an_empty_history_is_stale(self):
+        history = self.get("/api/cmc-price/vfx/history/")
+
+        self.assertEqual(history["data"], [])
+        self.assertTrue(history["stale"])
