@@ -50,6 +50,9 @@ class FungibleTokenRetrieveView(FungibleTokenView, RetrieveModelMixin):
         )
 
         addresses = set(unique_addresses + [token.owner_address])
+        deployer = token.create_transaction.from_address
+        if token.initial_supply > Decimal(0) and token.original_owner_address == deployer:
+            addresses.add(deployer)
 
         holders = {}
         for address in addresses:
