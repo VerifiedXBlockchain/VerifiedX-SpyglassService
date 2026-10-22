@@ -521,7 +521,11 @@ class Address(models.Model):
                 )
             )
             | Q(owner_address=address)
-            | Q(original_owner_address=address, initial_supply__gt=0)
+            | Q(
+                original_owner_address=address,
+                create_transaction__from_address=address,
+                initial_supply__gt=0,
+            )
         ).distinct()
 
         return tokens
