@@ -6,8 +6,9 @@ from unittest.mock import patch
 
 from django.core.management import call_command
 from django.test import TestCase
+from rest_framework.test import APIClient
 
-from rbx.models import FungibleToken, FungibleTokenTx, Transaction, TokenVoteTopicVote
+from rbx.models import Address, FungibleToken, FungibleTokenTx, Transaction, TokenVoteTopicVote
 from rbx.tasks import process_transaction
 from rbx.tests import make_block, make_token, make_tx
 
@@ -81,6 +82,48 @@ class TokenFunctionUnderAnyEnvelopeTests(TokenFunctionCase):
     def test_nft_transfer_under_nft_tx_is_not_a_token_function(self):
         self.call("n1", T.NFT_TX, "Transfer()", as_array=True)
         self.assertFalse(FungibleTokenTx.objects.exists())
+
+
+class OwnerChangeKeepsHoldersTests(TestCase):
+    """StateData.TokenContractOwnerChange sets the contract owner and moves no
+    balance: the deployer keeps the initial supply after handing over the token."""
+
+    def setUp(self):
+        block = make_block()
+        deploy = make_tx(block, "deploy", T.NFT_MINT, from_address="A")
+        self.token = FungibleToken.objects.create(
+            sc_identifier="ft:fixed", name="F", ticker="F", owner_address="A", original_owner_address="A",
+            smart_contract=make_token(owner="A", sc_identifier="ft:fixed").nft, create_transaction=deploy,
+            image_base64="", decimal_places=2, initial_supply=Decimal(500),
+            can_mint=False, can_burn=False, can_vote=False,
+        )
+        Address.objects.create(address="A")
+        Address.objects.create(address="B")
+        process_transaction(make_tx(make_block(height=2), "own", T.NFT_TX, from_address="A", data={
+            "Function": "TokenContractOwnerChange()", "ContractUID": "ft:fixed", "FromAddress": "A", "ToAddress": "B"}))
+
+    def test_owner_moves_and_balances_stay(self):
+        self.token.refresh_from_db()
+        self.assertEqual(self.token.owner_address, "B")
+        self.assertEqual(self.token.get_address_balance("A"), Decimal(500))
+        self.assertEqual(self.token.get_address_balance("B"), Decimal(0))
+        self.assertEqual(self.token.circulating_supply, Decimal(500))
+
+    def test_token_detail_lists_the_deployer_as_holder(self):
+        data = APIClient().get("/api/fungible-tokens/ft:fixed/").json()
+        self.assertEqual(data["token"]["owner_address"], "B")
+        self.assertEqual(Decimal(str(data["token"]["circulating_supply"])), Decimal(500))
+        self.assertEqual({k: Decimal(str(v)) for k, v in data["holders"].items()}, {"A": Decimal(500), "B": Decimal(0)})
+
+    def test_deployer_still_lists_the_token(self):
+        tokens = APIClient().get("/api/addresses/A/tokens/").json()["tokens"]
+        self.assertEqual([(t["token"]["sc_identifier"], Decimal(str(t["balance"]))) for t in tokens],
+                         [("ft:fixed", Decimal(500))])
+
+    def test_new_owner_lists_the_token_with_nothing_held(self):
+        tokens = APIClient().get("/api/addresses/B/tokens/").json()["tokens"]
+        self.assertEqual([(t["token"]["sc_identifier"], Decimal(str(t["balance"]))) for t in tokens],
+                         [("ft:fixed", Decimal(0))])
 
 
 class ReindexTokenFunctionsTests(TokenFunctionCase):
