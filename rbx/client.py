@@ -1171,18 +1171,25 @@ def send_testnet_funds(from_address: str, to_address: str, amount: Decimal):
             BASE_URL, f"api/V1/SendTransaction/{from_address}/{to_address}/{amount_str}"
         )
         response = _http.get(url)
+        return parse_send_transaction(response.text)
 
-        text = response.text
+    return None
 
-        if text == "FAIL":
-            return None
 
-        if text == "This is not a valid RBX address to send to. Please verify again.":
-            return None
-
-        hash = text.replace("Success! TxId: ", "")
-        return hash
-
+def parse_send_transaction(text: str):
+    """The hash from SendTransaction's answer, or None when it was refused.
+    Core 9.0 answers {"Result", "Message", "Hash"}; earlier builds answered
+    "Success! TxId: <hash>" or a bare error string."""
+    try:
+        data = json.loads(text)
+    except ValueError:
+        data = None
+    if isinstance(data, dict):
+        if data.get("Result") == "Success" and data.get("Hash"):
+            return data["Hash"]
+        return None
+    if text.startswith("Success! TxId: "):
+        return text[len("Success! TxId: "):].strip() or None
     return None
 
 

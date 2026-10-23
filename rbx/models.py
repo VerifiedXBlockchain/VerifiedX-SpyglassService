@@ -929,11 +929,22 @@ class FaucetWithdrawlRequest(models.Model):
         db_index=True,
     )
 
-    address = models.CharField(max_length=64)
+    # The VFX part. An empty address and a zero amount mean the request asks for BTC only.
+    address = models.CharField(max_length=64, blank=True, default="")
     amount = models.DecimalField(default=0.0, decimal_places=16, max_digits=32)
-    phone = PhoneNumberField()
+    # Empty only on automation requests, which skip the SMS check.
+    phone = PhoneNumberField(blank=True, null=True)
     is_verified = models.BooleanField(default=False)
+    is_automation = models.BooleanField(default=False)
     transaction_hash = models.CharField(max_length=255, blank=True, null=True)
+
+    # The signet BTC part, paid by the node farm's faucet API.
+    btc_address = models.CharField(max_length=100, blank=True, default="")
+    btc_amount = models.DecimalField(default=0, decimal_places=8, max_digits=16)
+    btc_transaction_hash = models.CharField(max_length=64, blank=True, null=True)
+    # The farm's answer was lost, so the BTC may have been paid: it counts against limits and is never retried.
+    btc_payment_unknown = models.BooleanField(default=False)
+    error = models.TextField(blank=True, default="")
 
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
