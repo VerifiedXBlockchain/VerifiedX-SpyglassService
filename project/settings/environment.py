@@ -23,6 +23,19 @@ FAUCET_MAX_PER_VERIFIED_NUMBER = (
     ENV.float("FAUCET_MAX_PER_VERIFIED_NUMBER", 0) if FAUCET_ENABLED else 0
 )
 
+# Signet BTC from the faucet: paid by the node farm's faucet API, testnet only.
+SIGNET_FAUCET_URL = ENV.str("SIGNET_FAUCET_URL", "https://fleet.verifiedx.io/api/signet/faucet/")
+SIGNET_FAUCET_TOKEN = ENV.str("SIGNET_FAUCET_TOKEN", None)
+FAUCET_BTC_ENABLED = bool(FAUCET_ENABLED and SIGNET_FAUCET_TOKEN and ENVIRONMENT == "testnet")
+FAUCET_BTC_MAX_PER_VERIFIED_NUMBER = ENV.str("FAUCET_BTC_MAX_PER_VERIFIED_NUMBER", "0.01")
+
+# Test automation sends this in the X-Faucet-Token header to skip the SMS
+# check (never the caps). Unset turns the bypass off. Automation has its own
+# totals per rolling 24 hours.
+FAUCET_AUTOMATION_TOKEN = ENV.str("FAUCET_AUTOMATION_TOKEN", None) if ENVIRONMENT == "testnet" else None
+FAUCET_AUTOMATION_DAILY_VFX = ENV.str("FAUCET_AUTOMATION_DAILY_VFX", "1000")
+FAUCET_AUTOMATION_DAILY_BTC = ENV.str("FAUCET_AUTOMATION_DAILY_BTC", "0.1")
+
 HEALTH_CHECK_ENABLED = ENV.bool("HEALTH_CHECK_ENABLED", True)
 
 IS_DEVNET = ENV.bool("IS_DEVNET", False)
