@@ -45,10 +45,13 @@ _MAINNET = {
 }
 _TESTNET = {k: 1 for k in _MAINNET}
 _TESTNET["CANCELLATION_VOTE_RULES_HEIGHT"] = 1_019_000
-# Globals.FundLossAuditTestnetHeight on testnet-staging f41b1ed7.
-_TESTNET["FUND_LOSS_AUDIT_HEIGHT"] = 1_172_000
-# Globals.BitcoinAttestationTestnetHeight on testnet-staging a1257325.
-_TESTNET["BITCOIN_ATTESTATION_HEIGHT"] = 1_192_500
+# The testnet chain restarted from genesis on 2026-10-22 (VerifiedX-Core
+# testnet 2cd65002, GlobalsNetworkHeights.cs): the fund-loss rules and the
+# Bitcoin attestation record at Globals.FundLossAuditTestnetHeight (400) and
+# freeze legacy vaults from Globals.BitcoinAttestationTestnetHeight (401). A
+# vault created from block 400 is watched.
+_TESTNET["FUND_LOSS_AUDIT_HEIGHT"] = 400
+_TESTNET["BITCOIN_ATTESTATION_HEIGHT"] = 401
 
 # Core's value for a height not set yet (Globals.FundLossAuditHeight on
 # mainnet). A height at or past it is not served: no such block is coming.

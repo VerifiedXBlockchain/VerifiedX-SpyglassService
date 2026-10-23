@@ -71,16 +71,40 @@ class IsWatchedTests(TestCase):
         self.assertEqual(own, [])
 
 
+@override_settings(VBTC_NETWORK="testnet")
+class ResetTestnetIsWatchedTests(TestCase):
+    """The testnet chain restarted from genesis on 2026-10-22; Core watches
+    every vault created from block 400 there."""
+
+    def setUp(self):
+        cache.clear()
+        minted("sc:before", 399)
+        minted("sc:recording", 400)
+        minted("sc:web1", 2_774)
+
+    def test_a_vault_from_block_400_on_is_watched(self):
+        response = get(VbtcV2ListAllView, "/api/btc/vbtc-v2/")
+        watched = {t["sc_identifier"]: t["is_watched"] for t in response.data["results"]}
+        self.assertEqual(watched, {"sc:before": False, "sc:recording": True, "sc:web1": True})
+
+    def test_the_detail_serves_it_too(self):
+        with patch(STATUS, return_value=None), patch("api.btc.views.BtcClient") as client:
+            client.return_value.get_balance.return_value = None
+            detail = get(VbtcV2DetailView, "/api/btc/vbtc-v2/detail/sc:web1/", sc_identifier="sc:web1")
+        self.assertTrue(detail.data["is_watched"])
+
+
 class HeightsTests(TestCase):
     def heights(self):
         return get(VbtcV2HeightsView, "/api/btc/vbtc-v2/heights/").data
 
     @override_settings(VBTC_NETWORK="testnet")
     def test_testnet_serves_cores_record_and_enforcement_heights(self):
-        make_block(height=1_171_480)
+        # The testnet chain restarted from genesis on 2026-10-22.
+        make_block(height=3_100)
         self.assertEqual(
             self.heights(),
-            {"record_height": 1_172_000, "enforcement_height": 1_192_500, "latest_block_height": 1_171_480},
+            {"record_height": 400, "enforcement_height": 401, "latest_block_height": 3_100},
         )
 
     @override_settings(VBTC_NETWORK="mainnet")
