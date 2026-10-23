@@ -432,6 +432,9 @@ class EscrowTests(TestCase):
         self.token.refresh_from_db()
         self.assertTrue(self.token.is_pending_withdrawal)
 
+    # The legacy vote count, below VbtcCancellationVoteRulesHeight (the
+    # rules from it are in test_vbtc_cancellation).
+    @override_settings(VBTC_CANCELLATION_VOTE_RULES_HEIGHT=999_999_999)
     def test_approved_vote_refunds_and_cancels(self):
         process_transaction(cancel_tx(self.block, "x1", "U", "sc:a", "r1"))
         row = VbtcV2WithdrawalRequest.objects.get(request_transaction__hash="r1")

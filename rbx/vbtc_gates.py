@@ -11,10 +11,12 @@ height or its ledger diverges from the chain's. The values are per network:
     WithdrawalEscrowHeight           1          7,296,200
     V2TransferMultiHeight            1          7,281,000
     V2WithdrawalOwnerAddBackFixHeight 1         7,281,000
-    VbtcCancellationVoteRulesHeight  1,019,000  7,400,500
+    VbtcCancellationVoteRulesHeight  1          7,400,500
 
 VbtcCancellationVoteRulesHeight is from VerifiedX-Core 9601f132 (Globals.cs,
-Program.cs); the others are from 63468588.
+Program.cs); the others are from 63468588. Testnet restarted from genesis on
+2026-10-22 and has every one of them at 1 (VerifiedX-Core testnet 2cd65002,
+GlobalsNetworkHeights.cs).
 
 Which network this deployment indexes comes from settings.VBTC_NETWORK, which
 defaults from the deployment's ENVIRONMENT (testnet) or IS_DEVNET flag; each
@@ -44,11 +46,13 @@ _MAINNET = {
     "BITCOIN_ATTESTATION_HEIGHT": 999_999_999 + 90_000,
 }
 _TESTNET = {k: 1 for k in _MAINNET}
-_TESTNET["CANCELLATION_VOTE_RULES_HEIGHT"] = 1_019_000
-# Globals.FundLossAuditTestnetHeight on testnet-staging f41b1ed7.
-_TESTNET["FUND_LOSS_AUDIT_HEIGHT"] = 1_172_000
-# Globals.BitcoinAttestationTestnetHeight on testnet-staging a1257325.
-_TESTNET["BITCOIN_ATTESTATION_HEIGHT"] = 1_192_500
+# The testnet chain restarted from genesis on 2026-10-22 (VerifiedX-Core
+# testnet 2cd65002, GlobalsNetworkHeights.cs): the fund-loss rules and the
+# Bitcoin attestation record at Globals.FundLossAuditTestnetHeight (400) and
+# freeze legacy vaults from Globals.BitcoinAttestationTestnetHeight (401). A
+# vault created from block 400 is watched.
+_TESTNET["FUND_LOSS_AUDIT_HEIGHT"] = 400
+_TESTNET["BITCOIN_ATTESTATION_HEIGHT"] = 401
 
 # Core's value for a height not set yet (Globals.FundLossAuditHeight on
 # mainnet). A height at or past it is not served: no such block is coming.

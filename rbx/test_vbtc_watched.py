@@ -17,7 +17,7 @@ from rbx.tasks import process_transaction, sync_block
 from rbx.test_vbtc_dispatch import cancel_tx, complete_tx, request_tx
 from rbx.tests import add_transfer, make_block, make_tx, make_token
 from rbx.vbtc_bridge import ExitExpiryUnanswered, expire_exits, read_exit_expiries, rebuild_bridge_state
-from rbx.vbtc_dispatch import reconcile_watched_withdrawals
+from rbx.vbtc_dispatch import reconcile_all_watched_vaults, reconcile_watched_withdrawals
 
 T = Transaction.Type
 Status = VbtcV2WithdrawalRequest.Status
@@ -1044,3 +1044,76 @@ class ReconcileIsolationTests(WatchedVaultCase):
             with self.assertLogs(level="ERROR"):
                 vbtc_dispatch.reconcile_all_watched_vaults()
         self.assertEqual(VbtcV2WithdrawalRequest.objects.get(request_transaction__hash="r2").status, Status.COMPLETED)
+
+
+@override_settings(VBTC_NETWORK="testnet")
+class ResetTestnetWithdrawalTests(TestCase):
+    """VerifiedX-Issues#354, on the testnet heights alone: a vault minted at
+    block 2,774 of the chain restarted on 2026-10-22 is watched, so its
+    withdrawals close as the chain reports them and each is debited from its
+    requester when it is mined."""
+
+    def vault(self, sc_identifier, owner, holders, mint_height):
+        token = make_token(owner=owner, global_balance="0.0001", sc_identifier=sc_identifier)
+        token.nft.mint_transaction = make_tx(make_block(height=mint_height), f"mint-{sc_identifier}",
+                                             T.VBTC_V2_MINT, from_address=owner)
+        token.nft.save(update_fields=["mint_transaction"])
+        for i, (holder, amount) in enumerate(holders):
+            add_transfer(token, make_tx(make_block(height=mint_height + 1 + i), f"{sc_identifier}-s{i}",
+                                        T.VBTC_V2_TRANSFER), owner, holder, amount)
+        return token
+
+    def request(self, height, tx_hash, requester, sc_identifier):
+        process_transaction(request_tx(make_block(height=height), tx_hash, requester, sc_identifier, "0.00002"))
+
+    def row(self, tx_hash):
+        return VbtcV2WithdrawalRequest.objects.get(request_transaction__hash=tx_hash)
+
+    def reconcile(self, token, data):
+        # The pass a block with a Bitcoin report runs (sync_block).
+        with patch(HISTORY, return_value=data), patch("rbx.vbtc_bridge.reconcile_watched_exits", return_value=True):
+            reconcile_all_watched_vaults()
+        token.refresh_from_db()
+
+    def test_paid_withdrawals_complete_and_debit_their_requesters(self):
+        token = self.vault("sc:web1", "A", [("B", "0.00003")], 2_774)
+        self.request(2_964, "rA", "A", "sc:web1")
+        self.request(3_050, "rB", "B", "sc:web1")
+        make_tx(make_block(height=3_001), "repA", T.VBTC_V2_BTC_REPORT)
+        make_tx(make_block(height=3_083), "repB", T.VBTC_V2_BTC_REPORT)
+        self.reconcile(token, history(paid=[
+            {"RequestHash": "rA", "CompletionHash": "repA", "BTCTransactionHash": "c314d462"},
+            {"RequestHash": "rB", "CompletionHash": "repB", "BTCTransactionHash": "3019b484"},
+        ]))
+        self.assertEqual((self.row("rA").status, self.row("rB").status), (Status.COMPLETED, Status.COMPLETED))
+        self.assertEqual(self.row("rB").btc_transaction_hash, "3019b484")
+        self.assertFalse(token.is_pending_withdrawal)
+        # Both payments left the vault: 6,000 sats remain.
+        token.global_balance = Decimal("0.00006")
+        token.save(update_fields=["global_balance"])
+        expected = {"A": Decimal("0.00005"), "B": Decimal("0.00001")}
+        self.assertEqual(token.addresses, expected)
+        self.assertEqual(token.available_balances(current_height=3_100), expected)
+
+    def test_a_release_refunds_less_its_fee_and_a_cancel_closes_its_request(self):
+        token = self.vault("sc:web2", "O", [("B", "0.00007"), ("C", "0.00002")], 2_780)
+        self.request(3_040, "rB", "B", "sc:web2")
+        self.request(3_041, "rC", "C", "sc:web2")
+        process_transaction(cancel_tx(make_block(height=3_055), "xC", "C", "sc:web2", "rC"))
+        self.assertEqual(self.row("rC").status, Status.CANCELLED)
+        make_block(height=3_090)
+        self.reconcile(token, history(refunded=[
+            {"RequestHash": "rB", "Amount": 0.00002, "Refunded": 0.00001076, "Outcome": "Released",
+             "ClosedAtBlock": 3_090},
+            {"RequestHash": "rC", "Amount": 0.00002, "Refunded": 0.00002, "Outcome": "Cancelled",
+             "ClosedAtBlock": 3_055},
+        ]))
+        released = self.row("rB")
+        self.assertEqual((released.status, released.closed_because), (Status.CANCELLED, "Released"))
+        self.assertFalse(token.is_pending_withdrawal)
+        # The release's 924-sat Bitcoin fee left the vault.
+        token.global_balance = Decimal("0.00009076")
+        token.save(update_fields=["global_balance"])
+        expected = {"O": Decimal("0.00001"), "B": Decimal("0.00006076"), "C": Decimal("0.00002")}
+        self.assertEqual(token.addresses, expected)
+        self.assertEqual(token.available_balances(current_height=3_100), expected)
