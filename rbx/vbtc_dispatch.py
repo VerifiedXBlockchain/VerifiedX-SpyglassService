@@ -1287,6 +1287,30 @@ def refresh_all_watched_backings():
             refresh_watched_backing(token)
 
 
+def refresh_pins_after_block(height):
+    """The watched vaults a block's withdrawal requests (type 27, single or
+    multi-contract) or fee bumps and releases (type 44) touched, read again
+    from the node: Core fixes a request's Bitcoin transaction, a higher fee
+    or a release in that block, so its pin state changes there, not at the
+    next Bitcoin report. Only those vaults are asked."""
+    sc_identifiers = set(
+        VbtcV2WithdrawalRequest.objects.filter(request_transaction__height=height).values_list(
+            "token__sc_identifier", flat=True
+        )
+    )
+    for raw in Transaction.objects.filter(height=height, type=Transaction.Type.VBTC_V2_COIN_PIN).values_list(
+        "data", flat=True
+    ):
+        sc_uid = net_string(field(parse_object(raw), "ContractUID"))
+        if sc_uid:
+            sc_identifiers.add(sc_uid)
+    if not sc_identifiers:
+        return
+    for token in VbtcV2Token.objects.filter(sc_identifier__in=sc_identifiers).select_related("nft__mint_transaction"):
+        if token.is_watched:
+            refresh_watched_backing(token)
+
+
 def refresh_backing(token, client):
     """The vault's backing: from the node for a vault the chain watches,
     from the Bitcoin providers otherwise. A watched vault whose node does
