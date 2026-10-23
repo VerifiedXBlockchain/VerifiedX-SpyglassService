@@ -123,6 +123,9 @@ def _fulfil(request_pk, mark_verified=False):
                 withdrawl_request.btc_payment_unknown = e.unknown
                 errors.append(str(e))
 
+        if withdrawl_request.btc_payment_unknown and not any("may have gone through" in e for e in errors):
+            # Reported until someone checks the farm's admin, but never sent again.
+            errors.append("the BTC payment's result is unknown; it may have gone through")
         withdrawl_request.error = "; ".join(errors)
         withdrawl_request.save()
 

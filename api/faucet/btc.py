@@ -29,10 +29,12 @@ def send_signet_btc(address, amount, note=""):
             headers={"Authorization": f"Bearer {settings.SIGNET_FAUCET_TOKEN}"},
             timeout=TIMEOUT_SECONDS,
         )
-    except requests.ReadTimeout as e:
-        raise SignetFaucetError(f"the BTC faucet did not answer in time; the payment may have gone through: {e}", unknown=True) from e
-    except requests.RequestException as e:
+    except requests.ConnectTimeout as e:
+        # The connection never opened, so nothing was sent.
         raise SignetFaucetError(f"the BTC faucet could not be reached: {e}") from e
+    except requests.RequestException as e:
+        # Any other failure (a read timeout, a reset mid-answer) can come after the farm sent.
+        raise SignetFaucetError(f"the BTC faucet's answer was lost; the payment may have gone through: {e}", unknown=True) from e
     try:
         body = response.json()
     except ValueError:

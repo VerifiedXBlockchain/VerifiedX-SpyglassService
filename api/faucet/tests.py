@@ -148,6 +148,19 @@ class FaucetTests(TestCase):
         self.assertEqual(self.request({"btc_address": BTC_ADDRESS, "btc_amount": "0.005", "phone": PHONE}).status_code, 400)
         self.assertEqual(self.btc.call_count, 1)
 
+    def test_a_retry_keeps_reporting_an_unknown_btc_result(self):
+        self.vfx.return_value = None  # VFX fails the first time
+        self.btc.side_effect = SignetFaucetError("the BTC faucet's answer was lost; the payment may have gone through", unknown=True)
+        uuid = self.request({"address": VFX_ADDRESS, "amount": "5", "btc_address": BTC_ADDRESS, "btc_amount": "0.002", "phone": PHONE}).data["uuid"]
+        self.assertEqual(self.verify(uuid).status_code, 400)
+        self.vfx.return_value = VFX_HASH
+        response = self.verify(uuid)
+        # VFX went through on the retry, BTC was not sent again, and its unknown result is still reported.
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.data["hash"], VFX_HASH)
+        self.assertIn("result is unknown", response.data["message"])
+        self.assertEqual(self.btc.call_count, 1)
+
     def test_automation_skips_the_sms_and_pays_at_once(self):
         response = self.request(
             {"address": VFX_ADDRESS, "amount": "5", "btc_address": BTC_ADDRESS, "btc_amount": "0.002"},
@@ -227,7 +240,7 @@ class SignetFaucetClientTests(TestCase):
             with self.assertRaisesRegex(SignetFaucetError, "no ready signer") as known:
                 send_signet_btc(BTC_ADDRESS, Decimal("0.002"))
         self.assertFalse(known.exception.unknown)
-        with patch("api.faucet.btc.requests.post", side_effect=requests.ConnectionError("down")):
+        with patch("api.faucet.btc.requests.post", side_effect=requests.ConnectTimeout("down")):
             with self.assertRaisesRegex(SignetFaucetError, "could not be reached") as unreachable:
                 send_signet_btc(BTC_ADDRESS, Decimal("0.002"))
         self.assertFalse(unreachable.exception.unknown)
@@ -238,6 +251,10 @@ class SignetFaucetClientTests(TestCase):
             with self.assertRaises(SignetFaucetError) as timeout:
                 send_signet_btc(BTC_ADDRESS, Decimal("0.002"))
         self.assertTrue(timeout.exception.unknown)
+        with patch("api.faucet.btc.requests.post", side_effect=requests.ConnectionError("reset by peer")):
+            with self.assertRaises(SignetFaucetError) as reset:
+                send_signet_btc(BTC_ADDRESS, Decimal("0.002"))
+        self.assertTrue(reset.exception.unknown)
         with patch("api.faucet.btc.requests.post", return_value=FakeResponse(504, None)):
             with self.assertRaises(SignetFaucetError) as gateway:
                 send_signet_btc(BTC_ADDRESS, Decimal("0.002"))
