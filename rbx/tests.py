@@ -2232,6 +2232,7 @@ class NodeApiTokenTests(TestCase):
             client._http.get(url, timeout=(5, 30))
         get.assert_called_once_with(url, timeout=(5, 30))
 
+
 class HealthCheckAlertTests(TestCase):
     """Health-check alerts go to Discord (shared ops channel) and SMS, and a
     failure on one channel never blocks the other."""
@@ -2280,3 +2281,5 @@ class HealthCheckAlertTests(TestCase):
 
         with patch("rbx.discord_alerts.requests.post", side_effect=real_requests.ConnectionError("down")):
             self.assertFalse(send_discord_alert("x"))
+
+

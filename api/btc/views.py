@@ -10,7 +10,7 @@ from django.db.models import Case, F, Max, Q, Value, When
 from rest_framework.response import Response
 from rest_framework.generics import GenericAPIView, RetrieveAPIView
 from api.btc.constants import FALLBACK_VBTC_IMAGE_DATA
-from rbx.vbtc_dispatch import refresh_backing
+from rbx.vbtc_dispatch import refresh_watched_backing
 from api.btc.serializers import (
     VbtcTokenSerializer,
     VbtcV2TokenSerializer,
@@ -230,21 +230,23 @@ class VbtcV2ListView(GenericAPIView):
 
 
 class VbtcV2DetailView(RetrieveAPIView):
+    # Serves the row as indexed. The deposit balance comes from the 10-minute
+    # update_vbtc_balances sweep, not a live provider call: that call ran
+    # inside the request, and a slow provider ladder held gunicorn workers
+    # past their timeout, so wallets polling this endpoint never got an answer.
     serializer_class = VbtcV2TokenSerializer
     queryset = VbtcV2Token.objects.select_related("nft__mint_transaction")
     lookup_field = "sc_identifier"
 
     def get(self, request, *args, **kwargs):
         token = self.get_object()
-        # Throttle the live refresh per token — this endpoint doubles as the
-        # on-demand balance refresh (it updates the row), and UI polling
-        # shouldn't translate into one upstream provider call per request.
-        # Within the window, serve the row as-is (still fresh from the last
-        # refresh or the 10-min sweep). cache.add is atomic — only one
-        # concurrent request wins the refresh slot.
+        # A watched vault's backing is the node's figure, so the view asks the
+        # node (short timeouts), throttled per token so wallet polling is not
+        # one node call per request. A legacy vault never makes the provider
+        # call here: it held gunicorn workers on mainnet; the sweep covers it.
         throttle_key = f"vbtcv2:balance_refresh:{token.sc_identifier}"
-        if cache.add(throttle_key, 1, timeout=15):
-            refresh_backing(token, BtcClient())
+        if token.is_watched and cache.add(throttle_key, 1, timeout=15):
+            refresh_watched_backing(token)
             token.refresh_from_db()
         return Response(self.get_serializer(token).data)
 
