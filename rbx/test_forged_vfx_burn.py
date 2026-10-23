@@ -70,3 +70,13 @@ class TestnetForgedVfxBurnTests(TestCase):
         forged_vfx_burn.apply_at(HEIGHT)
 
         self.assertFalse(ForgedVfxBurn.objects.exists())
+
+
+class BurnHeightTests(TestCase):
+    @override_settings(VBTC_NETWORK="mainnet", FORGED_VFX_BURN_HEIGHT=None, VBTC_FUND_LOSS_AUDIT_HEIGHT=7_580_000)
+    def test_the_burn_follows_the_fund_loss_height_when_not_pinned(self):
+        self.assertEqual(forged_vfx_burn.burn_height(), 7_580_000)
+
+    @override_settings(VBTC_NETWORK="mainnet", FORGED_VFX_BURN_HEIGHT=7_581_000, VBTC_FUND_LOSS_AUDIT_HEIGHT=7_580_000)
+    def test_a_pinned_burn_height_wins(self):
+        self.assertEqual(forged_vfx_burn.burn_height(), 7_581_000)
