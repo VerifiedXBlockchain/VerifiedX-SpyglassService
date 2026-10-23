@@ -1117,3 +1117,103 @@ class ResetTestnetWithdrawalTests(TestCase):
         expected = {"O": Decimal("0.00001"), "B": Decimal("0.00006076"), "C": Decimal("0.00002")}
         self.assertEqual(token.addresses, expected)
         self.assertEqual(token.available_balances(current_height=3_100), expected)
+
+
+class PinBlocks:
+    """Blocks carrying withdrawal requests and type 44 transactions, synced
+    with the node's GetWithdrawalStatus answer patched."""
+
+    def block(self, height, *txs):
+        return {"Height": height, "Hash": f"block-{height}", "PrevHash": "", "Validator": "V", "ValidatorSignature": "",
+                "ValidatorAnswer": "", "ChainRefId": "", "MerkleRoot": "", "StateRoot": "", "TotalReward": 0,
+                "TotalAmount": 0, "TotalValidators": 0, "Version": 1, "Size": 0, "BCraftTime": 0, "Timestamp": 1760000000,
+                "Transactions": [{"ToAddress": tx.get("FromAddress", ""), "Amount": 0, "Fee": 0, "Signature": "", **tx}
+                                 for tx in txs]}
+
+    def request_tx_data(self, tx_hash, requester, *contracts):
+        if len(contracts) == 1:
+            data = {"Function": "VBTCWithdrawalRequest()", "ContractUID": contracts[0], "RequestorAddress": requester,
+                    "BTCAddress": "btc-payout-addr", "Amount": 0.001, "FeeRate": 3}
+        else:
+            data = {"Function": "VBTCWithdrawalRequestMultiV2()", "BTCAddress": "btc-payout-addr",
+                    "FeeRate": 3, "Inputs": [{"SCUID": sc, "Amount": 0.001} for sc in contracts]}
+        return {"Hash": tx_hash, "TransactionType": int(T.VBTC_V2_WITHDRAWAL_REQUEST), "FromAddress": requester,
+                "Data": json.dumps(data)}
+
+    def coin_pin(self, tx_hash, request_hash, fee_rate, release=False):
+        function = "VBTCWithdrawalRelease()" if release else "VBTCWithdrawalFeeBump()"
+        return {"Hash": tx_hash, "TransactionType": int(T.VBTC_V2_COIN_PIN), "FromAddress": "U",
+                "Data": json.dumps({"Function": function, "ContractUID": "sc:w", "WithdrawalRequestHash": request_hash,
+                                    "FeeRate": fee_rate})}
+
+    def view(self, *entries):
+        return {"Success": True, "Attested": True, "Bitcoin": {
+            "HeldSats": 1_000_000, "PaidOutForBridgeExitsSats": 0, "DepositAddress": "bc1w", "OpenWithdrawals": list(entries)}}
+
+    def pinned(self, request_hash, txid, fee_rate, releasing=False):
+        return {"RequestHash": request_hash, "Kind": "Withdrawal", "State": "Pinned", "BitcoinTxid": txid,
+                "FeeRate": fee_rate, "Releasing": releasing}
+
+    def sync(self, data, view):
+        with patch(STATUS, return_value=view) as node:
+            sync_block(data["Height"], data=data, notify=False)
+        return node
+
+    def pin(self, request_hash):
+        row = VbtcV2WithdrawalRequest.objects.get(request_transaction__hash=request_hash)
+        return row.pin_state, row.pin_txid, row.pin_fee_rate, row.releasing
+
+
+@WATCHING
+class PinRefreshAfterBlockTests(PinBlocks, WatchedVaultCase):
+    """VerifiedX-Issues#362: Core pins a watched withdrawal's Bitcoin
+    transaction in the block of its request, and a fee bump or a release in
+    the block of its type 44. The vaults those blocks touch are read again
+    after the block, not at the next Bitcoin report."""
+
+    def test_a_request_block_stores_the_pin_it_made(self):
+        node = self.sync(self.block(40, self.request_tx_data("r2", "U", "sc:w")),
+                         self.view(self.pinned("r2", "btc-r2", 3)))
+        node.assert_called_once_with("sc:w")
+        self.assertEqual(self.pin("r2"), ("Pinned", "btc-r2", Decimal(3), False))
+
+    def test_a_multi_request_block_reads_every_watched_vault_it_names(self):
+        second = make_token(owner="O", global_balance="0.01", sc_identifier="sc:w2")
+        second.nft.mint_transaction = make_tx(make_block(height=7), "mint2", T.VBTC_V2_MINT, from_address="O")
+        second.nft.save(update_fields=["mint_transaction"])
+        add_transfer(second, make_tx(make_block(height=8), "s2", T.VBTC_V2_TRANSFER), "O", "U", "0.004")
+        node = self.sync(self.block(40, self.request_tx_data("m1", "U", "sc:w", "sc:w2")),
+                         self.view(self.pinned("m1", "btc-m1", 3)))
+        self.assertEqual(sorted(call.args[0] for call in node.call_args_list), ["sc:w", "sc:w2"])
+        self.assertEqual(
+            set(VbtcV2WithdrawalRequest.objects.filter(request_transaction__hash="m1").values_list("pin_txid", flat=True)),
+            {"btc-m1"},
+        )
+
+    def test_a_fee_bump_block_stores_the_new_pin(self):
+        self.sync(self.block(40), self.view(self.pinned("r1", "btc-first", 1)))
+        self.sync(self.block(41, self.coin_pin("b1", "r1", 9)), self.view(self.pinned("r1", "btc-bumped", 9)))
+        self.assertEqual(self.pin("r1"), ("Pinned", "btc-bumped", Decimal(9), False))
+
+    def test_a_release_block_stores_the_release(self):
+        self.sync(self.block(41, self.coin_pin("x1", "r1", 4, release=True)),
+                  self.view(self.pinned("r1", "btc-release", 4, releasing=True)))
+        self.assertEqual(self.pin("r1"), ("Pinned", "btc-release", Decimal(4), True))
+
+    def test_a_block_without_them_asks_the_node_nothing(self):
+        transfer = {"Hash": "t9", "TransactionType": int(T.TX), "FromAddress": "A", "ToAddress": "B", "Amount": 1, "Data": None}
+        node = self.sync(self.block(40, transfer), self.view())
+        node.assert_not_called()
+
+    def test_a_failing_read_keeps_the_block(self):
+        with patch("rbx.vbtc_dispatch.refresh_pins_after_block", side_effect=RuntimeError("node broke")):
+            with self.assertLogs(level="ERROR"):
+                sync_block(40, data=self.block(40, self.request_tx_data("r2", "U", "sc:w")), notify=False)
+        self.assertTrue(VbtcV2WithdrawalRequest.objects.filter(request_transaction__hash="r2").exists())
+
+
+@override_settings(VBTC_NETWORK="testnet", VBTC_FUND_LOSS_AUDIT_HEIGHT=1000)
+class PinRefreshLegacyVaultTests(PinBlocks, WatchedVaultCase):
+    def test_a_request_block_on_a_legacy_vault_asks_the_node_nothing(self):
+        node = self.sync(self.block(40, self.request_tx_data("r2", "U", "sc:w")), self.view())
+        node.assert_not_called()

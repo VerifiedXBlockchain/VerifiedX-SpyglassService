@@ -303,6 +303,14 @@ def sync_block(height: int, data: Optional[dict] = None, notify: bool = True) ->
             vbtc_dispatch.refresh_all_watched_backings()
         except Exception:
             logging.exception(f"Reading the watched vaults' backing after block {height} failed")
+    else:
+        # A withdrawal request or a fee bump or release pins a Bitcoin
+        # transaction in its own block: the vaults it touched are read again
+        # now, not at the next report.
+        try:
+            vbtc_dispatch.refresh_pins_after_block(height)
+        except Exception:
+            logging.exception(f"Reading the watched vaults' pins after block {height} failed")
 
     if block_created and notify:
         b = None
