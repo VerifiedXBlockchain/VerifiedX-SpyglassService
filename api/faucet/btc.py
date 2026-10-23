@@ -12,7 +12,12 @@ TIMEOUT_SECONDS = 25
 
 
 class SignetFaucetError(Exception):
-    pass
+    """A BTC payment that failed. `unknown` when it may have gone through anyway
+    (the farm sends before answering, so a lost answer proves nothing)."""
+
+    def __init__(self, message, unknown=False):
+        super().__init__(message)
+        self.unknown = unknown
 
 
 def send_signet_btc(address, amount, note=""):
@@ -24,12 +29,15 @@ def send_signet_btc(address, amount, note=""):
             headers={"Authorization": f"Bearer {settings.SIGNET_FAUCET_TOKEN}"},
             timeout=TIMEOUT_SECONDS,
         )
+    except requests.ReadTimeout as e:
+        raise SignetFaucetError(f"the BTC faucet did not answer in time; the payment may have gone through: {e}", unknown=True) from e
     except requests.RequestException as e:
         raise SignetFaucetError(f"the BTC faucet could not be reached: {e}") from e
     try:
         body = response.json()
     except ValueError:
-        body = {}
+        # Not the farm's answer (a proxy's error page, say): whether it sent is unknown.
+        raise SignetFaucetError(f"the BTC faucet answered HTTP {response.status_code} without a result; the payment may have gone through", unknown=True)
     if response.status_code == 200 and body.get("txid"):
         return body["txid"]
     reason = body.get("error") or f"HTTP {response.status_code}"

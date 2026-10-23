@@ -942,6 +942,8 @@ class FaucetWithdrawlRequest(models.Model):
     btc_address = models.CharField(max_length=100, blank=True, default="")
     btc_amount = models.DecimalField(default=0, decimal_places=8, max_digits=16)
     btc_transaction_hash = models.CharField(max_length=64, blank=True, null=True)
+    # The farm's answer was lost, so the BTC may have been paid: it counts against limits and is never retried.
+    btc_payment_unknown = models.BooleanField(default=False)
     error = models.TextField(blank=True, default="")
 
     created_at = models.DateTimeField(auto_now_add=True)

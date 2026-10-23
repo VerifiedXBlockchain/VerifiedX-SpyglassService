@@ -115,6 +115,39 @@ class FaucetTests(TestCase):
         self.assertEqual((response.data["hash"], response.data["btc_hash"]), (VFX_HASH, None))
         self.assertIn("insufficient funds", FaucetWithdrawlRequest.objects.get().error)
 
+    def test_a_request_is_never_paid_twice(self):
+        from api.faucet.views import _fulfil
+
+        uuid = self.request({"address": VFX_ADDRESS, "amount": "5", "btc_address": BTC_ADDRESS, "btc_amount": "0.002", "phone": PHONE}).data["uuid"]
+        self.assertEqual(self.verify(uuid).status_code, 200)
+        # A second payment attempt (a racing verify that read the request before the first saved) re-reads
+        # the request under the lock and finds nothing left to pay.
+        pk = FaucetWithdrawlRequest.objects.get().pk
+        self.assertEqual(_fulfil(pk, mark_verified=True).status_code, 200)
+        self.assertEqual((self.vfx.call_count, self.btc.call_count), (1, 1))
+
+    def test_a_partly_paid_request_finishes_its_unpaid_part(self):
+        self.btc.side_effect = SignetFaucetError("the BTC faucet refused: no ready signer")
+        uuid = self.request({"address": VFX_ADDRESS, "amount": "5", "btc_address": BTC_ADDRESS, "btc_amount": "0.008", "phone": PHONE}).data["uuid"]
+        self.assertEqual(self.verify(uuid).status_code, 400)
+        self.btc.side_effect = None
+        response = self.verify(uuid)
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual((response.data["hash"], response.data["btc_hash"]), (VFX_HASH, BTC_TXID))
+        # The code is checked once, VFX is not sent again, and the request's own VFX doesn't count against it.
+        self.assertEqual((self.check.call_count, self.vfx.call_count, self.btc.call_count), (1, 1, 2))
+        self.assertIn("Already verified", self.verify(uuid).data["message"])
+
+    def test_an_unknown_btc_payment_counts_and_is_never_retried(self):
+        self.btc.side_effect = SignetFaucetError("the BTC faucet did not answer in time", unknown=True)
+        uuid = self.request({"btc_address": BTC_ADDRESS, "btc_amount": "0.008", "phone": PHONE}).data["uuid"]
+        self.assertEqual(self.verify(uuid).status_code, 400)
+        self.assertTrue(FaucetWithdrawlRequest.objects.get().btc_payment_unknown)
+        self.assertIn("Already verified", self.verify(uuid).data["message"])
+        # The 0.008 that may have been paid still counts: 0.008 + 0.005 > 0.01.
+        self.assertEqual(self.request({"btc_address": BTC_ADDRESS, "btc_amount": "0.005", "phone": PHONE}).status_code, 400)
+        self.assertEqual(self.btc.call_count, 1)
+
     def test_automation_skips_the_sms_and_pays_at_once(self):
         response = self.request(
             {"address": VFX_ADDRESS, "amount": "5", "btc_address": BTC_ADDRESS, "btc_amount": "0.002"},
@@ -190,9 +223,22 @@ class SignetFaucetClientTests(TestCase):
         with patch("api.faucet.btc.requests.post", return_value=FakeResponse(429, {"error": "daily cap"})):
             with self.assertRaisesRegex(SignetFaucetError, "daily cap"):
                 send_signet_btc(BTC_ADDRESS, Decimal("0.002"))
-        with patch("api.faucet.btc.requests.post", return_value=FakeResponse(502, None)):
-            with self.assertRaisesRegex(SignetFaucetError, "HTTP 502"):
+        with patch("api.faucet.btc.requests.post", return_value=FakeResponse(502, {"status": "failed", "error": "no ready signer"})):
+            with self.assertRaisesRegex(SignetFaucetError, "no ready signer") as known:
                 send_signet_btc(BTC_ADDRESS, Decimal("0.002"))
+        self.assertFalse(known.exception.unknown)
         with patch("api.faucet.btc.requests.post", side_effect=requests.ConnectionError("down")):
-            with self.assertRaisesRegex(SignetFaucetError, "could not be reached"):
+            with self.assertRaisesRegex(SignetFaucetError, "could not be reached") as unreachable:
                 send_signet_btc(BTC_ADDRESS, Decimal("0.002"))
+        self.assertFalse(unreachable.exception.unknown)
+
+    def test_a_lost_answer_leaves_the_payment_unknown(self):
+        # The farm sends before answering: a read timeout or a proxy's error page proves nothing.
+        with patch("api.faucet.btc.requests.post", side_effect=requests.ReadTimeout("slow")):
+            with self.assertRaises(SignetFaucetError) as timeout:
+                send_signet_btc(BTC_ADDRESS, Decimal("0.002"))
+        self.assertTrue(timeout.exception.unknown)
+        with patch("api.faucet.btc.requests.post", return_value=FakeResponse(504, None)):
+            with self.assertRaises(SignetFaucetError) as gateway:
+                send_signet_btc(BTC_ADDRESS, Decimal("0.002"))
+        self.assertTrue(gateway.exception.unknown)
