@@ -118,6 +118,7 @@ class VbtcV2WithdrawRequestMultiPrepareViewTests(TestCase):
             [{"sc_identifier": "sc:big", "amount": True}],
             [{"sc_identifier": "sc:big", "amount": 0}],
             [{"sc_identifier": "sc:big", "amount": -0.1}],
+            [{"sc_identifier": "sc:big", "amount": 10**400}],
             [{"sc_identifier": "sc:big", "amount": 0.1}, {"sc_identifier": "sc:small", "amount": [0.1]}],
         ]:
             with mock.patch("api.btc.views.get_raw_request_withdrawal_multi_tx") as prepare:

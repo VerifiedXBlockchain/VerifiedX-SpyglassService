@@ -497,7 +497,10 @@ def _valid_withdrawal_input(entry):
         return False
     if isinstance(amount, bool) or not isinstance(amount, (int, float)):
         return False
-    return math.isfinite(amount) and amount > 0
+    try:
+        return math.isfinite(amount) and amount > 0
+    except OverflowError:  # a JSON integer past the float range
+        return False
 
 
 class VbtcV2WithdrawRequestMultiPrepareView(GenericAPIView):
