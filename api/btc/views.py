@@ -28,6 +28,7 @@ from rbx.client import (
     get_raw_transfer_vbtc_tx,
     send_raw_transfer_vbtc_tx,
     get_raw_request_withdrawal_tx,
+    get_raw_request_withdrawal_multi_tx,
     send_raw_request_withdrawal_tx,
     prepare_complete_withdrawal,
     execute_complete_withdrawal,
@@ -481,6 +482,42 @@ class VbtcV2WithdrawRequestPrepareView(GenericAPIView):
             "FeeRate": request.data["fee_rate"],
         }
         return _vbtc_v2_proxy(get_raw_request_withdrawal_tx, payload, "Withdrawal request TX preparation failed")
+
+
+class VbtcV2WithdrawRequestMultiPrepareView(GenericAPIView):
+    """One withdrawal request drawn from several vaults (Core's
+    GetRawRequestWithdrawalMultiTxData). The wallet names the shares in
+    `inputs`: this node holds no local record of a wallet's vaults, so its
+    own allocation could not see them. Core checks every share against the
+    state trei (balance, the per-share fee floor, at most 10 vaults, the
+    destination) and answers with the single-vault shape when one input
+    covers the total. The signed hash goes through withdraw/request/send/.
+    """
+
+    def post(self, request, *args, **kwargs):
+        err = _require_fields(request.data, ["requestor_address", "btc_address", "total_amount", "fee_rate", "inputs"])
+        if err:
+            return err
+
+        inputs = request.data["inputs"]
+        if not isinstance(inputs, list) or not all(
+            isinstance(i, dict) and i.get("sc_identifier") and i.get("amount") for i in inputs
+        ):
+            return Response(
+                {"success": False, "message": "inputs must be a list of {sc_identifier, amount}"},
+                status=400,
+            )
+
+        payload = {
+            "RequestorAddress": request.data["requestor_address"],
+            "BTCAddress": request.data["btc_address"],
+            "TotalAmount": request.data["total_amount"],
+            "FeeRate": request.data["fee_rate"],
+            "Inputs": [{"SCUID": i["sc_identifier"], "Amount": i["amount"]} for i in inputs],
+        }
+        return _vbtc_v2_proxy(
+            get_raw_request_withdrawal_multi_tx, payload, "Multi-vault withdrawal request TX preparation failed"
+        )
 
 
 class VbtcV2WithdrawRequestSendView(GenericAPIView):

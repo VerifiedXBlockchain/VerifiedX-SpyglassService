@@ -130,6 +130,28 @@ POST /api/btc/vbtc-v2/withdraw/cancel/
 { "hash": "...", "signature": "...", "public_key": "..." }
 ```
 
+### Withdrawal Request from several vaults (Core 9.0)
+
+**Prepare:** `POST /api/btc/vbtc-v2/withdraw/multi/prepare/` (Core `GetRawRequestWithdrawalMultiTxData`)
+```json
+// Request: the wallet names the shares (at most 10 watched vaults, summing to total_amount)
+{
+  "requestor_address": "x...",
+  "btc_address": "tb1q...",
+  "total_amount": 0.00007,
+  "fee_rate": 3,
+  "inputs": [
+    { "sc_identifier": "guid:timestamp", "amount": 0.00005 },
+    { "sc_identifier": "guid:timestamp", "amount": 0.00002 }
+  ]
+}
+
+// Response: Core's answer; IsMultiContract false when one input covers the total (single shape)
+{ "success": true, "Hash": "...", "Fee": 0.00001375, "Data": "...", "IsMultiContract": true, "Allocations": [...], "BitcoinTransactions": 2, ... }
+```
+
+Each share pays its own Bitcoin fee from its own amount, so every input must clear `fee_rate × 154 + 330` sats. Sign `Hash` and submit through **Send** above (`withdraw/request/send/`).
+
 ### Withdrawal Complete (FROST)
 
 **Prepare:** `POST /api/btc/vbtc-v2/withdraw/complete/prepare/`
