@@ -23,7 +23,7 @@ from rbx.chain_contract import smart_contract_from_chain
 from rbx.client import get_master_nodes, get_block, get_nft, get_topics
 from shop.media import scp_down_folder, upload_to_s3
 from rbx.exceptions import RBXException
-from rbx.vbtc_gates import field, net_string, parse_envelope, parse_object
+from rbx.vbtc_gates import field, ledger_rules_batch_height, net_string, parse_envelope, parse_object
 from rbx import forged_vfx_burn, historical_reserve_reversals, legacy_token_transfers, vbtc_bridge, vbtc_dispatch
 from rbx.models import (
     FungibleToken,
@@ -1291,6 +1291,14 @@ def process_transaction(tx: Transaction):
 #     )
 
 
+def btc_name_record(btc_address, sender):
+    """The BTC name at [btc_address] that a transfer or delete from [sender]
+    acts on: the sender's own when the address holds more than one (Core acts
+    only on the sender's record), else the one there. None when there is none."""
+    records = Adnr.objects.filter(is_btc=True, btc_address=btc_address)
+    return records.filter(address=sender).first() or records.first()
+
+
 def process_adnr(tx):
     if tx.type != Transaction.Type.ADDRESS:
         print("Not an ADNR TX")
@@ -1360,13 +1368,22 @@ def process_adnr(tx):
         btc_to_address = parsed["BTCToAddress"]
         btc_from_address = parsed["BTCFromAddress"]
 
-        try:
-            adnr = Adnr.objects.get(btc_address=btc_from_address)
-            adnr.btc_address = btc_to_address
-            adnr.save()
-        except Adnr.DoesNotExist:
+        adnr = btc_name_record(btc_from_address, tx.from_address)
+        if adnr is None:
             print(f"ADNR with btc_address of {btc_from_address} not found.")
-            pass
+        elif tx.height >= ledger_rules_batch_height() and Adnr.objects.filter(
+            is_btc=True, btc_address=btc_to_address
+        ).exists():
+            # Core (BtcNameOneRecordPerAddressHeight) skips a transfer to a
+            # Bitcoin address that already holds a name, including one moved
+            # there earlier in the same block.
+            print(f"BTC name transfer to {btc_to_address} skipped: it already holds a name.")
+        else:
+            # Core makes the transaction's recipient the name's owner.
+            adnr.btc_address = btc_to_address
+            adnr.address = tx.to_address
+            adnr.save()
+            adnr.transfer_transactions.add(tx)
 
     elif kind == "AdnrDelete()":
         try:
@@ -1378,11 +1395,11 @@ def process_adnr(tx):
 
     elif kind == "BTCAdnrDelete()":
         if "BTCFromAddress" in parsed:
-            try:
-                adnr = Adnr.objects.get(btc_address=parsed["BTCFromAddress"])
-                adnr.delete()
-            except Adnr.DoesNotExist:
+            adnr = btc_name_record(parsed["BTCFromAddress"], tx.from_address)
+            if adnr is None:
                 print(f"ADNR not found with domain {domain}.")
+            else:
+                adnr.delete()
 
 
 def process_shop(tx):
@@ -1543,18 +1560,55 @@ def sync_topics() -> None:
 
 @app.task(autoretry_for=[RBXException])
 def sync_adnrs() -> None:
-    print("Deleting ADNRs...")
-    Adnr.objects.all().delete()
-    print("Clearing ADNRs from addresses...")
+    from django.db import connection
 
-    Address.objects.filter(adnr__isnull=False).update(adnr=None)
-    transactions = Transaction.objects.filter(type=Transaction.Type.ADDRESS).order_by(
-        "block__height"
-    )
+    with atomic_transaction():
+        # Address then names, the order the block worker writes them in, so the
+        # two can't deadlock: the worker's writes wait until the rebuild commits
+        # and then apply on top of it, and anything committed before is in the
+        # history read below. Block indexing pauses for the rebuild; reads (the
+        # API) are not blocked.
+        with connection.cursor() as cursor:
+            cursor.execute(
+                f'LOCK TABLE "{Address._meta.db_table}", "{Adnr._meta.db_table}" IN EXCLUSIVE MODE'
+            )
 
-    print("Processing ADNR transactions")
-    for tx in transactions:
-        process_adnr(tx)
+        transactions = Transaction.objects.filter(type=Transaction.Type.ADDRESS).order_by(
+            "block__height"
+        )
+        # The node's order of every block that needs it is fetched before
+        # anything is deleted; a node that can't answer, or any failure
+        # part-way, rolls the whole rebuild back.
+        print("Ordering ADNR transactions")
+        ordered = list(in_node_order(transactions))
+
+        print("Deleting ADNRs...")
+        Adnr.objects.all().delete()
+        print("Clearing ADNRs from addresses...")
+        Address.objects.filter(adnr__isnull=False).update(adnr=None)
+
+        print("Processing ADNR transactions")
+        for tx in ordered:
+            process_adnr(tx)
+
+
+def in_node_order(transactions):
+    """[transactions] (ordered by height) in the order the node applied them.
+    The order inside a block is not stored, and it decides name transactions
+    that meet in one block (two transfers to one Bitcoin address, a delete then
+    a transfer into the freed address), so a block holding more than one is
+    put in the node's order. Raises RBXException when the node can't say."""
+    from itertools import groupby
+
+    for height, group in groupby(transactions, key=lambda tx: tx.height):
+        group = list(group)
+        if len(group) > 1:
+            block = get_block(height)
+            order = [t.get("Hash") for t in (block or {}).get("Transactions") or []]
+            if any(tx.hash not in order for tx in group):
+                raise RBXException(f"Node did not give the transaction order of block {height}")
+            group.sort(key=lambda tx: order.index(tx.hash))
+        yield from group
 
 
 @app.task(autoretry_for=[RBXException])

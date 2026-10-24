@@ -44,6 +44,10 @@ _MAINNET = {
     # recording height are frozen (BtcLegacyFreeze). FundLossAuditHeight plus
     # two weeks on mainnet, so a placeholder while that one is.
     "BITCOIN_ATTESTATION_HEIGHT": 999_999_999 + 90_000,
+    # Globals.LedgerRulesBatchHeight (Core #72, 9.0.1): from it a BTC name
+    # transfer to a Bitcoin address that already holds a name is skipped at
+    # apply (BtcNameOneRecordPerAddressHeight), among other rules.
+    "LEDGER_RULES_BATCH_HEIGHT": 7_575_250,
 }
 _TESTNET = {k: 1 for k in _MAINNET}
 # The testnet chain restarted from genesis on 2026-10-22 (VerifiedX-Core
@@ -53,6 +57,7 @@ _TESTNET = {k: 1 for k in _MAINNET}
 # vault created from block 400 is watched.
 _TESTNET["FUND_LOSS_AUDIT_HEIGHT"] = 400
 _TESTNET["BITCOIN_ATTESTATION_HEIGHT"] = 401
+_TESTNET["LEDGER_RULES_BATCH_HEIGHT"] = 7_400
 
 # Core's value for a height not set yet (Globals.FundLossAuditHeight on
 # mainnet). A height at or past it is not served: no such block is coming.
@@ -105,6 +110,11 @@ def served_height(height):
 def fund_loss_audit_height():
     """Globals.FundLossAuditHeight, which PathAuditRulesHeight follows."""
     return _gate("FUND_LOSS_AUDIT_HEIGHT")
+
+
+def ledger_rules_batch_height():
+    """Globals.LedgerRulesBatchHeight: the 9.0.1 ledger rules apply from it."""
+    return _gate("LEDGER_RULES_BATCH_HEIGHT")
 
 
 def escrow_applies(request_block_height):
