@@ -21,6 +21,7 @@ from .views import (
     VbtcV2TransferPrepareView,
     VbtcV2TransferSendView,
     VbtcV2WithdrawRequestPrepareView,
+    VbtcV2WithdrawRequestMultiPrepareView,
     VbtcV2WithdrawRequestSendView,
     VbtcV2WithdrawCompletePrepareView,
     VbtcV2WithdrawCompleteExecuteView,
@@ -54,6 +55,7 @@ urlpatterns = [
     path("vbtc-v2/transfer/send/", VbtcV2TransferSendView.as_view()),
     # Withdrawal Request
     path("vbtc-v2/withdraw/request/prepare/", VbtcV2WithdrawRequestPrepareView.as_view()),
+    path("vbtc-v2/withdraw/multi/prepare/", VbtcV2WithdrawRequestMultiPrepareView.as_view()),
     path("vbtc-v2/withdraw/request/send/", VbtcV2WithdrawRequestSendView.as_view()),
     # Withdrawal Complete (FROST)
     path("vbtc-v2/withdraw/complete/prepare/", VbtcV2WithdrawCompletePrepareView.as_view()),

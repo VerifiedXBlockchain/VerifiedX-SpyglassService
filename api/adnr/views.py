@@ -46,8 +46,5 @@ class BtcAdnrLookupView(RetrieveModelMixin, GenericAPIView):
 
         btc_address = kwargs["btc_address"]
 
-        try:
-            adnr = Adnr.objects.get(btc_address=btc_address, is_btc=True)
-            return Response({"btc_address": btc_address, "domain": adnr.domain})
-        except Adnr.DoesNotExist:
-            return Response({"btc_address": btc_address, "domain": None})
+        adnr = Adnr.objects.filter(btc_address=btc_address, is_btc=True).first()
+        return Response({"btc_address": btc_address, "domain": adnr.domain if adnr else None})
