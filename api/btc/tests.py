@@ -73,8 +73,27 @@ class VbtcV2WithdrawRequestMultiPrepareViewTests(TestCase):
         self.assertEqual(response.status_code, 500)
         self.assertEqual(response.json()["message"], refusal["Message"])
 
+    def test_without_inputs_core_allocates(self):
+        body = self._body(unique_id="u-1")
+        del body["inputs"]
+        with mock.patch(
+            "api.btc.views.get_raw_request_withdrawal_multi_tx", return_value={"Success": True, "Hash": "abc"}
+        ) as prepare:
+            response = self.client.post(self.URL, body, content_type="application/json")
+
+        self.assertEqual(response.status_code, 200)
+        prepare.assert_called_once_with(
+            {
+                "RequestorAddress": "xREQ",
+                "BTCAddress": "tb1qdest",
+                "TotalAmount": 0.00007,
+                "FeeRate": 3,
+                "UniqueId": "u-1",
+            }
+        )
+
     def test_requires_every_field(self):
-        for field in ["requestor_address", "btc_address", "total_amount", "fee_rate", "inputs"]:
+        for field in ["requestor_address", "btc_address", "total_amount", "fee_rate"]:
             body = self._body()
             del body[field]
             with mock.patch("api.btc.views.get_raw_request_withdrawal_multi_tx") as prepare:
@@ -85,7 +104,7 @@ class VbtcV2WithdrawRequestMultiPrepareViewTests(TestCase):
             prepare.assert_not_called()
 
     def test_refuses_malformed_inputs_without_asking_core(self):
-        for inputs in ["sc:big", [{"sc_identifier": "sc:big"}], [{"amount": 0.1}], ["sc:big"]]:
+        for inputs in ["sc:big", [], [{"sc_identifier": "sc:big"}], [{"amount": 0.1}], ["sc:big"]]:
             with mock.patch("api.btc.views.get_raw_request_withdrawal_multi_tx") as prepare:
                 response = self.client.post(
                     self.URL, self._body(inputs=inputs), content_type="application/json"
