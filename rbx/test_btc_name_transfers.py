@@ -136,3 +136,14 @@ class BtcNameTransferTests(TestCase):
             with self.assertRaises(RBXException):
                 sync_adnrs()
         self.assertTrue(Adnr.objects.filter(pk=kept.pk).exists())
+
+    def test_a_rebuild_replays_the_history_under_the_table_lock(self):
+        from rbx.tasks import sync_adnrs
+
+        create = make_tx(make_block(7_700), "r1", Transaction.Type.ADDRESS, from_address=OWNER,
+                         data={"Function": "BTCAdnrCreate()", "Name": "rebuilt", "BTCAddress": "tb1qr"})
+        transfer(7_701, "r2", OWNER, RECIPIENT, "tb1qr", "tb1qs", domain="rebuilt")
+        Adnr.objects.all().delete()
+        sync_adnrs()
+        record = Adnr.objects.get(domain="rebuilt.btc")
+        self.assertEqual((record.address, record.btc_address, record.create_transaction_id), (RECIPIENT, "tb1qs", create.hash))

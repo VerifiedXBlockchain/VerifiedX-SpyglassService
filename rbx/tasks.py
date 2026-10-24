@@ -1560,16 +1560,24 @@ def sync_topics() -> None:
 
 @app.task(autoretry_for=[RBXException])
 def sync_adnrs() -> None:
-    transactions = Transaction.objects.filter(type=Transaction.Type.ADDRESS).order_by(
-        "block__height"
-    )
-    # The node's order of every block that needs it is fetched before anything
-    # is deleted, and the rebuild is one database transaction, so a node that
-    # can't answer, or any failure part-way, leaves the names as they were.
-    print("Ordering ADNR transactions")
-    ordered = list(in_node_order(transactions))
+    from django.db import connection
 
     with atomic_transaction():
+        # Name writes from the block worker wait on this lock until the rebuild
+        # commits and then apply on top of it; anything committed before it is
+        # in the history read below. Reads (the API) are not blocked.
+        with connection.cursor() as cursor:
+            cursor.execute(f'LOCK TABLE "{Adnr._meta.db_table}" IN EXCLUSIVE MODE')
+
+        transactions = Transaction.objects.filter(type=Transaction.Type.ADDRESS).order_by(
+            "block__height"
+        )
+        # The node's order of every block that needs it is fetched before
+        # anything is deleted; a node that can't answer, or any failure
+        # part-way, rolls the whole rebuild back.
+        print("Ordering ADNR transactions")
+        ordered = list(in_node_order(transactions))
+
         print("Deleting ADNRs...")
         Adnr.objects.all().delete()
         print("Clearing ADNRs from addresses...")
