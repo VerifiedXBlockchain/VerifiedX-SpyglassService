@@ -1560,18 +1560,24 @@ def sync_topics() -> None:
 
 @app.task(autoretry_for=[RBXException])
 def sync_adnrs() -> None:
-    print("Deleting ADNRs...")
-    Adnr.objects.all().delete()
-    print("Clearing ADNRs from addresses...")
-
-    Address.objects.filter(adnr__isnull=False).update(adnr=None)
     transactions = Transaction.objects.filter(type=Transaction.Type.ADDRESS).order_by(
         "block__height"
     )
+    # The node's order of every block that needs it is fetched before anything
+    # is deleted, and the rebuild is one database transaction, so a node that
+    # can't answer, or any failure part-way, leaves the names as they were.
+    print("Ordering ADNR transactions")
+    ordered = list(in_node_order(transactions))
 
-    print("Processing ADNR transactions")
-    for tx in in_node_order(transactions):
-        process_adnr(tx)
+    with atomic_transaction():
+        print("Deleting ADNRs...")
+        Adnr.objects.all().delete()
+        print("Clearing ADNRs from addresses...")
+        Address.objects.filter(adnr__isnull=False).update(adnr=None)
+
+        print("Processing ADNR transactions")
+        for tx in ordered:
+            process_adnr(tx)
 
 
 def in_node_order(transactions):

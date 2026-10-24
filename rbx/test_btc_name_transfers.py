@@ -123,3 +123,16 @@ class BtcNameTransferTests(TestCase):
         with patch("rbx.tasks.get_block", return_value={"Transactions": [{"Hash": "a1"}]}):
             with self.assertRaises(RBXException):
                 list(in_node_order([a, b]))
+
+    def test_a_rebuild_that_cannot_order_a_block_leaves_the_names_as_they_were(self):
+        from rbx.exceptions import RBXException
+        from rbx.tasks import sync_adnrs
+
+        kept = name("kept.btc", OWNER, "tb1qkept")
+        block = make_block(7_602)
+        make_tx(block, "c1", Transaction.Type.ADDRESS, data={"Function": "AdnrDelete()", "Name": "x"})
+        make_tx(block, "c2", Transaction.Type.ADDRESS, data={"Function": "AdnrDelete()", "Name": "y"})
+        with patch("rbx.tasks.get_block", side_effect=RBXException("node down")):
+            with self.assertRaises(RBXException):
+                sync_adnrs()
+        self.assertTrue(Adnr.objects.filter(pk=kept.pk).exists())
