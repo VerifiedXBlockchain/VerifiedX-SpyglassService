@@ -23,7 +23,7 @@ from rbx.chain_contract import smart_contract_from_chain
 from rbx.client import get_master_nodes, get_block, get_nft, get_topics
 from shop.media import scp_down_folder, upload_to_s3
 from rbx.exceptions import RBXException
-from rbx.vbtc_gates import field, net_string, parse_envelope, parse_object
+from rbx.vbtc_gates import field, ledger_rules_batch_height, net_string, parse_envelope, parse_object
 from rbx import forged_vfx_burn, historical_reserve_reversals, legacy_token_transfers, vbtc_bridge, vbtc_dispatch
 from rbx.models import (
     FungibleToken,
@@ -1291,6 +1291,14 @@ def process_transaction(tx: Transaction):
 #     )
 
 
+def btc_name_record(btc_address, sender):
+    """The BTC name at [btc_address] that a transfer or delete from [sender]
+    acts on: the sender's own when the address holds more than one (Core acts
+    only on the sender's record), else the one there. None when there is none."""
+    records = Adnr.objects.filter(is_btc=True, btc_address=btc_address)
+    return records.filter(address=sender).first() or records.first()
+
+
 def process_adnr(tx):
     if tx.type != Transaction.Type.ADDRESS:
         print("Not an ADNR TX")
@@ -1360,13 +1368,22 @@ def process_adnr(tx):
         btc_to_address = parsed["BTCToAddress"]
         btc_from_address = parsed["BTCFromAddress"]
 
-        try:
-            adnr = Adnr.objects.get(btc_address=btc_from_address)
-            adnr.btc_address = btc_to_address
-            adnr.save()
-        except Adnr.DoesNotExist:
+        adnr = btc_name_record(btc_from_address, tx.from_address)
+        if adnr is None:
             print(f"ADNR with btc_address of {btc_from_address} not found.")
-            pass
+        elif tx.height >= ledger_rules_batch_height() and Adnr.objects.filter(
+            is_btc=True, btc_address=btc_to_address
+        ).exists():
+            # Core (BtcNameOneRecordPerAddressHeight) skips a transfer to a
+            # Bitcoin address that already holds a name, including one moved
+            # there earlier in the same block.
+            print(f"BTC name transfer to {btc_to_address} skipped: it already holds a name.")
+        else:
+            # Core makes the transaction's recipient the name's owner.
+            adnr.btc_address = btc_to_address
+            adnr.address = tx.to_address
+            adnr.save()
+            adnr.transfer_transactions.add(tx)
 
     elif kind == "AdnrDelete()":
         try:
@@ -1378,11 +1395,11 @@ def process_adnr(tx):
 
     elif kind == "BTCAdnrDelete()":
         if "BTCFromAddress" in parsed:
-            try:
-                adnr = Adnr.objects.get(btc_address=parsed["BTCFromAddress"])
-                adnr.delete()
-            except Adnr.DoesNotExist:
+            adnr = btc_name_record(parsed["BTCFromAddress"], tx.from_address)
+            if adnr is None:
                 print(f"ADNR not found with domain {domain}.")
+            else:
+                adnr.delete()
 
 
 def process_shop(tx):
