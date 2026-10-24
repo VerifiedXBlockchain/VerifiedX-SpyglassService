@@ -1570,8 +1570,27 @@ def sync_adnrs() -> None:
     )
 
     print("Processing ADNR transactions")
-    for tx in transactions:
+    for tx in in_node_order(transactions):
         process_adnr(tx)
+
+
+def in_node_order(transactions):
+    """[transactions] (ordered by height) in the order the node applied them.
+    The order inside a block is not stored, and it decides name transactions
+    that meet in one block (two transfers to one Bitcoin address, a delete then
+    a transfer into the freed address), so a block holding more than one is
+    put in the node's order. Raises RBXException when the node can't say."""
+    from itertools import groupby
+
+    for height, group in groupby(transactions, key=lambda tx: tx.height):
+        group = list(group)
+        if len(group) > 1:
+            block = get_block(height)
+            order = [t.get("Hash") for t in (block or {}).get("Transactions") or []]
+            if any(tx.hash not in order for tx in group):
+                raise RBXException(f"Node did not give the transaction order of block {height}")
+            group.sort(key=lambda tx: order.index(tx.hash))
+        yield from group
 
 
 @app.task(autoretry_for=[RBXException])
