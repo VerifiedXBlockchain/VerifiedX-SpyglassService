@@ -1563,11 +1563,15 @@ def sync_adnrs() -> None:
     from django.db import connection
 
     with atomic_transaction():
-        # Name writes from the block worker wait on this lock until the rebuild
-        # commits and then apply on top of it; anything committed before it is
-        # in the history read below. Reads (the API) are not blocked.
+        # Address then names, the order the block worker writes them in, so the
+        # two can't deadlock: the worker's writes wait until the rebuild commits
+        # and then apply on top of it, and anything committed before is in the
+        # history read below. Block indexing pauses for the rebuild; reads (the
+        # API) are not blocked.
         with connection.cursor() as cursor:
-            cursor.execute(f'LOCK TABLE "{Adnr._meta.db_table}" IN EXCLUSIVE MODE')
+            cursor.execute(
+                f'LOCK TABLE "{Address._meta.db_table}", "{Adnr._meta.db_table}" IN EXCLUSIVE MODE'
+            )
 
         transactions = Transaction.objects.filter(type=Transaction.Type.ADDRESS).order_by(
             "block__height"
