@@ -104,7 +104,22 @@ class VbtcV2WithdrawRequestMultiPrepareViewTests(TestCase):
             prepare.assert_not_called()
 
     def test_refuses_malformed_inputs_without_asking_core(self):
-        for inputs in ["sc:big", [], [{"sc_identifier": "sc:big"}], [{"amount": 0.1}], ["sc:big"]]:
+        for inputs in [
+            "sc:big",
+            [],
+            [{"sc_identifier": "sc:big"}],
+            [{"amount": 0.1}],
+            ["sc:big"],
+            [{"sc_identifier": ["sc:big"], "amount": 0.00005}],
+            [{"sc_identifier": {"id": "sc:big"}, "amount": 0.00005}],
+            [{"sc_identifier": "  ", "amount": 0.00005}],
+            [{"sc_identifier": "sc:big", "amount": {"value": 0.00005}}],
+            [{"sc_identifier": "sc:big", "amount": "0.00005"}],
+            [{"sc_identifier": "sc:big", "amount": True}],
+            [{"sc_identifier": "sc:big", "amount": 0}],
+            [{"sc_identifier": "sc:big", "amount": -0.1}],
+            [{"sc_identifier": "sc:big", "amount": 0.1}, {"sc_identifier": "sc:small", "amount": [0.1]}],
+        ]:
             with mock.patch("api.btc.views.get_raw_request_withdrawal_multi_tx") as prepare:
                 response = self.client.post(
                     self.URL, self._body(inputs=inputs), content_type="application/json"

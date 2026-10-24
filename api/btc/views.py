@@ -1,4 +1,5 @@
 import logging
+import math
 import time
 import requests
 from decimal import Decimal
@@ -484,6 +485,21 @@ class VbtcV2WithdrawRequestPrepareView(GenericAPIView):
         return _vbtc_v2_proxy(get_raw_request_withdrawal_tx, payload, "Withdrawal request TX preparation failed")
 
 
+def _valid_withdrawal_input(entry):
+    """One `inputs` entry as Core reads it: a non-empty string vault id and a
+    positive, finite JSON number. Anything else (a list or object id, a
+    numeric string, a bool) is refused here rather than forwarded."""
+    if not isinstance(entry, dict):
+        return False
+    sc_identifier = entry.get("sc_identifier")
+    amount = entry.get("amount")
+    if not isinstance(sc_identifier, str) or not sc_identifier.strip():
+        return False
+    if isinstance(amount, bool) or not isinstance(amount, (int, float)):
+        return False
+    return math.isfinite(amount) and amount > 0
+
+
 class VbtcV2WithdrawRequestMultiPrepareView(GenericAPIView):
     """One withdrawal request drawn from several vaults: a proxy for Core's
     GetRawRequestWithdrawalMultiTxData, with its input and answer (Hash,
@@ -509,9 +525,7 @@ class VbtcV2WithdrawRequestMultiPrepareView(GenericAPIView):
 
         inputs = request.data.get("inputs")
         if inputs is not None:
-            if not isinstance(inputs, list) or not inputs or not all(
-                isinstance(i, dict) and i.get("sc_identifier") and i.get("amount") for i in inputs
-            ):
+            if not isinstance(inputs, list) or not inputs or not all(_valid_withdrawal_input(i) for i in inputs):
                 return Response(
                     {"success": False, "message": "inputs must be a list of {sc_identifier, amount}"},
                     status=400,
