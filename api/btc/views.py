@@ -1,4 +1,5 @@
 import logging
+import math
 import time
 import requests
 from decimal import Decimal
@@ -28,6 +29,7 @@ from rbx.client import (
     get_raw_transfer_vbtc_tx,
     send_raw_transfer_vbtc_tx,
     get_raw_request_withdrawal_tx,
+    get_raw_request_withdrawal_multi_tx,
     send_raw_request_withdrawal_tx,
     prepare_complete_withdrawal,
     execute_complete_withdrawal,
@@ -481,6 +483,64 @@ class VbtcV2WithdrawRequestPrepareView(GenericAPIView):
             "FeeRate": request.data["fee_rate"],
         }
         return _vbtc_v2_proxy(get_raw_request_withdrawal_tx, payload, "Withdrawal request TX preparation failed")
+
+
+def _valid_withdrawal_input(entry):
+    """One `inputs` entry as Core reads it: a non-empty string vault id and a
+    positive, finite JSON number. Anything else (a list or object id, a
+    numeric string, a bool) is refused here rather than forwarded."""
+    if not isinstance(entry, dict):
+        return False
+    sc_identifier = entry.get("sc_identifier")
+    amount = entry.get("amount")
+    if not isinstance(sc_identifier, str) or not sc_identifier.strip():
+        return False
+    if isinstance(amount, bool) or not isinstance(amount, (int, float)):
+        return False
+    try:
+        return math.isfinite(amount) and amount > 0
+    except OverflowError:  # a JSON integer past the float range
+        return False
+
+
+class VbtcV2WithdrawRequestMultiPrepareView(GenericAPIView):
+    """One withdrawal request drawn from several vaults: a proxy for Core's
+    GetRawRequestWithdrawalMultiTxData, with its input and answer (Hash,
+    HashPreimage, Data, Allocations, ...) unchanged. `inputs` is optional:
+    a wallet that names its shares gets them checked against the state trei
+    (balance, the per-share fee floor, at most 10 vaults, the destination);
+    without it Core allocates from chain state, largest first. Core answers
+    with the single-vault shape when one vault covers the total. The signed
+    hash goes through withdraw/request/send/.
+    """
+
+    def post(self, request, *args, **kwargs):
+        err = _require_fields(request.data, ["requestor_address", "btc_address", "total_amount", "fee_rate"])
+        if err:
+            return err
+
+        payload = {
+            "RequestorAddress": request.data["requestor_address"],
+            "BTCAddress": request.data["btc_address"],
+            "TotalAmount": request.data["total_amount"],
+            "FeeRate": request.data["fee_rate"],
+        }
+
+        inputs = request.data.get("inputs")
+        if inputs is not None:
+            if not isinstance(inputs, list) or not inputs or not all(_valid_withdrawal_input(i) for i in inputs):
+                return Response(
+                    {"success": False, "message": "inputs must be a list of {sc_identifier, amount}"},
+                    status=400,
+                )
+            payload["Inputs"] = [{"SCUID": i["sc_identifier"], "Amount": i["amount"]} for i in inputs]
+
+        if request.data.get("unique_id"):
+            payload["UniqueId"] = request.data["unique_id"]
+
+        return _vbtc_v2_proxy(
+            get_raw_request_withdrawal_multi_tx, payload, "Multi-vault withdrawal request TX preparation failed"
+        )
 
 
 class VbtcV2WithdrawRequestSendView(GenericAPIView):

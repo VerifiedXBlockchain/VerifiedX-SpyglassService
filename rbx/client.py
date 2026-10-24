@@ -1349,6 +1349,14 @@ def get_raw_request_withdrawal_tx(payload: dict):
     )
 
 
+def get_raw_request_withdrawal_multi_tx(payload: dict):
+    return _vbtc_v2_request(
+        "post",
+        "vbtcapi/vbtc/GetRawRequestWithdrawalMultiTxData",
+        payload,
+    )
+
+
 def send_raw_request_withdrawal_tx(payload: dict):
     return _vbtc_v2_request(
         "post",

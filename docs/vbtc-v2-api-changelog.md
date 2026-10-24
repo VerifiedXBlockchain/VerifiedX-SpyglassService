@@ -130,6 +130,41 @@ POST /api/btc/vbtc-v2/withdraw/cancel/
 { "hash": "...", "signature": "...", "public_key": "..." }
 ```
 
+### Withdrawal Request from several vaults (Core 9.0)
+
+**Prepare:** `POST /api/btc/vbtc-v2/withdraw/multi/prepare/`, a proxy for Core's `GetRawRequestWithdrawalMultiTxData` with the same input and answer.
+```json
+// Request
+{
+  "requestor_address": "x...",
+  "btc_address": "tb1q...",
+  "total_amount": 0.00007,
+  "fee_rate": 3,
+  // Optional. The wallet's own shares: at most 10 vaults, summing to total_amount.
+  // Omitted: Core allocates from chain state, largest balance first, ties by contract id.
+  "inputs": [
+    { "sc_identifier": "guid:timestamp", "amount": 0.00005 },
+    { "sc_identifier": "guid:timestamp", "amount": 0.00002 }
+  ],
+  // Optional, carried into Data as UniqueId.
+  "unique_id": "..."
+}
+
+// Response: Core's answer, keys unchanged. IsMultiContract is false (and Function
+// VBTCWithdrawalRequest()) when one vault covers the total.
+{
+  "success": true,
+  "Hash": "...", "HashPreimage": "...", "Data": "...",
+  "Timestamp": 0, "FromAddress": "x...", "Fee": 0.00001375, "Nonce": 2, "TransactionType": "VBTC_V2_WITHDRAWAL_REQUEST",
+  "Function": "VBTCWithdrawalRequestMultiV2()", "IsMultiContract": true,
+  "Allocations": [{ "SCUID": "...", "Amount": 0.00005 }, { "SCUID": "...", "Amount": 0.00002 }],
+  "BitcoinTransactions": 2, "TotalAmount": 0.00007, "Destination": "tb1q...", "AttestedContracts": ["..."], "Message": "..."
+}
+// Refused: HTTP 500 { "success": false, "message": "<Core's reason>", "raw": {...} }; malformed inputs: HTTP 400.
+```
+
+Each share pays its own Bitcoin fee from its own amount. The builder checks `fee_rate × 154 + 330` sats per share; on a watched vault the transaction check (`BtcWithdrawals.Refusal`) is stricter and refuses a share whose payout after `fee_rate × 154` sats is under 546 sats, so clients should quote `fee_rate × 154 + 546`. Recompute `Hash` from `HashPreimage` before signing, sign `Hash`, and submit through **Send** above (`withdraw/request/send/`); the hash is held only on the node that built it.
+
 ### Withdrawal Complete (FROST)
 
 **Prepare:** `POST /api/btc/vbtc-v2/withdraw/complete/prepare/`
