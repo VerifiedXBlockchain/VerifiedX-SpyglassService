@@ -76,6 +76,9 @@ _http = _NodeHttp()
 # because the CLI can take ~30s to answer while its validator registry loads
 # after a restart.
 CLI_TIMEOUT = (5, 30)
+# The reads block sync and the sweep make for each watched vault: a hung
+# node must not hold a block for vaults x 30s.
+NODE_READ_TIMEOUT = (5, 5)
 
 
 def _get_session() -> requests.Session:
@@ -1168,18 +1171,25 @@ def send_testnet_funds(from_address: str, to_address: str, amount: Decimal):
             BASE_URL, f"api/V1/SendTransaction/{from_address}/{to_address}/{amount_str}"
         )
         response = _http.get(url)
+        return parse_send_transaction(response.text)
 
-        text = response.text
+    return None
 
-        if text == "FAIL":
-            return None
 
-        if text == "This is not a valid RBX address to send to. Please verify again.":
-            return None
-
-        hash = text.replace("Success! TxId: ", "")
-        return hash
-
+def parse_send_transaction(text: str):
+    """The hash from SendTransaction's answer, or None when it was refused.
+    Core 9.0 answers {"Result", "Message", "Hash"}; earlier builds answered
+    "Success! TxId: <hash>" or a bare error string."""
+    try:
+        data = json.loads(text)
+    except ValueError:
+        data = None
+    if isinstance(data, dict):
+        if data.get("Result") == "Success" and data.get("Hash"):
+            return data["Hash"]
+        return None
+    if text.startswith("Success! TxId: "):
+        return text[len("Success! TxId: "):].strip() or None
     return None
 
 
@@ -1215,10 +1225,16 @@ def _vbtc_v2_request(method, path, payload=None, timeout=30):
             response = _http.get(url, timeout=timeout)
         else:
             response = _http.post(url, json=payload, timeout=timeout)
+        if not response.ok:
+            # The node answers a refusal with HTTP 200; anything else is from
+            # something in between (a proxy's error page), not an answer.
+            raise ValueError(f"HTTP {response.status_code}")
         result = response.json()
     except Exception as e:
         logger.error(f"Error in vBTC V2 request {path}: {e}")
-        return {"Success": False, "Message": str(e)}
+        # No answer at all (a timeout, a refused connection, a body that is
+        # not JSON), told apart from a refusal the node answered with.
+        return {"Success": False, "Message": str(e), "Unreachable": True}
 
     # The CLI reports a refusal in the body with HTTP 200, and logs nothing of
     # its own on several of these paths. Unless the reason is recorded here it
@@ -1230,6 +1246,34 @@ def _vbtc_v2_request(method, path, payload=None, timeout=30):
         )
 
     return result
+
+
+def get_vbtc_v2_withdrawal_history(sc_uid: str):
+    """A vault's withdrawals as the chain settled them: paid (WithdrawalHistory,
+    with the Bitcoin txid and the report that completed each) and closed
+    without payment (Refunded, with the refund and the closing block)."""
+    return _vbtc_v2_request("get", f"vbtcapi/vbtc/GetWithdrawalHistory/{sc_uid}", timeout=NODE_READ_TIMEOUT)
+
+
+def get_vbtc_v2_withdrawal_status(sc_uid: str):
+    """A vault's withdrawal state and, for a watched vault, its Bitcoin as the
+    chain records it (Bitcoin.HeldBtc, PaidOutForBridgeExitsSats, ...)."""
+    return _vbtc_v2_request("get", f"vbtcapi/vbtc/GetWithdrawalStatus/{sc_uid}", timeout=NODE_READ_TIMEOUT)
+
+
+def get_vbtc_v2_withdrawal_pin(sc_uid: str, request_ref: str):
+    """One withdrawal (or exit part) of a watched vault, with its state."""
+    from urllib.parse import quote
+
+    return _vbtc_v2_request(
+        "get", f"vbtcapi/vbtc/GetWithdrawalPin/{sc_uid}/{quote(request_ref, safe='')}", timeout=NODE_READ_TIMEOUT
+    )
+
+
+def get_vbtc_v2_bridge_exit(base_burn_tx_hash: str):
+    """The bridge exit the chain holds for a Base burn, with each watched
+    vault's part."""
+    return _vbtc_v2_request("get", f"vbtcapi/vbtc/GetBridgeExit/{base_burn_tx_hash}", timeout=NODE_READ_TIMEOUT)
 
 
 # MPC Ceremony (DKG)

@@ -23,7 +23,8 @@ from rbx.chain_contract import smart_contract_from_chain
 from rbx.client import get_master_nodes, get_block, get_nft, get_topics
 from shop.media import scp_down_folder, upload_to_s3
 from rbx.exceptions import RBXException
-from rbx import vbtc_dispatch
+from rbx.vbtc_gates import field, net_string, parse_envelope, parse_object
+from rbx import forged_vfx_burn, historical_reserve_reversals, legacy_token_transfers, vbtc_bridge, vbtc_dispatch
 from rbx.models import (
     FungibleToken,
     FungibleTokenTx,
@@ -159,6 +160,15 @@ def sync_block(height: int, data: Optional[dict] = None, notify: bool = True) ->
     if not data:
         return
 
+    # Exits on watched vaults that reach their window at this block: the
+    # node fails one never pinned at the block's start, before its
+    # transactions. Asked before the bridge lock is taken. They are asked
+    # at this block only, so a node that does not answer stops the sync
+    # here (ExitExpiryUnanswered) and the block is synced again on the next
+    # run, rather than committed without the locks given back.
+    edge = vbtc_bridge.expiry_window_edge(height)
+    exit_expiries = vbtc_bridge.read_exit_expiries(height, {}, since=edge)
+
     # One transaction per block: a crash mid-block rolls the whole block back
     # so the next run re-syncs it instead of silently skipping its remaining
     # transactions, and the block's writes commit in a single round trip.
@@ -197,6 +207,14 @@ def sync_block(height: int, data: Optional[dict] = None, notify: bool = True) ->
         if block.master_node != master_node:
             block.master_node = master_node
             block.save()
+
+        # Core burns the forged VFX before the burn block's transactions apply.
+        forged_vfx_burn.apply_at(height)
+
+        if any(at is not None and at <= height for at in exit_expiries.values()):
+            with atomic_transaction():
+                vbtc_bridge.lock_bridge_state()
+                vbtc_bridge.expire_exits(height, exit_expiries)
 
         for transaction in data["Transactions"]:
             if transaction.get("TransactionStatus") == 999:
@@ -237,21 +255,9 @@ def sync_block(height: int, data: Optional[dict] = None, notify: bool = True) ->
                     to_address, _ = Address.objects.get_or_create(
                         address=tx.to_address
                     )
-                    b = to_address.balance + tx.total_amount
-
-                    # ADNR Transfer In
-                    if (
-                        tx.type == Transaction.Type.ADDRESS
-                        and tx.to_address != "Adnr_Base"
-                    ):
-                        if block.height > 832000 or settings.ENVIRONMENT == "testnet":
-                            b -= Decimal(5.0)
-                        else:
-                            b -= Decimal(1.0)
-
-                    to_address.balance = b
-
-                    to_address.save()
+                    if tx.type in Transaction.RECIPIENT_CREDIT_TYPES:
+                        to_address.balance = to_address.balance + tx.total_amount
+                        to_address.save()
 
                     if (
                         tx.from_address != "Coinbase_TrxFees"
@@ -275,10 +281,36 @@ def sync_block(height: int, data: Optional[dict] = None, notify: bool = True) ->
                     f"{height}; skipping it"
                 )
 
+        vbtc_dispatch.settle_pending_owners(block)
+        vbtc_dispatch.settle_matured_reserve_sends(block)
+
         if block_created and master_node:
             MasterNode.objects.filter(address=master_node.address).update(
                 block_count=F("block_count") + 1
             )
+
+    # A Bitcoin report, rewind or rekey: the watched vaults' withdrawals and
+    # exits take their outcome from the node, once, after the block is
+    # committed. A failure here is logged; the block and its transactions
+    # stand, and the next pass (or the ten-minute sweep) reads them again.
+    if any(t.get("TransactionType") in ATTESTATION_TYPES for t in data["Transactions"]):
+        rewound = any(t.get("TransactionType") == Transaction.Type.VBTC_V2_BTC_REORG for t in data["Transactions"])
+        try:
+            vbtc_dispatch.reconcile_all_watched_vaults(after_rewind=rewound)
+        except Exception:
+            logging.exception(f"Reading the watched vaults' outcomes after block {height} failed")
+        try:
+            vbtc_dispatch.refresh_all_watched_backings()
+        except Exception:
+            logging.exception(f"Reading the watched vaults' backing after block {height} failed")
+    else:
+        # A withdrawal request or a fee bump or release pins a Bitcoin
+        # transaction in its own block: the vaults it touched are read again
+        # now, not at the next report.
+        try:
+            vbtc_dispatch.refresh_pins_after_block(height)
+        except Exception:
+            logging.exception(f"Reading the watched vaults' pins after block {height} failed")
 
     if block_created and notify:
         b = None
@@ -319,8 +351,9 @@ def resync_balances() -> None:
     with tqdm(total=len(transactions), desc="Processing Tx") as progress:
         for tx in transactions:
             to_address, _ = Address.objects.get_or_create(address=tx.to_address)
-            to_address.balance = to_address.balance + tx.total_amount
-            to_address.save()
+            if tx.type in Transaction.RECIPIENT_CREDIT_TYPES:
+                to_address.balance = to_address.balance + tx.total_amount
+                to_address.save()
 
             if (
                 tx.from_address != "Coinbase_TrxFees"
@@ -333,6 +366,14 @@ def resync_balances() -> None:
                 from_address.save()
 
             progress.update()
+
+    # The forged-VFX burn has no transaction; take the recorded amounts off again.
+    from rbx.models import ForgedVfxBurn
+
+    for burn in ForgedVfxBurn.objects.all():
+        row, _ = Address.objects.get_or_create(address=burn.address)
+        row.balance = row.balance - burn.amount
+        row.save()
 
 
 # @app.task(autoretry_for=[RBXException])
@@ -451,23 +492,30 @@ def expire_stale_withdrawals():
 
 
 # Types that reach process_transaction with nothing for it to index: plain
-# value transfers, validator lifecycle, topic voting, standard (non-tokenized)
-# smart contracts, the shielded-transaction family, and legacy V1 tokenization
-# burns and withdrawals.
+# value transfers, validator lifecycle, topic voting, the shielded transactions other than a vBTC shield or
+# unshield (rbx/vbtc_bridge.py), and legacy V1 tokenization burns and
+# withdrawals.
 #
 # Anything neither matched by a branch below nor listed here is a type nobody
 # wired up, and until now it looked exactly like a type nobody needed to —
 # which is how every Base-bridge transaction (37-42) has been passing through
 # the indexer unnoticed.
+# The attestation types after which sync_block reads the watched vaults'
+# outcomes from the node.
+ATTESTATION_TYPES = frozenset(
+    {
+        Transaction.Type.VBTC_V2_BTC_REPORT,
+        Transaction.Type.VBTC_V2_BTC_REORG,
+        Transaction.Type.VBTC_V2_VAULT_REKEY,
+    }
+)
+
 UNINDEXED_TX_TYPES = frozenset(
     {
         Transaction.Type.TX,
         Transaction.Type.NODE,
         Transaction.Type.VOTE_TOPIC,
         Transaction.Type.VOTE,
-        Transaction.Type.SC_MINT,
-        Transaction.Type.SC_TX,
-        Transaction.Type.SC_BURN,
         Transaction.Type.TKNZ_BURN,
         Transaction.Type.TKNZ_WITHDRAWAL_REQUEST,
         Transaction.Type.TKNZ_WITHDRAWAL_COMPLETE,
@@ -477,17 +525,203 @@ UNINDEXED_TX_TYPES = frozenset(
         Transaction.Type.VFX_SHIELD,
         Transaction.Type.VFX_UNSHIELD,
         Transaction.Type.VFX_PRIVATE_TRANSFER,
-        Transaction.Type.VBTC_SHIELD,
-        Transaction.Type.VBTC_UNSHIELD,
         Transaction.Type.VBTC_PRIVATE_TRANSFER,
+        # A fee bump moves no balance.
+        Transaction.Type.VBTC_V2_COIN_PIN,
     }
 )
+
+
+# The fungible-token functions of the node's contract-call switch
+# (StateData.UpdateTreis). TokenDeploy() is indexed with the mints.
+TOKEN_FUNCTIONS = frozenset(
+    {
+        "TokenTransfer()",
+        "TokenMint()",
+        "TokenBurn()",
+        "TokenPause()",
+        "TokenBanAddress()",
+        "TokenContractOwnerChange()",
+        "TokenVoteTopicCreate()",
+        "TokenVoteTopicCast()",
+    }
+)
+
+
+def token_function_of(tx: Transaction):
+    """The token function tx calls, read as the node's dispatcher reads it,
+    or None. The node runs it under every contract-call envelope type."""
+    if tx.type not in vbtc_dispatch.SC_ENVELOPE_TYPES:
+        return None
+    payload, _ = parse_envelope(tx.data)
+    function = net_string(field(payload, "Function"))
+    return function if function in TOKEN_FUNCTIONS else None
+
+
+def pause_calls_through(token, tx):
+    """The TokenPause() calls the node applied to token in blocks up to tx's,
+    tx's whole block included: object payloads under a contract-call type.
+    Inside a block no order is stored, so the state is right once the block
+    has been processed (each call of the block counts them all)."""
+    count = 0
+    candidates = Transaction.objects.filter(
+        type__in=list(vbtc_dispatch.SC_ENVELOPE_TYPES), height__lte=tx.height
+    ).only("data")
+    for call in candidates.iterator():
+        payload = parse_object(call.data)
+        if (
+            net_string(field(payload, "Function")) == "TokenPause()"
+            and net_string(field(payload, "ContractUID")) == token.sc_identifier
+        ):
+            count += 1
+    return count
+
+
+def process_token_function(tx: Transaction):
+    """A fungible-token function (TOKEN_FUNCTIONS), under whichever envelope
+    type carries it: the node dispatches on Function for every one of them
+    (StateData.UpdateTreis). Each handler there parses tx.Data as a single
+    JSON object, so a call carried in an array applies nothing."""
+
+    parsed = parse_object(tx.data)
+    if parsed is None:
+        logging.warning(f"Token call {tx.hash}: payload is not a JSON object; the node applies nothing.")
+        # An older indexer applied it: its row goes.
+        FungibleTokenTx.objects.filter(transaction=tx).delete()
+        return
+
+    func = parsed["Function"]
+    sc_identifier = parsed["ContractUID"]
+
+    try:
+        token = FungibleToken.objects.get(sc_identifier=sc_identifier)
+    except FungibleToken.DoesNotExist:
+        print(f"FT doesn't exist with id of {sc_identifier}")
+        return
+
+    if func in ["TokenMint()", "TokenBurn()"]:
+
+        type = (
+            FungibleTokenTx.Type.MINT
+            if func == "TokenMint()"
+            else FungibleTokenTx.Type.BURN
+        )
+
+        from_address = parsed["FromAddress"]
+        amount = parsed["Amount"]
+
+        FungibleTokenTx.objects.update_or_create(
+            transaction=tx,
+            defaults={
+                "type": type,
+                "sc_identifier": sc_identifier,
+                "token": token,
+                "receiving_address": from_address,
+                "sending_address": None,
+                "amount": amount,
+            },
+        )
+
+    elif func == "TokenTransfer()":
+        from_address = parsed["FromAddress"]
+        to_address = parsed["ToAddress"]
+        amount = parsed["Amount"]
+
+        FungibleTokenTx.objects.update_or_create(
+            transaction=tx,
+            defaults={
+                "type": FungibleTokenTx.Type.TRANSFER,
+                "sc_identifier": sc_identifier,
+                "token": token,
+                "receiving_address": legacy_token_transfers.credited_address(tx, to_address),
+                "sending_address": from_address,
+                "amount": amount,
+            },
+        )
+
+    elif func == "TokenContractOwnerChange()":
+        from_address = parsed["FromAddress"]
+        to_address = parsed["ToAddress"]
+
+        token.owner_address = to_address
+        token.save()
+
+    elif func == "TokenPause()":
+        # StateData.TokenPause flips the state whatever the payload's Pause
+        # says. Counted from the chain, so a re-index lands on the same state.
+        token.is_paused = pause_calls_through(token, tx) % 2 == 1
+        token.save(update_fields=["is_paused"])
+    elif func == "TokenBanAddress()":
+        address = parsed["BanAddress"]
+        if address not in token.banned_addresses:
+            token.banned_addresses.append(address)
+            token.save()
+
+    elif func == "TokenVoteTopicCreate()":
+        sc_identifier = parsed["ContractUID"]
+        from_address = parsed["FromAddress"]
+        topic_data = parsed["TokenVoteTopic"]
+
+        try:
+            topic = TokenVoteTopic.objects.get(
+                sc_identifier=sc_identifier, topic_id=topic_data["TopicUID"]
+            )
+        except TokenVoteTopic.DoesNotExist:
+            topic = TokenVoteTopic(
+                sc_identifier=sc_identifier, topic_id=topic_data["TopicUID"]
+            )
+
+        try:
+            token = FungibleToken.objects.get(sc_identifier=sc_identifier)
+        except FungibleToken.DoesNotExist:
+            print(
+                f"token with sc_identifier of {sc_identifier} not found when creating vote topic."
+            )
+            return
+
+        topic.token = token
+        topic.from_address = from_address
+        topic.topic_id = topic_data["TopicUID"]
+        topic.name = topic_data["TopicName"]
+        topic.description = topic_data["TopicDescription"]
+        topic.vote_requirement = topic_data["MinimumVoteRequirement"]
+        topic.created_at = timezone.make_aware(
+            datetime.fromtimestamp(topic_data["TopicCreateDate"])
+        )
+        topic.voting_ends_at = timezone.make_aware(
+            datetime.fromtimestamp(topic_data["VotingEndDate"])
+        )
+
+        topic.save()
+
+    elif func == "TokenVoteTopicCast()":
+        topic_id = parsed["TopicUID"]
+        try:
+            topic = TokenVoteTopic.objects.get(topic_id=topic_id)
+
+        except TokenVoteTopic.DoesNotExist:
+            print(f"TokenVoteTopic with topic id of {topic_id} not found.")
+            return
+
+        TokenVoteTopicVote.objects.get_or_create(
+            topic=topic,
+            address=parsed["FromAddress"],
+            created_at=tx.date_crafted,
+            defaults={"value": parsed["VoteType"] == 1},
+        )
 
 
 def process_transaction(tx: Transaction):
     # The legacy smart-contract envelope types can carry vBTC V2 functions;
     # the node routes them through its function switch before anything else.
     if vbtc_dispatch.route_envelope(tx):
+        return
+
+    if vbtc_bridge.route(tx):
+        return
+
+    if token_function_of(tx):
+        process_token_function(tx)
         return
 
     if tx.type in [Transaction.Type.NFT_MINT, Transaction.Type.TKNZ_MINT, Transaction.Type.VBTC_V2_MINT]:
@@ -646,7 +880,11 @@ def process_transaction(tx: Transaction):
                         v2_token.name = nft.name
                         v2_token.description = nft.description
                         v2_token.image_base64 = v2_info.get("ImageBase", "default")
-                        v2_token.deposit_address = v2_info["DepositAddress"]
+                        # A watched vault's current address comes from the
+                        # chain (a rekey moves it); a reprocessed mint must
+                        # not put the mint-time one back.
+                        if is_new_v2_token or not v2_token.is_watched:
+                            v2_token.deposit_address = v2_info["DepositAddress"]
                         v2_token.frost_group_public_key = v2_info.get("FrostGroupPublicKey", "")
                         v2_token.dkg_proof = v2_info.get("DKGProof", "")
                         v2_token.validator_snapshot = v2_info.get(
@@ -690,11 +928,15 @@ def process_transaction(tx: Transaction):
             return
 
         if func == "Transfer()":
-            nft.owner_address = tx.to_address
             nft.transfer_transactions.add(tx)
             v2_token = VbtcV2Token.objects.filter(sc_identifier=identifier).first()
             if v2_token is not None:
+                # Moves the NFT owner with the contract owner, which waits for
+                # the unlock when the sender is a reserve address.
                 vbtc_dispatch.apply_ownership_transfer(v2_token, tx)
+                nft.refresh_from_db(fields=["owner_address"])
+            else:
+                nft.owner_address = tx.to_address
 
         elif func in ["ChangeEvolveStateSpecific()", "Evolve()", "Devolve()"]:
             nft.misc_transactions.add(tx)
@@ -778,6 +1020,7 @@ def process_transaction(tx: Transaction):
     elif tx.type == Transaction.Type.RESERVE:
         parsed = json.loads(tx.data)
         func = parsed["Function"]
+        recipient_keeps = historical_reserve_reversals.recipient_keeps_transfer(tx)
         if func == "CallBack()":
             original_tx_hash = parsed["Hash"]
             try:
@@ -786,7 +1029,11 @@ def process_transaction(tx: Transaction):
                 print("Could not find callback original TX")
                 return
 
-            if original_tx.type == Transaction.Type.TX:
+            if vbtc_dispatch.call_back_ownership_transfer(original_tx):
+                # A vBTC V2 contract: its owner and its NFT's owner never moved.
+                pass
+
+            elif original_tx.type == Transaction.Type.TX:
                 Callback.objects.get_or_create(
                     transaction=tx,
                     original_transaction=original_tx,
@@ -794,10 +1041,12 @@ def process_transaction(tx: Transaction):
                         "amount": original_tx.total_amount,
                         "to_address": original_tx.to_address,
                         "from_address": original_tx.from_address,
+                        "recipient_keeps": recipient_keeps,
                     },
                 )
-                original_tx.voided_from_callback = True
-                original_tx.save()
+                if not recipient_keeps:
+                    original_tx.voided_from_callback = True
+                    original_tx.save()
 
             elif original_tx.type == Transaction.Type.VBTC_V2_TRANSFER:
                 vbtc_dispatch.void_reserve_transfer(original_tx)
@@ -823,7 +1072,9 @@ def process_transaction(tx: Transaction):
             a = Address(address=original_address)
             existing_balance, _, _ = a.get_balance()
 
-            Address.objects.create(address=new_address)
+            # The recovery address may already be on record (any earlier transaction to or from it); a plain create
+            # raised, and the block sync skipped the whole recovery.
+            Address.objects.get_or_create(address=new_address)
 
             outstanding_transactions = Transaction.objects.filter(
                 Q(
@@ -831,7 +1082,9 @@ def process_transaction(tx: Transaction):
                     & Q(voided_from_callback=False)
                     & Q(
                         Q(unlock_time__isnull=False)
-                        & Q(unlock_time__gt=tx.date_crafted)
+                        # Still pending at the recovery's second: the node
+                        # settles a send only in a block stamped after it.
+                        & Q(unlock_time__gte=tx.date_crafted)
                     )
                 )
             )
@@ -839,6 +1092,7 @@ def process_transaction(tx: Transaction):
             # Materialised: the redirect below moves a transaction's unlock time,
             # which would otherwise drop it from this lazily re-evaluated set.
             outstanding_transactions = list(outstanding_transactions)
+            vbtc_sends = []
             for transaction in outstanding_transactions:
                 # additional_balance += tx.total_amount
 
@@ -850,16 +1104,16 @@ def process_transaction(tx: Transaction):
                         to_address=transaction.to_address,
                         from_address=new_address,
                         from_recovery=True,
+                        recipient_keeps=recipient_keeps,
                     )
                     callback.save()
 
-                    transaction.voided_from_callback = True
-                    transaction.save()
+                    if not recipient_keeps:
+                        transaction.voided_from_callback = True
+                        transaction.save()
 
                 elif transaction.type == Transaction.Type.VBTC_V2_TRANSFER:
-                    vbtc_dispatch.redirect_reserve_transfer(
-                        transaction, new_address, tx.date_crafted
-                    )
+                    vbtc_sends.append(transaction)
 
                 elif transaction.type == Transaction.Type.NFT_TX:
                     parsed = json.loads(transaction.data)[0]
@@ -872,6 +1126,10 @@ def process_transaction(tx: Transaction):
                         continue
                     nft.owner_address = new_address
                     nft.save()
+
+            # Judged together, in Core's order, before the sweep reads them.
+            vbtc_dispatch.redirect_reserve_sends(tx, vbtc_sends, new_address)
+            vbtc_dispatch.apply_recovery(tx, new_address)
 
             recovery = Recovery(
                 original_address=original_address,
@@ -892,125 +1150,8 @@ def process_transaction(tx: Transaction):
         Transaction.Type.FTKN_BURN,
         Transaction.Type.FTKN_MINT,
     ]:
-
-        parsed = json.loads(tx.data)
-
-        if isinstance(parsed, list):
-            parsed = parsed[0]
-
-        func = parsed["Function"]
-        sc_identifier = parsed["ContractUID"]
-
-        try:
-            token = FungibleToken.objects.get(sc_identifier=sc_identifier)
-        except FungibleToken.DoesNotExist:
-            print(f"FT doesn't exist with id of {sc_identifier}")
-            return
-
-        if func in ["TokenMint()", "TokenBurn()"]:
-
-            type = (
-                FungibleTokenTx.Type.MINT
-                if func == "TokenMint()"
-                else FungibleTokenTx.Type.BURN
-            )
-
-            from_address = parsed["FromAddress"]
-            amount = parsed["Amount"]
-
-            ftt = FungibleTokenTx(
-                type=type,
-                sc_identifier=sc_identifier,
-                token=token,
-                receiving_address=from_address,
-                sending_address=None,
-                amount=amount,
-            )
-
-            ftt.save()
-
-        elif func == "TokenTransfer()":
-            from_address = parsed["FromAddress"]
-            to_address = parsed["ToAddress"]
-            amount = parsed["Amount"]
-
-            ftt = FungibleTokenTx(
-                type=FungibleTokenTx.Type.TRANSFER,
-                sc_identifier=sc_identifier,
-                token=token,
-                receiving_address=to_address,
-                sending_address=from_address,
-                amount=amount,
-            )
-            ftt.save()
-
-        elif func == "TokenContractOwnerChange()":
-            from_address = parsed["FromAddress"]
-            to_address = parsed["ToAddress"]
-
-            token.owner_address = to_address
-            token.save()
-
-        elif func == "TokenPause()":
-            token.is_paused = parsed["Pause"]
-            token.save()
-        elif func == "TokenBanAddress()":
-            address = parsed["BanAddress"]
-            token.banned_addresses.append(address)
-            token.save()
-
-        elif func == "TokenVoteTopicCreate()":
-            sc_identifier = parsed["ContractUID"]
-            from_address = parsed["FromAddress"]
-            topic_data = parsed["TokenVoteTopic"]
-
-            try:
-                topic = TokenVoteTopic.objects.get(
-                    sc_identifier=sc_identifier, topic_id=topic_data["TopicUID"]
-                )
-            except TokenVoteTopic.DoesNotExist:
-                topic = TokenVoteTopic(
-                    sc_identifier=sc_identifier, topic_id=topic_data["TopicUID"]
-                )
-
-            try:
-                token = FungibleToken.objects.get(sc_identifier=sc_identifier)
-            except FungibleToken.DoesNotExist:
-                print(
-                    f"token with sc_identifier of {sc_identifier} not found when creating vote topic."
-                )
-                return
-
-            topic.token = token
-            topic.from_address = from_address
-            topic.topic_id = topic_data["TopicUID"]
-            topic.name = topic_data["TopicName"]
-            topic.description = topic_data["TopicDescription"]
-            topic.vote_requirement = topic_data["MinimumVoteRequirement"]
-            topic.created_at = timezone.make_aware(
-                datetime.fromtimestamp(topic_data["TopicCreateDate"])
-            )
-            topic.voting_ends_at = timezone.make_aware(
-                datetime.fromtimestamp(topic_data["VotingEndDate"])
-            )
-
-            topic.save()
-
-        elif func == "TokenVoteTopicCast()":
-            topic_id = parsed["TopicUID"]
-            try:
-                topic = TokenVoteTopic.objects.get(topic_id=topic_id)
-
-            except TokenVoteTopic.DoesNotExist:
-                print(f"TokenVoteTopic with topic id of {topic_id} not found.")
-                return
-
-            TokenVoteTopicVote.objects.create(
-                topic=topic,
-                address=parsed["FromAddress"],
-                value=parsed["VoteType"] == 1,
-                created_at=tx.date_crafted,
-            )
+        # Any other function under these types: nothing is indexed for it.
+        pass
 
     elif tx.type == Transaction.Type.TKNZ_TX:
 
@@ -1103,6 +1244,15 @@ def process_transaction(tx: Transaction):
 
     elif tx.type == Transaction.Type.VBTC_V2_WITHDRAWAL_CANCEL:
         vbtc_dispatch.apply_cancel(tx)
+
+    elif tx.type in (
+        Transaction.Type.VBTC_V2_BTC_REPORT,
+        Transaction.Type.VBTC_V2_BTC_REORG,
+        Transaction.Type.VBTC_V2_VAULT_REKEY,
+    ):
+        # Bitcoin moved in consensus: sync_block reads the watched vaults'
+        # outcomes from the node once the block is committed.
+        pass
 
     elif tx.type == Transaction.Type.VBTC_V2_WITHDRAWAL_VOTE:
         vbtc_dispatch.apply_vote(tx)
@@ -1317,7 +1467,7 @@ def sync_circulation():
     stake = active_master_nodes * 5000
     total_addresses = Address.objects.all().count()
 
-    total_burned = fees + adnr_burned_sum + dst_burned_sum + vault_burned_sum
+    total_burned = fees + adnr_burned_sum + dst_burned_sum + vault_burned_sum + forged_vfx_burn.total_burned()
 
     circulating_supply = Decimal(200000000) - total_burned
     lifetime_supply = Decimal(200000000) - total_burned

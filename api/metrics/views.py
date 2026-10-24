@@ -10,6 +10,7 @@ from api import exceptions
 from api.transaction.serializers import TransactionSerializer
 from api.transaction.querysets import ALL_TRANSACTIONS_QUERYSET
 from rbx.models import Transaction, Block, MasterNode
+from rbx import forged_vfx_burn
 from django.conf import settings
 from django.db.models import Q, Sum, F
 from django.utils.decorators import method_decorator
@@ -54,7 +55,7 @@ class NetworkMetricsView(GenericAPIView):
             to_address="Reserve_Base",
         ).count() * Decimal(4.0)
 
-        total_burned = fees + adnr_burned_sum + dst_burned_sum + vault_burned_sum
+        total_burned = fees + adnr_burned_sum + dst_burned_sum + vault_burned_sum + forged_vfx_burn.total_burned()
 
         data["total_burned"] = total_burned
 

@@ -76,3 +76,10 @@ VBTC_V2_WITHDRAWAL_OWNER_ADDBACK_FIX_HEIGHT = ENV.int(
 VBTC_CANCELLATION_VOTE_RULES_HEIGHT = ENV.int(
     "VBTC_CANCELLATION_VOTE_RULES_HEIGHT", default=None
 )
+# The 9.0 heights Core sets at the mainnet release (Globals.FundLossAuditHeight
+# and BitcoinAttestationHeight, fund-loss + 90,000). Pin them here on the
+# mainnet deployment when Core's are set; unset keeps rbx/vbtc_gates.py's table.
+VBTC_FUND_LOSS_AUDIT_HEIGHT = ENV.int("VBTC_FUND_LOSS_AUDIT_HEIGHT", default=None)
+VBTC_BITCOIN_ATTESTATION_HEIGHT = ENV.int("VBTC_BITCOIN_ATTESTATION_HEIGHT", default=None)
+# Globals.ForgedVfxBurnHeight. Unset follows the fund-loss height, as Core's does.
+FORGED_VFX_BURN_HEIGHT = ENV.int("FORGED_VFX_BURN_HEIGHT", default=None)

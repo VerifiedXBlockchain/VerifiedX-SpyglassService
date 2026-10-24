@@ -4,11 +4,13 @@ import requests
 from decimal import Decimal
 from datetime import datetime
 from django.utils import timezone
+from django.core.cache import cache
 from django.db import close_old_connections
-from django.db.models import Case, F, Value, When
+from django.db.models import Case, F, Max, Q, Value, When
 from rest_framework.response import Response
 from rest_framework.generics import GenericAPIView, RetrieveAPIView
 from api.btc.constants import FALLBACK_VBTC_IMAGE_DATA
+from rbx.vbtc_dispatch import refresh_watched_backing
 from api.btc.serializers import (
     VbtcTokenSerializer,
     VbtcV2TokenSerializer,
@@ -37,6 +39,7 @@ from rbx.client import (
     get_vbtc_v2_ownership_transfer_data,
 )
 from rbx.models import (
+    Block,
     Price,
     VbtcToken,
     VbtcTokenAmountTransfer,
@@ -44,6 +47,7 @@ from rbx.models import (
     VbtcV2TokenTransfer,
     VbtcV2WithdrawalRequest,
 )
+from rbx.vbtc_gates import bitcoin_attestation_height, bitcoin_attestation_record_height, served_height
 from btc.btc_client import BtcClient
 from btc.client import BtcExplorerClient
 from api.decorators import cache_request
@@ -192,7 +196,7 @@ class VbtcDetailView(RetrieveAPIView):
 class VbtcV2ListAllView(GenericAPIView):
 
     def get(self, request, *args, **kwargs):
-        tokens = VbtcV2Token.objects.all().order_by("-created_at")
+        tokens = VbtcV2Token.objects.select_related("nft__mint_transaction").order_by("-created_at")
         results = VbtcV2TokenSerializer(tokens, many=True).data
         return Response({"results": results}, status=200)
 
@@ -210,12 +214,16 @@ class VbtcV2ListView(GenericAPIView):
         for transfer in transfers:
             sc_identifiers.add(transfer.token.sc_identifier)
 
-        for token in VbtcV2Token.objects.filter(owner_address=vfx_address):
-            sc_identifiers.add(token.sc_identifier)
+        owned = VbtcV2Token.objects.filter(
+            Q(owner_address=vfx_address) | Q(pending_owner_address=vfx_address)
+        )
+        for token in owned:
+            if token.current_owner() == vfx_address:
+                sc_identifiers.add(token.sc_identifier)
 
         tokens = VbtcV2Token.objects.filter(
             sc_identifier__in=sc_identifiers
-        ).order_by("-created_at")
+        ).select_related("nft__mint_transaction").order_by("-created_at")
 
         results = VbtcV2TokenSerializer(tokens, many=True).data
         return Response({"results": results}, status=200)
@@ -227,8 +235,36 @@ class VbtcV2DetailView(RetrieveAPIView):
     # inside the request, and a slow provider ladder held gunicorn workers
     # past their timeout, so wallets polling this endpoint never got an answer.
     serializer_class = VbtcV2TokenSerializer
-    queryset = VbtcV2Token.objects.all()
+    queryset = VbtcV2Token.objects.select_related("nft__mint_transaction")
     lookup_field = "sc_identifier"
+
+    def get(self, request, *args, **kwargs):
+        token = self.get_object()
+        # A watched vault's backing is the node's figure, so the view asks the
+        # node (short timeouts), throttled per token so wallet polling is not
+        # one node call per request. A legacy vault never makes the provider
+        # call here: it held gunicorn workers on mainnet; the sweep covers it.
+        throttle_key = f"vbtcv2:balance_refresh:{token.sc_identifier}"
+        if token.is_watched and cache.add(throttle_key, 1, timeout=15):
+            refresh_watched_backing(token)
+            token.refresh_from_db()
+        return Response(self.get_serializer(token).data)
+
+
+class VbtcV2HeightsView(GenericAPIView):
+    """The vBTC attestation heights of this network: from record_height a new
+    vault is watched; from enforcement_height older vaults are frozen. Null
+    while Core has not set a height (mainnet before the 9.0 release)."""
+
+    def get(self, request, *args, **kwargs):
+        return Response(
+            {
+                "record_height": served_height(bitcoin_attestation_record_height()),
+                "enforcement_height": served_height(bitcoin_attestation_height()),
+                "latest_block_height": Block.objects.aggregate(v=Max("height"))["v"],
+            },
+            status=200,
+        )
 
 
 class VbtcV2TransfersView(GenericAPIView):

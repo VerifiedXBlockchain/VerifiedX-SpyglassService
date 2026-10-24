@@ -1,9 +1,12 @@
+import logging
+
 from tqdm import tqdm
 from django.db.models import Q, Sum
 from django.core.management.base import BaseCommand
 from rbx.models import Block, Transaction
 from rbx.tasks import sync_block
 from rbx.client import get_block
+from rbx.vbtc_bridge import BRIDGE_TYPES, rebuild_bridge_state
 
 """
 python manage.py validate_transactions --height 357469
@@ -60,8 +63,34 @@ class Command(BaseCommand):
         print(blocks_to_resync)
 
         if fix:
+            fix_blocks(blocks_to_resync)
 
-            for h in blocks_to_resync:
-                print(f"Fixing {h}")
-                Transaction.objects.filter(height=h).delete()
-                sync_block(h)
+
+def fix_blocks(heights):
+    """Deletes each block's transactions and syncs it again. The delete
+    takes the block's bridge rows with it but not what its transactions drew
+    on locks of earlier blocks, so when a re-synced block holds a bridge
+    transaction the bridge state is rebuilt from every bridge transaction."""
+    bridge = list(BRIDGE_TYPES)
+    touched = Transaction.objects.filter(height__in=heights, type__in=bridge).exists()
+    sync_error = None
+    try:
+        for h in heights:
+            print(f"Fixing {h}")
+            Transaction.objects.filter(height=h).delete()
+            sync_block(h)
+    except Exception as e:
+        sync_error = e
+    # Also when a sync failed partway: the blocks already synced again would
+    # otherwise keep their second draws.
+    if touched or Transaction.objects.filter(height__in=heights, type__in=bridge).exists():
+        print("Rebuilding the vBTC bridge state")
+        try:
+            rebuild_bridge_state()
+        except Exception:
+            logging.exception("Rebuilding the vBTC bridge state failed")
+            if sync_error is None:
+                raise
+            logging.error("The re-sync had failed first; that error follows.")
+    if sync_error is not None:
+        raise sync_error

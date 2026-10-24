@@ -8,12 +8,13 @@ from decimal import Decimal
 from django.conf import settings
 from shop.models import Listing
 from django.db.models import Q
-from django.utils import timezone
+from django.db.models.functions import Cast, Upper
 import json
 import uuid
 from phonenumber_field.modelfields import PhoneNumberField
 from django.contrib.postgres.fields import ArrayField
-from rbx.vbtc_gates import escrow_applies
+from rbx.vbtc_gates import bitcoin_attestation_record_height, escrow_applies, field, net_string, parse_envelope
+from rbx import forged_vfx_burn
 
 # class MasterNodeManager(models.Manager):
 #     def get_queryset(self):
@@ -146,6 +147,23 @@ class Block(models.Model):
         ordering = ["-height"]
 
 
+def chain_time():
+    """The time of the latest indexed block, or None when none is indexed:
+    the cut-off for a reserve (xRBX) transaction, which the node applies at
+    the end of the first block stamped after its unlock time
+    (ReserveTransactions.DueRows). Not the wall clock: until such a block
+    the node still holds it as pending, and Spyglass has not seen that
+    block until it is indexed."""
+    return Block.objects.order_by("-height").values_list("date_crafted", flat=True).first()
+
+
+def _still_locked(now):
+    """A transaction whose unlock is not past `now` (chain_time())."""
+    if now is None:
+        return Q(unlock_time__isnull=False)
+    return Q(unlock_time__isnull=False) & Q(unlock_time__gt=now)
+
+
 class Transaction(models.Model):
     class Type(models.IntegerChoices):
         TX = 0
@@ -191,6 +209,15 @@ class Transaction(models.Model):
         VBTC_BRIDGE_EXIT_TO_BTC = 40
         VBTC_BRIDGE_EXIT_TO_BTC_COMPLETE = 41
         VBTC_BRIDGE_EXIT_TO_BTC_FAIL = 42
+        # Bitcoin facts in consensus (VerifiedXCore/Models/Transaction.cs).
+        VBTC_V2_BTC_REPORT = 43
+        VBTC_V2_COIN_PIN = 44
+        VBTC_V2_BTC_REORG = 45
+        VBTC_V2_VAULT_REKEY = 46
+
+    # The types whose Amount Core credits to the recipient (StateData for TX, PrivateTxLedgerService for a VFX
+    # unshield). Every other type's Amount leaves the sender and is credited to no one.
+    RECIPIENT_CREDIT_TYPES = (Type.TX, Type.VFX_UNSHIELD)
 
     hash = models.CharField(_("Hash"), primary_key=True, max_length=255, db_index=True)
     block = models.ForeignKey(
@@ -223,6 +250,9 @@ class Transaction(models.Model):
     unlock_time = models.DateTimeField(_("Unlock Time"), blank=True, null=True)
 
     voided_from_callback = models.BooleanField(default=False)
+    # A reserve vBTC send the node refused when it fell due (no longer
+    # covered by its sender): it never moved (vbtc_dispatch.settle_matured_reserve_sends).
+    refused_at_maturity = models.BooleanField(default=False)
 
     @property
     def callback_details(self):
@@ -340,6 +370,14 @@ class Transaction(models.Model):
             return "vBTC Bridge Exit to BTC Complete"
         if self.type == Transaction.Type.VBTC_BRIDGE_EXIT_TO_BTC_FAIL:
             return "vBTC Bridge Exit to BTC Failed"
+        if self.type == Transaction.Type.VBTC_V2_BTC_REPORT:
+            return "vBTC Bitcoin Report"
+        if self.type == Transaction.Type.VBTC_V2_COIN_PIN:
+            return "vBTC Withdrawal Fee Bump"
+        if self.type == Transaction.Type.VBTC_V2_BTC_REORG:
+            return "vBTC Bitcoin Rewind"
+        if self.type == Transaction.Type.VBTC_V2_VAULT_REKEY:
+            return "vBTC Vault Rekey"
 
         return f"{self.type}"
 
@@ -483,6 +521,11 @@ class Address(models.Model):
                 )
             )
             | Q(owner_address=address)
+            | Q(
+                original_owner_address=address,
+                create_transaction__from_address=address,
+                initial_supply__gt=0,
+            )
         ).distinct()
 
         return tokens
@@ -505,18 +548,17 @@ class Address(models.Model):
 
     def get_balance(self):
         address = self.address
+        now = chain_time()
 
         inbound_locked = (
             Transaction.objects.filter(
                 Q(
                     Q(to_address=address)
                     & Q(voided_from_callback=False)
-                    & Q(
-                        Q(unlock_time__isnull=False) & Q(unlock_time__gt=timezone.now())
-                    )
+                    & _still_locked(now)
                 )
             )
-            .exclude(type=Transaction.Type.NFT_SALE)
+            .filter(type__in=Transaction.RECIPIENT_CREDIT_TYPES)
             .aggregate(Sum("total_amount"))
         )
         inbound_locked_amount = inbound_locked["total_amount__sum"] or Decimal(0)
@@ -526,9 +568,7 @@ class Address(models.Model):
                 Q(
                     Q(from_address=address)
                     & Q(voided_from_callback=False)
-                    & Q(
-                        Q(unlock_time__isnull=False) & Q(unlock_time__gt=timezone.now())
-                    )
+                    & _still_locked(now)
                 )
             )
             .exclude(type=Transaction.Type.NFT_SALE)
@@ -554,7 +594,7 @@ class Address(models.Model):
 
         inbound = (
             Transaction.objects.filter(to_address=address)
-            .exclude(type=Transaction.Type.NFT_SALE)
+            .filter(type__in=Transaction.RECIPIENT_CREDIT_TYPES)
             .aggregate(Sum("total_amount"))
         )
 
@@ -569,17 +609,6 @@ class Address(models.Model):
         outbound_amount = (outbound["total_amount__sum"] or Decimal(0)) + (
             outbound["total_fee__sum"] or Decimal(0)
         )
-
-        if settings.ENVIRONMENT == "testnet":
-            adnrs_in_1rbx = 0
-        else:
-            adnrs_in_1rbx = Transaction.objects.filter(
-                to_address=address, type=Transaction.Type.ADDRESS, height__lte=832000
-            ).count()
-
-        adnrs_in_5rbx = Transaction.objects.filter(
-            to_address=address, type=Transaction.Type.ADDRESS, height__gt=832000
-        ).count()
 
         nft_sales = Transaction.objects.filter(
             Q(Q(to_address=address) | Q(from_address=address))
@@ -616,9 +645,9 @@ class Address(models.Model):
 
         callbacks_from_amount = callbacks_from["amount__sum"] or Decimal(0)
 
-        callbacks_to = Callback.objects.filter(to_address=address).aggregate(
-            Sum("amount")
-        )
+        callbacks_to = Callback.objects.filter(
+            to_address=address, recipient_keeps=False
+        ).aggregate(Sum("amount"))
 
         callbacks_to_amount = callbacks_to["amount__sum"] or Decimal(0)
 
@@ -637,13 +666,12 @@ class Address(models.Model):
         available_balance = (
             (inbound_amount or Decimal(0))
             - (outbound_amount or Decimal(0))
-            - Decimal(adnrs_in_1rbx)
-            - Decimal(adnrs_in_5rbx * 5)
             + sales_balance_diff
             + callbacks_from_amount
             - callbacks_to_amount
             + recoveries_inbound_amount
             - recoveries_outbound_amount
+            - forged_vfx_burn.burned_from(address)
             - (total_locked if not address.startswith("xRBX") else 0)
         )
 
@@ -863,9 +891,20 @@ class Callback(models.Model):
     )
 
     from_recovery = models.BooleanField(default=False)
+    # A listed historical reversal (rbx.historical_reserve_reversals): the sender is credited and the recipient keeps
+    # the transfer, as Core applied it.
+    recipient_keeps = models.BooleanField(default=False)
 
     def __str__(self):
         return f"{self.amount} ({self.from_address} <- {self.to_address})"
+
+
+class ForgedVfxBurn(models.Model):
+    """The forged VFX Core burned from an address at the burn block (rbx.forged_vfx_burn); one row per address."""
+
+    address = models.CharField(max_length=64, unique=True)
+    height = models.IntegerField()
+    amount = models.DecimalField(decimal_places=16, max_digits=32)
 
 
 class Recovery(models.Model):
@@ -890,11 +929,22 @@ class FaucetWithdrawlRequest(models.Model):
         db_index=True,
     )
 
-    address = models.CharField(max_length=64)
+    # The VFX part. An empty address and a zero amount mean the request asks for BTC only.
+    address = models.CharField(max_length=64, blank=True, default="")
     amount = models.DecimalField(default=0.0, decimal_places=16, max_digits=32)
-    phone = PhoneNumberField()
+    # Empty only on automation requests, which skip the SMS check.
+    phone = PhoneNumberField(blank=True, null=True)
     is_verified = models.BooleanField(default=False)
+    is_automation = models.BooleanField(default=False)
     transaction_hash = models.CharField(max_length=255, blank=True, null=True)
+
+    # The signet BTC part, paid by the node farm's faucet API.
+    btc_address = models.CharField(max_length=100, blank=True, default="")
+    btc_amount = models.DecimalField(default=0, decimal_places=8, max_digits=16)
+    btc_transaction_hash = models.CharField(max_length=64, blank=True, null=True)
+    # The farm's answer was lost, so the BTC may have been paid: it counts against limits and is never retried.
+    btc_payment_unknown = models.BooleanField(default=False)
+    error = models.TextField(blank=True, default="")
 
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -1021,6 +1071,11 @@ class FungibleTokenTx(models.Model):
     receiving_address = models.CharField(max_length=64, blank=True, null=True, db_index=True)
     sending_address = models.CharField(max_length=64, blank=True, null=True, db_index=True)
     amount = models.DecimalField(decimal_places=16, max_digits=32)
+    # The transaction that applied it; rows indexed before this was recorded
+    # have none.
+    transaction = models.OneToOneField(
+        "Transaction", blank=True, null=True, on_delete=models.CASCADE, related_name="fungible_token_tx"
+    )
 
     def __str__(self):
         return f"{self.type} ({self.token})"
@@ -1175,10 +1230,54 @@ class VbtcV2Token(models.Model):
     total_sent = models.DecimalField(decimal_places=16, max_digits=32, default=0)
     tx_count = models.IntegerField(default=0)
     is_pending_withdrawal = models.BooleanField(default=False)
+    # A Transfer() of the contract from a reserve (xRBX) owner only marks the
+    # recipient as next owner; the node moves the owner when the transfer
+    # unlocks, and a callback before then undoes it (StateData.cs
+    # TransferSmartContract, UpdateTreiFromReserve, CallBackReserveAccountTx).
+    pending_owner_address = models.CharField(max_length=64, blank=True, null=True)
+    # A watched vault's Bitcoin paid out for bridge exits, as the node reports
+    # it (PaidOutForBridgeExitsSats): added back to the owner, as Core's
+    # SettledExitSats.
+    settled_exit_btc = models.DecimalField(decimal_places=16, max_digits=32, default=0)
+    pending_owner_transaction = models.ForeignKey(
+        "Transaction", blank=True, null=True, on_delete=models.SET_NULL, related_name="+"
+    )
     created_at = models.DateTimeField()
 
     def __str__(self):
         return f"{self.sc_identifier} ({self.deposit_address})"
+
+    @property
+    def is_watched(self):
+        """Whether the chain watches this vault's Bitcoin: Core registers a
+        vault created from the recording height on (BtcAttestApply
+        .RegisterVaultIfAny). Its withdrawals settle from Bitcoin reports,
+        read from the node (vbtc_dispatch.reconcile_watched_withdrawals)."""
+        mint = self.nft.mint_transaction if self.nft_id else None
+        return mint is not None and mint.height >= bitcoin_attestation_record_height()
+
+    def pending_owner_settled(self, as_of=None):
+        """Whether the pending reserve transfer has taken effect at as_of
+        (default the latest indexed block's time): its unlock time is before
+        as_of, as the node settles a reserve row (ReserveTransactions.DueRows)
+        after the first block stamped past it, and it was not called back.
+        Not the wall clock: until that block the node still names the sender
+        and admits a callback (ReserveService.cs:17-21)."""
+        tx = self.pending_owner_transaction
+        if tx is None or not self.pending_owner_address or tx.voided_from_callback:
+            return False
+        if tx.unlock_time is None:
+            return True
+        if as_of is None:
+            as_of = chain_time()
+            if as_of is None:
+                return False
+        return tx.unlock_time < as_of
+
+    def current_owner(self, as_of=None):
+        if self.pending_owner_settled(as_of):
+            return self.pending_owner_address
+        return self.owner_address
 
     @property
     def image_is_default(self):
@@ -1210,11 +1309,14 @@ class VbtcV2Token(models.Model):
         if current_height is None:
             current_height = Block.objects.aggregate(v=Max("height"))["v"] or 0
 
-        pending = self.withdrawal_requests.filter(
-            status__in=VbtcV2WithdrawalRequest.ACTIVE_STATUSES,
-            request_transaction__height__gte=current_height
-            - WITHDRAWAL_EXPIRY_BLOCKS,
-        ).exists()
+        open_requests = self.withdrawal_requests.filter(status__in=VbtcV2WithdrawalRequest.ACTIVE_STATUSES)
+        # On a watched vault the chain closes an unpinned request itself and
+        # never ages out a pinned one; the open rows are the chain's.
+        if not self.is_watched:
+            open_requests = open_requests.filter(
+                request_transaction__height__gte=current_height - WITHDRAWAL_EXPIRY_BLOCKS
+            )
+        pending = open_requests.exists()
         if self.is_pending_withdrawal != pending:
             self.is_pending_withdrawal = pending
             self.save(update_fields=["is_pending_withdrawal"])
@@ -1251,7 +1353,7 @@ class VbtcV2Token(models.Model):
         Settlement rows created at ownership transfer are ordinary
         VbtcV2TokenTransfer rows, so they flow through here unchanged.
         """
-        as_of = timezone.now() if before is None else before.date_crafted
+        as_of = chain_time() if before is None else before.date_crafted
         transfers = (
             VbtcV2TokenTransfer.objects.filter(token=self)
             .select_related("transaction")
@@ -1261,11 +1363,25 @@ class VbtcV2Token(models.Model):
         for t in transfers:
             if not self._applied_before(t.transaction, before):
                 continue
-            if t.from_address.startswith("xRBX"):
+            # A reserve owner's ownership transfer defers its settlement row
+            # with the transfer, whichever way the row runs. A Recover()
+            # (type RESERVE) applies at once.
+            if t.transaction.type != Transaction.Type.RESERVE and (
+                t.from_address.startswith("xRBX") or t.transaction.from_address.startswith("xRBX")
+            ):
                 tx = t.transaction
-                if tx.voided_from_callback:
+                if tx.voided_from_callback or tx.refused_at_maturity:
                     continue
-                if tx.unlock_time is not None and tx.unlock_time > as_of:
+                # The node applies a reserve send at the end of the first
+                # block stamped after its unlock time. A send a recovery
+                # redirected counts from that recovery on: in the view of
+                # the latest block, once the recovery is indexed.
+                if (
+                    tx.unlock_time is not None
+                    and (as_of is None or tx.unlock_time >= as_of)
+                    and not self._redirected_by(tx, before)
+                    and not (before is None and tx.recovery_outstanding_transactions.exists())
+                ):
                     continue
             entries[t.to_address] = entries.get(t.to_address, Decimal(0)) + t.amount
             entries[t.from_address] = entries.get(t.from_address, Decimal(0)) - t.amount
@@ -1273,15 +1389,30 @@ class VbtcV2Token(models.Model):
         for w in self._requests(before):
             status = self._status(w, before)
             if escrow_applies(w.request_transaction.height):
-                debit = status != VbtcV2WithdrawalRequest.Status.CANCELLED
+                if status != VbtcV2WithdrawalRequest.Status.CANCELLED:
+                    debit = w.amount
+                else:
+                    # A release refunds its amount less its Bitcoin fee.
+                    debit = w.release_fee
             else:
-                debit = status == VbtcV2WithdrawalRequest.Status.COMPLETED
+                debit = w.amount if status == VbtcV2WithdrawalRequest.Status.COMPLETED else Decimal(0)
             if debit:
                 entries[w.requestor_address] = (
-                    entries.get(w.requestor_address, Decimal(0)) - w.amount
+                    entries.get(w.requestor_address, Decimal(0)) - debit
                 )
 
         return entries
+
+    @staticmethod
+    def _redirected_by(tx, before):
+        """redirect_reserve_transfer brings a send's unlock time to its
+        recovery's time."""
+        return (
+            before is not None
+            and before.type == Transaction.Type.RESERVE
+            and before.from_address == tx.from_address
+            and tx.unlock_time == before.date_crafted
+        )
 
     @staticmethod
     def _applied_before(tx, before):
@@ -1318,7 +1449,7 @@ class VbtcV2Token(models.Model):
         unlocked = Q(
             from_address__startswith="xRBX",
             transaction__voided_from_callback=False,
-            transaction__unlock_time__lte=tx.date_crafted,
+            transaction__unlock_time__lt=tx.date_crafted,
         )
         previous = (
             Block.objects.filter(height=tx.height - 1)
@@ -1362,7 +1493,82 @@ class VbtcV2Token(models.Model):
                 continue
             if not escrow_applies(w.request_transaction.height):
                 pending += w.amount
+            elif (
+                before is not None
+                and not self.is_watched
+                and w.refunded_after(before)
+                and self.owner_before(w.request_transaction) == address
+            ):
+                # An escrow the outgoing owner placed as owner and a vote
+                # refunds after the handover is not the incoming owner's to
+                # cover: the node credits the refund to the requestor, and the
+                # owner's balance is the backing less every other holder's
+                # entry. The handover settles as if it had never been placed,
+                # less a release's Bitcoin fee, which stays the requestor's.
+                # On a vault the chain watches the outgoing owner's position
+                # moves to the incoming owner at the handover
+                # (CarryOwnerPosition), and the refund is the requestor's to
+                # keep: the settlement stands as planned at the handover.
+                pending -= w.amount - w.release_fee
         return self.ledger_entries(before).get(address, Decimal(0)) - pending
+
+    def ownership_transfers(self, since_height=0):
+        """The Transfer() transactions of this contract from since_height on,
+        in (height, hash) order, under any envelope type the node routes it
+        through."""
+        from rbx.vbtc_dispatch import OWNERSHIP_TRANSFER_FUNCTION, OWNERSHIP_TRANSFER_TYPES
+
+        found = []
+        candidates = (
+            Transaction.objects.filter(type__in=list(OWNERSHIP_TRANSFER_TYPES), height__gte=since_height)
+            .annotate(data_text=Cast("data", models.TextField()))
+            .filter(data_text__contains=self.sc_identifier)
+            .order_by("height", "hash")
+        )
+        for tx in candidates:
+            payload, _ = parse_envelope(tx.data)
+            if (
+                net_string(field(payload, "Function")) == OWNERSHIP_TRANSFER_FUNCTION
+                and net_string(field(payload, "ContractUID")) == self.sc_identifier
+            ):
+                found.append(tx)
+        return found
+
+    def owner_before(self, tx):
+        """The contract's owner when tx was applied, from the chain: the
+        minter, then each Transfer() from the owner of the day (a reserve
+        owner's once it took effect: unlocked by a block before tx and not
+        undone) and each Recover() of the owner of the day. Inside a block
+        the order is the backfill's, by hash."""
+        from rbx.vbtc_dispatch import is_reserve_address, recovery_address_of, reserve_transfer_undone
+
+        def before_tx(event):
+            return event.pk != tx.pk and (event.height, event.hash) < (tx.height, tx.hash)
+
+        recoveries = Transaction.objects.filter(type=Transaction.Type.RESERVE, height__lte=tx.height)
+        events = sorted(
+            [e for e in self.ownership_transfers() if before_tx(e)]
+            + [e for e in recoveries if before_tx(e) and recovery_address_of(e)],
+            key=lambda e: (e.height, e.hash),
+        )
+        owner = self.nft.minter_address
+        for event in events:
+            if event.from_address != owner:
+                continue
+            if event.type == Transaction.Type.RESERVE:
+                owner = recovery_address_of(event)
+                continue
+            if not event.to_address:
+                continue
+            if is_reserve_address(event.from_address):
+                if event.voided_from_callback or reserve_transfer_undone(event):
+                    continue
+                if event.unlock_time is not None and not Block.objects.filter(
+                    height__lt=tx.height, height__gte=event.height, date_crafted__gt=event.unlock_time
+                ).exists():
+                    continue
+            owner = event.to_address
+        return owner
 
     @property
     def addresses(self):
@@ -1374,10 +1580,19 @@ class VbtcV2Token(models.Model):
         total_withdrawn = VbtcV2WithdrawalRequest.objects.filter(
             token=self, status=VbtcV2WithdrawalRequest.Status.COMPLETED
         ).aggregate(total=Sum("amount"))["total"] or Decimal(0)
+        # What bridge exits paid out of a watched vault (Core's SettledExitSats)
+        # and the Bitcoin fee of a release, charged to its requester (Core's
+        # ReleaseFeeSats), both in OwnerAddBackBtc.
+        total_withdrawn += self.settled_exit_btc
+        for w in VbtcV2WithdrawalRequest.objects.filter(
+            token=self, status=VbtcV2WithdrawalRequest.Status.CANCELLED, refunded_amount__isnull=False
+        ):
+            total_withdrawn += w.release_fee
 
         # Owner anchor = global_balance (actual BTC on deposit) + total_withdrawn
-        entries[self.owner_address] = (
-            entries.get(self.owner_address, Decimal(0))
+        owner = self.current_owner()
+        entries[owner] = (
+            entries.get(owner, Decimal(0))
             + self.global_balance
             + total_withdrawn
         )
@@ -1385,6 +1600,11 @@ class VbtcV2Token(models.Model):
         # Pre-filter, entries always sum to global_balance. A negative entry
         # therefore means the displayed total exceeds the BTC backing —
         # that's ledger corruption, not display noise. Alarm before hiding.
+        # The node's sink "-" and source "+" (bridge locks and unlocks,
+        # shields and unshields) are not holders.
+        for pseudo in ("-", "+"):
+            entries.pop(pseudo, None)
+
         negatives = {a: str(b) for a, b in entries.items() if b < 0}
         if negatives:
             logging.warning(
@@ -1395,7 +1615,8 @@ class VbtcV2Token(models.Model):
         return {addr: bal for addr, bal in entries.items() if bal > 0}
 
     def available_balances(self, current_height=None):
-        """`addresses` minus each address's open legacy withdrawal requests.
+        """`addresses` minus each address's open legacy withdrawal requests
+        and each reserve address's sends still waiting to unlock.
 
         Below WithdrawalEscrowHeight a withdrawal request writes no ledger
         row until it completes, and the node's transfer check reads the raw
@@ -1436,6 +1657,31 @@ class VbtcV2Token(models.Model):
             if address in balances:
                 balances[address] = max(balances[address] - w.amount, Decimal(0))
 
+        # A reserve (xRBX) send is debited only when it unlocks (see
+        # ledger_entries), and until then the node subtracts it from what the
+        # sender can spend and refuses a second one on the contract
+        # (VBTCController.cs:4434-4462, ReserveTransactions
+        # .GetPendingVBTCTransferTotal). The node counts single transfers
+        # only: a multi-transfer's payload carries no top-level ContractUID.
+        pending_reserve_sends = VbtcV2TokenTransfer.objects.filter(
+            token=self,
+            from_address__startswith="xRBX",
+            is_multi=False,
+            transaction__type=Transaction.Type.VBTC_V2_TRANSFER,
+            transaction__voided_from_callback=False,
+            transaction__unlock_time__isnull=False,
+            # A recovery applied it to the recovery address at once.
+            transaction__recovery_outstanding_transactions__isnull=True,
+        )
+        now = chain_time()
+        if now is not None:
+            pending_reserve_sends = pending_reserve_sends.filter(transaction__unlock_time__gte=now)
+        for t in pending_reserve_sends:
+            if t.from_address in balances:
+                balances[t.from_address] = max(
+                    balances[t.from_address] - t.amount, Decimal(0)
+                )
+
         return balances
 
 
@@ -1464,6 +1710,82 @@ class VbtcV2TokenTransfer(models.Model):
 
     def __str__(self):
         return f"{self.from_address} => {self.to_address} [{self.amount}]"
+
+
+# Base-bridge state as the node keeps it outside the contract ledger
+# (VBTCBridgeLockState, VBTCBridgeBtcExitState, VBTCBridgeConsumedBurn). The
+# ledger moves themselves are VbtcV2TokenTransfer rows against the node's
+# sink "-" and source "+" (rbx/vbtc_bridge.py).
+class VbtcV2RewindMark(models.Model):
+    """The height of the latest Bitcoin rewind (type 45) block whose
+    reconciliation with the node succeeded for every watched vault and exit.
+    Until it reaches the latest one, every pass re-opens what the node no
+    longer lists as paid."""
+
+    reconciled_height = models.BigIntegerField(default=0)
+    # The rewind height whose long hold has been logged as an error, so it
+    # is logged once (vbtc_dispatch.REWIND_HOLD_ALERT_BLOCKS).
+    alerted_height = models.BigIntegerField(default=0)
+
+
+class VbtcV2BridgeLock(models.Model):
+    lock_id = models.CharField(max_length=128, unique=True)
+    token = models.ForeignKey(VbtcV2Token, on_delete=models.CASCADE, related_name="bridge_locks")
+    owner_address = models.CharField(max_length=64, db_index=True)
+    amount = models.DecimalField(decimal_places=16, max_digits=32)
+    amount_sats = models.BigIntegerField()
+    unlocked_amount = models.DecimalField(decimal_places=16, max_digits=32, default=0)
+    unlocked_amount_sats = models.BigIntegerField(default=0)
+    is_unlocked = models.BooleanField(default=False)
+    is_blacklisted = models.BooleanField(default=False)
+    evm_destination = models.CharField(max_length=128)
+    lock_transaction = models.ForeignKey(Transaction, on_delete=models.CASCADE, related_name="+")
+    unlock_transaction = models.ForeignKey(
+        Transaction, blank=True, null=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    exit_burn_tx_hash = models.CharField(max_length=128, blank=True)
+
+    class Meta:
+        # The node compares lock ids without regard to case (lock_id__iexact).
+        indexes = [models.Index(Upper("lock_id"), name="vbtcv2bridgelock_lock_id_upper")]
+
+    @property
+    def remaining_amount(self):
+        return self.amount - self.unlocked_amount
+
+    @property
+    def remaining_amount_sats(self):
+        return self.amount_sats - self.unlocked_amount_sats
+
+
+class VbtcV2BridgeExit(models.Model):
+    # As the transaction carried it (trimmed), and normalised (lower case, no
+    # 0x), which is what the node matches an exit's burn on.
+    burn_tx_hash = models.CharField(max_length=128)
+    burn_key = models.CharField(max_length=128, unique=True)
+    exit_transaction = models.ForeignKey(Transaction, on_delete=models.CASCADE, related_name="+")
+    owner_address = models.CharField(max_length=64)
+    amount = models.DecimalField(decimal_places=16, max_digits=32)
+    btc_destination = models.CharField(max_length=128)
+    allocations = models.JSONField(default=list)
+    is_complete = models.BooleanField(default=False)
+    # The Bitcoin transaction(s) (one per vault, comma-separated), or
+    # "FAILED:<record>" as the node marks a failed exit.
+    btc_tx_hash = models.TextField(blank=True)
+    # On vaults the chain watches: the parts whose outcome read from the node
+    # has been applied to the locks (vbtc_bridge.reconcile_watched_exit).
+    applied_parts = models.JSONField(default=list)
+
+    @property
+    def failed(self):
+        return self.btc_tx_hash.startswith("FAILED:")
+
+
+class VbtcV2BridgeConsumedBurn(models.Model):
+    # Normalised: lower case, no 0x (VBTCBridgeConsumedBurn.Normalize).
+    burn_tx_hash = models.CharField(max_length=128, unique=True)
+    kind = models.CharField(max_length=32)
+    transaction = models.ForeignKey(Transaction, on_delete=models.CASCADE, related_name="+")
 
 
 class VbtcV2WithdrawalRequest(models.Model):
@@ -1532,6 +1854,33 @@ class VbtcV2WithdrawalRequest(models.Model):
     created_at = models.DateTimeField()
     completed_at = models.DateTimeField(blank=True, null=True)
     cancelled_at = models.DateTimeField(blank=True, null=True)
+    # What a closed request gave back, when the node refunded less than its
+    # amount (a release keeps its Bitcoin fee). Null: the whole amount.
+    refunded_amount = models.DecimalField(decimal_places=16, max_digits=32, blank=True, null=True)
+    # A watched vault's open request as the node last described it
+    # (GetWithdrawalStatus Bitcoin.OpenWithdrawals, read with the backing by
+    # vbtc_dispatch.refresh_watched_backing): Waiting for its Bitcoin
+    # transaction to be fixed, or Pinned to one. pin_txid and pin_fee_rate
+    # are the newest live pin's; releasing, a release is pinned for it;
+    # expires_at_height, the block it closes at if still waiting. Blank or
+    # null: not read yet, or not a watched vault's open request.
+    pin_state = models.CharField(max_length=16, blank=True, default="")
+    pin_txid = models.CharField(max_length=128, blank=True, default="")
+    pin_fee_rate = models.DecimalField(decimal_places=8, max_digits=16, blank=True, null=True)
+    releasing = models.BooleanField(default=False)
+    expires_at_height = models.BigIntegerField(blank=True, null=True)
+    # Why a cancelled request closed without payment: Cancelled (by its
+    # requester: a watched vault's cancel, or an approved vote), or, on a
+    # watched vault, what the node's history says (VaultWithdrawalState):
+    # Released, Expired or Void. Blank: not known.
+    CLOSE_REASONS = ("Cancelled", "Released", "Expired", "Void")
+    closed_because = models.CharField(max_length=16, blank=True, default="")
+
+    @property
+    def release_fee(self):
+        if self.refunded_amount is None:
+            return Decimal(0)
+        return max(self.amount - self.refunded_amount, Decimal(0))
 
     def __str__(self):
         return f"{self.token.sc_identifier} withdrawal [{self.status}]"

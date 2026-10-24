@@ -11,10 +11,12 @@ height or its ledger diverges from the chain's. The values are per network:
     WithdrawalEscrowHeight           1          7,296,200
     V2TransferMultiHeight            1          7,281,000
     V2WithdrawalOwnerAddBackFixHeight 1         7,281,000
-    VbtcCancellationVoteRulesHeight  1,019,000  7,400,500
+    VbtcCancellationVoteRulesHeight  1          7,400,500
 
 VbtcCancellationVoteRulesHeight is from VerifiedX-Core 9601f132 (Globals.cs,
-Program.cs); the others are from 63468588.
+Program.cs); the others are from 63468588. Testnet restarted from genesis on
+2026-10-22 and has every one of them at 1 (VerifiedX-Core testnet 2cd65002,
+GlobalsNetworkHeights.cs).
 
 Which network this deployment indexes comes from settings.VBTC_NETWORK, which
 defaults from the deployment's ENVIRONMENT (testnet) or IS_DEVNET flag; each
@@ -32,9 +34,29 @@ _MAINNET = {
     "V2_TRANSFER_MULTI_HEIGHT": 7_281_000,
     "V2_WITHDRAWAL_OWNER_ADDBACK_FIX_HEIGHT": 7_281_000,
     "CANCELLATION_VOTE_RULES_HEIGHT": 7_400_500,
+    "BRIDGE_INTRA_BLOCK_GUARD_HEIGHT": 7_296_200,
+    # Globals.FundLossAuditHeight, which BitcoinAttestationRecordHeight and
+    # the other fund-loss audit rules activate at. Core's value on mainnet is
+    # still the unset placeholder: set this to the launch height when Core's
+    # is set (the placeholder keeps the rules inactive).
+    "FUND_LOSS_AUDIT_HEIGHT": 999_999_999,
+    # Globals.BitcoinAttestationHeight: from it, vaults minted before the
+    # recording height are frozen (BtcLegacyFreeze). FundLossAuditHeight plus
+    # two weeks on mainnet, so a placeholder while that one is.
+    "BITCOIN_ATTESTATION_HEIGHT": 999_999_999 + 90_000,
 }
 _TESTNET = {k: 1 for k in _MAINNET}
-_TESTNET["CANCELLATION_VOTE_RULES_HEIGHT"] = 1_019_000
+# The testnet chain restarted from genesis on 2026-10-22 (VerifiedX-Core
+# testnet 2cd65002, GlobalsNetworkHeights.cs): the fund-loss rules and the
+# Bitcoin attestation record at Globals.FundLossAuditTestnetHeight (400) and
+# freeze legacy vaults from Globals.BitcoinAttestationTestnetHeight (401). A
+# vault created from block 400 is watched.
+_TESTNET["FUND_LOSS_AUDIT_HEIGHT"] = 400
+_TESTNET["BITCOIN_ATTESTATION_HEIGHT"] = 401
+
+# Core's value for a height not set yet (Globals.FundLossAuditHeight on
+# mainnet). A height at or past it is not served: no such block is coming.
+UNSET_HEIGHT = 999_999_999
 
 
 def _gate(name):
@@ -60,6 +82,29 @@ def v2_withdrawal_owner_addback_fix_height():
 
 def cancellation_vote_rules_height():
     return _gate("CANCELLATION_VOTE_RULES_HEIGHT")
+
+
+def bridge_intra_block_guard_height():
+    return _gate("BRIDGE_INTRA_BLOCK_GUARD_HEIGHT")
+
+
+def bitcoin_attestation_record_height():
+    return _gate("FUND_LOSS_AUDIT_HEIGHT")
+
+
+def bitcoin_attestation_height():
+    """Globals.BitcoinAttestationHeight: legacy vaults are frozen from it."""
+    return _gate("BITCOIN_ATTESTATION_HEIGHT")
+
+
+def served_height(height):
+    """A gate height as the API serves it: None while Core has not set it."""
+    return None if height >= UNSET_HEIGHT else height
+
+
+def fund_loss_audit_height():
+    """Globals.FundLossAuditHeight, which PathAuditRulesHeight follows."""
+    return _gate("FUND_LOSS_AUDIT_HEIGHT")
 
 
 def escrow_applies(request_block_height):

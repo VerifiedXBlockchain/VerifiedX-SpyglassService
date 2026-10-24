@@ -28,10 +28,16 @@ The balance math that consumes these rows is in rbx.models.VbtcV2Token.
 """
 import logging
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from contextvars import ContextVar
 from decimal import Decimal
 
+from django.db.models import Max, Q
+from django.db.transaction import atomic
+
 from rbx.models import (
+    Block,
+    VbtcV2RewindMark,
     Recovery,
     Transaction,
     VbtcV2Token,
@@ -41,7 +47,9 @@ from rbx.models import (
 from rbx import vbtc_cancellation
 from rbx.vbtc_gates import (
     bound_field,
+    decode_data,
     field,
+    fund_loss_audit_height,
     net_bool,
     net_decimal,
     net_int,
@@ -168,8 +176,9 @@ def _write_transfer(token, tx, from_address, to_address, amount, is_multi):
         # A recovery moved this send to its own address while it was in
         # flight (redirect_reserve_transfer). A later pass over the send
         # does not replay the recovery, so it keeps that recipient.
+        # A send the recovery took back without applying keeps its own.
         recovery = Recovery.objects.filter(outstanding_transactions=tx).first()
-        if recovery is not None:
+        if recovery is not None and not tx.voided_from_callback:
             to_address = recovery.new_address
     # update_or_create, not get_or_create: a backfill must correct rows that
     # were indexed from payload addresses before the parties came from the
@@ -287,7 +296,7 @@ def route_envelope(tx):
 KEEP_STORED = "keep the stored row"
 
 
-def planned_settlement(token, tx):
+def planned_settlement(token, tx, old_owner=None, new_owner=None):
     """The settlement row tx calls for: (from_address, to_address, amount),
     None when it calls for no row, or KEEP_STORED.
 
@@ -304,8 +313,8 @@ def planned_settlement(token, tx):
     The block cannot hold a second Transfer() of the contract: the node
     checks each against the owner before the block
     (TransactionValidatorService.cs:981)."""
-    old_owner = tx.from_address
-    new_owner = tx.to_address
+    old_owner = tx.from_address if old_owner is None else old_owner
+    new_owner = tx.to_address if new_owner is None else new_owner
     if not old_owner or old_owner == new_owner:
         return None
     stored = VbtcV2TokenTransfer.objects.filter(token=token, transaction=tx).exists()
@@ -327,11 +336,37 @@ def apply_ownership_transfer(token, tx):
     (see planned_settlement), rewritten on replay so that a backfill corrects
     a row an earlier run got wrong."""
     new_owner = tx.to_address
-    plan = planned_settlement(token, tx)
+    _write_settlement(token, tx, planned_settlement(token, tx), "V2 ownership transfer")
+    if is_reserve_address(tx.from_address):
+        # The node marks the recipient as next owner and moves the owner only
+        # when the transfer unlocks without a callback (settle_pending_owners).
+        # A replay already knows whether it was called back.
+        if _replaying.get() and not tx.voided_from_callback and reserve_transfer_undone(tx):
+            tx.voided_from_callback = True
+            tx.save(update_fields=["voided_from_callback"])
+        if tx.voided_from_callback:
+            if token.pending_owner_transaction_id == tx.pk:
+                _clear_pending_owner(token)
+            if _replaying.get():
+                # The sender owned the contract when the transfer was
+                # admitted, and the callback left it there; earlier indexing
+                # had moved it to the recipient.
+                _move_owner(token, tx.from_address, tx)
+            return
+        token.pending_owner_address = new_owner
+        token.pending_owner_transaction = tx
+        token.save(update_fields=["pending_owner_address", "pending_owner_transaction"])
+        if _replaying.get() and token.pending_owner_settled():
+            _move_owner(token, new_owner, tx)
+        return
+    _move_owner(token, new_owner, tx)
+
+
+def _write_settlement(token, tx, plan, what):
     if plan is KEEP_STORED:
         logging.warning(
-            f"V2 ownership transfer {tx.hash} ({token.sc_identifier}): the order "
-            f"of this transfer and other activity on the contract around block "
+            f"{what} {tx.hash} ({token.sc_identifier}): the order "
+            f"of this transaction and other activity on the contract around block "
             f"{tx.height} is not stored; the settlement is left as it is stored."
         )
     elif plan is None:
@@ -348,8 +383,47 @@ def apply_ownership_transfer(token, tx):
                 "created_at": tx.date_crafted,
             },
         )
+
+
+def reserve_transfer_undone(tx, ignore=None):
+    """Whether the chain holds a CallBack() of tx, or a Recover() of its
+    sender, that the node applied before the transfer took effect: one mined
+    by the end of the first block stamped after the unlock, when the node
+    applies the transfer instead. Earlier indexing marked neither on an
+    ownership transfer, so a backfill reads the chain."""
+    callbacks = Transaction.objects.filter(
+        type=Transaction.Type.RESERVE, from_address=tx.from_address, height__gte=tx.height
+    )
+    if tx.unlock_time is not None:
+        applied = (
+            Block.objects.filter(height__gte=tx.height, date_crafted__gt=tx.unlock_time)
+            .order_by("height")
+            .values_list("height", flat=True)
+            .first()
+        )
+        if applied is not None:
+            callbacks = callbacks.filter(height__lte=applied)
+    for callback in callbacks:
+        payload = decode_data(callback.data)
+        function = net_string(field(payload, "Function"))
+        if function == "CallBack()" and net_string(field(payload, "Hash")) == tx.hash:
+            return True
+        if function == "Recover()" and callback.pk != tx.pk and (ignore is None or callback.pk != ignore.pk):
+            return True
+    return False
+
+
+def _clear_pending_owner(token):
+    token.pending_owner_address = None
+    token.pending_owner_transaction = None
+    token.save(update_fields=["pending_owner_address", "pending_owner_transaction"])
+
+
+def _move_owner(token, new_owner, tx):
     token.owner_address = new_owner
-    token.save(update_fields=["owner_address"])
+    token.pending_owner_address = None
+    token.pending_owner_transaction = None
+    token.save(update_fields=["owner_address", "pending_owner_address", "pending_owner_transaction"])
     try:
         nft = token.nft
         nft.owner_address = new_owner
@@ -360,6 +434,249 @@ def apply_ownership_transfer(token, tx):
         )
 
 
+def settle_pending_owners(block):
+    """End of a block: a reserve owner's Transfer() whose unlock time is
+    before the block's time and that was not called back takes effect, as
+    the node's ReserveService applies it after the block
+    (ReserveTransactions.DueRows, UpdateTreiFromReserve)."""
+    pending = VbtcV2Token.objects.filter(
+        pending_owner_transaction__isnull=False
+    ).select_related("pending_owner_transaction")
+    for token in pending:
+        tx = token.pending_owner_transaction
+        if tx.voided_from_callback:
+            _clear_pending_owner(token)
+        elif token.pending_owner_settled(as_of=block.date_crafted):
+            _move_owner(token, token.pending_owner_address, tx)
+
+
+def _sender_covers(row, cutoff, held, owner, pending):
+    """DeferredVbtcTransferStillCovered: the owner of a vault the chain does
+    not watch (`owner`, as the pass has it when it reaches the row) is
+    covered; anyone else must hold the amount on the ledger as it stood at
+    `cutoff`. `held` carries the running figure per (contract, address)
+    through one judging pass; `pending` is what to add to the ledger's
+    figure (sends the ledger already counts but that are judged in this
+    pass)."""
+    token = row.token
+    if owner == row.from_address:
+        return True
+    key = (token.pk, row.from_address)
+    if key not in held:
+        entries = token.ledger_entries(before=cutoff)
+        held[key] = entries.get(row.from_address, Decimal(0)) + pending.get(key, Decimal(0))
+    if held[key] >= row.amount:
+        held[key] -= row.amount
+        return True
+    return False
+
+
+def _pass_order(row):
+    """Core's order of reserve rows: (ConfirmTimestamp, Height, Hash)."""
+    return (row.transaction.unlock_time, row.transaction.height, row.transaction.hash)
+
+
+def _pending_handovers(token, unlock_from, unlock_before, sender=None, recovery=None):
+    """A reserve owner's Transfer()s of token still waiting for the reserve
+    pass, unlocking in [unlock_from, unlock_before), in Core's order. Inside
+    a recovery's own loop, that recovery does not count as undoing them."""
+    rows = []
+    for tx in token.ownership_transfers():
+        if not is_reserve_address(tx.from_address) or tx.unlock_time is None:
+            continue
+        if sender is not None and tx.from_address != sender:
+            continue
+        if tx.voided_from_callback or not (unlock_from <= tx.unlock_time < unlock_before):
+            continue
+        if reserve_transfer_undone(tx, ignore=recovery):
+            continue
+        rows.append(tx)
+    return sorted(rows, key=lambda t: (t.unlock_time, t.height, t.hash))
+
+
+def _owner_in_pass(token, base_owner, handovers, row, moves_to=None):
+    """The owner when the pass reaches row: base_owner, then each handover
+    of the same pass that sorts before the row and was made by the owner of
+    the moment (to its recipient, or to moves_to at a recovery)."""
+    owner = base_owner
+    key = _pass_order(row)
+    for tx in handovers:
+        if (tx.unlock_time, tx.height, tx.hash) >= key:
+            break
+        # Core's recovery loop moves a contract mid-loop only for an NFT_TX
+        # row (StateData.cs:1649); a vBTC vault's Transfer() is usually a
+        # TKNZ_TX (VBTCService.cs:737), and the reserve stays its owner.
+        if moves_to is not None and tx.type != Transaction.Type.NFT_TX:
+            continue
+        if tx.from_address == owner:
+            owner = moves_to or tx.to_address
+    return owner
+
+
+def _end_of(block):
+    """A cut-off after every transaction of block (owner_before compares
+    (height, hash); ledger_entries compares height and time)."""
+    return Transaction(hash="\uffff", height=block.height, date_crafted=block.date_crafted, type=-1)
+
+
+def settle_matured_reserve_sends(block):
+    """End of a block: the node applies each reserve vBTC send whose unlock
+    time is before the block's and at or after the block before's, judging
+    it again first (UpdateTreiFromReserve). From the path-audit rules a send
+    its sender no longer covers is refused and moves nothing; ledger_entries
+    then leaves it out. The sends of one block are judged in Core's order,
+    each against the ledger with the ones before it applied. A send a
+    recovery redirected is no longer pending on the node and is not judged.
+
+    Not mirrored: the holder limit and the attested owner balance of a vault
+    the chain watches (#159); such a send is taken as covered."""
+    previous = Block.objects.filter(height=block.height - 1).values_list("date_crafted", flat=True).first()
+    if previous is None:
+        return
+    rules_from = (
+        Block.objects.filter(height=fund_loss_audit_height()).values_list("date_crafted", flat=True).first()
+    )
+    if rules_from is None:
+        return
+    due = list(
+        VbtcV2TokenTransfer.objects.filter(
+            from_address__startswith="xRBX",
+            is_multi=False,
+            transaction__type=Transaction.Type.VBTC_V2_TRANSFER,
+            transaction__voided_from_callback=False,
+            transaction__refused_at_maturity=False,
+            transaction__unlock_time__lt=block.date_crafted,
+            transaction__unlock_time__gte=previous,
+            transaction__recovery_outstanding_transactions__isnull=True,
+        ).select_related("transaction", "token")
+    )
+    # The ledger at the end of the block already counts both sides of these
+    # sends (their unlock is before the cut-off); each is taken back out and
+    # applied in turn, so a send sorted first does not see the credit of one
+    # sorted after it. Every address is read before any refusal is saved:
+    # ledger_entries leaves a refused send out.
+    pending = {}
+    for row in due:
+        if row.transaction.unlock_time < rules_from:
+            continue
+        sender, recipient = (row.token_id, row.from_address), (row.token_id, row.to_address)
+        pending[sender] = pending.get(sender, Decimal(0)) + row.amount
+        pending[recipient] = pending.get(recipient, Decimal(0)) - row.amount
+    # Core settles the block's due ownership transfers and vBTC sends in one
+    # pass, in (unlock, height, hash) order: a handover due earlier in the
+    # pass has changed the owner when a send is reached.
+    cutoff = _end_of(block)
+    held, base, handovers = {}, {}, {}
+    entries = {}
+    for token_id, address in pending:
+        if token_id not in entries:
+            token = next(row.token for row in due if row.token_id == token_id)
+            entries[token_id] = token.ledger_entries(before=cutoff)
+        held[(token_id, address)] = entries[token_id].get(address, Decimal(0)) + pending[(token_id, address)]
+    for row in sorted(due, key=_pass_order):
+        tx = row.transaction
+        if tx.unlock_time < rules_from:
+            continue
+        token = row.token
+        if token.pk not in base:
+            base[token.pk] = token.owner_before(cutoff)
+            handovers[token.pk] = _pending_handovers(token, previous, block.date_crafted)
+        owner = _owner_in_pass(token, base[token.pk], handovers[token.pk], row)
+        if _sender_covers(row, cutoff, held, owner, pending):
+            # Applied to the live state: a later send of the recipient sees it.
+            held[(row.token_id, row.to_address)] += row.amount
+            continue
+        logging.warning(
+            f"Reserve vBTC send {tx.hash} of {row.amount} on {row.token.sc_identifier}: not covered by "
+            f"{row.from_address} when it fell due; the node refuses it."
+        )
+        tx.refused_at_maturity = True
+        tx.save(update_fields=["refused_at_maturity"])
+
+
+def maturity_heights():
+    """The blocks in which some reserve vBTC send falls due: for each, the
+    first block stamped after its unlock time."""
+    heights = set()
+    sends = Transaction.objects.filter(
+        type=Transaction.Type.VBTC_V2_TRANSFER, from_address__startswith="xRBX", unlock_time__isnull=False
+    ).only("height", "unlock_time")
+    for tx in sends:
+        due = (
+            Block.objects.filter(height__gte=tx.height, date_crafted__gt=tx.unlock_time)
+            .order_by("height")
+            .values_list("height", flat=True)
+            .first()
+        )
+        if due is not None:
+            heights.add(due)
+    return sorted(heights)
+
+
+def clear_maturity_refusals():
+    Transaction.objects.filter(
+        type=Transaction.Type.VBTC_V2_TRANSFER, refused_at_maturity=True
+    ).update(refused_at_maturity=False)
+
+
+def redirect_reserve_sends(recovery_tx, sends, recovery_address):
+    """Recover() with reserve vBTC sends in flight (RecoverReserveAccountTx,
+    StateData.cs:1704): from the path-audit rules each is judged in Core's
+    order; one its sender covers is applied to the recovery address at
+    once, and one it does not cover is taken back with the rest and never
+    applied (voided, as a called-back send)."""
+    rows = list(
+        VbtcV2TokenTransfer.objects.filter(transaction__in=sends, is_multi=False).select_related("transaction", "token")
+    )
+    judged = recovery_tx.height >= fund_loss_audit_height()
+    # The recovery's pending loop runs in (unlock, height, hash) order and
+    # gives a contract the reserve still owns to the recovery address when
+    # it reaches that contract's pending transfer (StateData.cs:1539, :1571).
+    reserve = recovery_tx.from_address
+    held, base, handovers = {}, {}, {}
+    for row in sorted(rows, key=_pass_order):
+        token = row.token
+        if token.pk not in base:
+            base[token.pk] = token.owner_before(recovery_tx)
+            handovers[token.pk] = _pending_handovers(
+                token, recovery_tx.date_crafted, datetime.max.replace(tzinfo=timezone.utc),
+                sender=reserve, recovery=recovery_tx,
+            )
+        owner = _owner_in_pass(token, base[token.pk], handovers[token.pk], row, moves_to=recovery_address)
+        if judged and not _sender_covers(row, recovery_tx, held, owner, {}):
+            logging.warning(
+                f"Reserve vBTC send {row.transaction.hash} on {row.token.sc_identifier}: not covered by "
+                f"{row.from_address} at the recovery {recovery_tx.hash}; taken back, never applied."
+            )
+            void_reserve_transfer(row.transaction)
+            continue
+        redirect_reserve_transfer(row.transaction, recovery_address, recovery_tx.date_crafted)
+
+
+def call_back_ownership_transfer(original_tx):
+    """CallBack() of a reserve owner's Transfer() of a vBTC V2 contract.
+    Returns False when original_tx is not one. While the transfer is pending
+    the callback voids it: the owner never moved and the settlement row is
+    never counted. Once it has taken effect the node skips the callback (its
+    reserve row is no longer Pending), and so does this."""
+    if original_tx.type not in OWNERSHIP_TRANSFER_TYPES:
+        # A vBTC send (type 26) applies by ContractUID and Amount whatever
+        # its Function says.
+        return False
+    token = VbtcV2Token.objects.filter(pending_owner_transaction=original_tx).first()
+    if token is None:
+        payload, _ = parse_envelope(original_tx.data)
+        if net_string(field(payload, "Function")) != OWNERSHIP_TRANSFER_FUNCTION:
+            return False
+        sc_uid = net_string(field(payload, "ContractUID"))
+        return bool(sc_uid) and VbtcV2Token.objects.filter(sc_identifier=sc_uid).exists()
+    if not original_tx.voided_from_callback:
+        original_tx.voided_from_callback = True
+        original_tx.save(update_fields=["voided_from_callback"])
+    _clear_pending_owner(token)
+    return True
+
+
 # --- reserve callback and recovery -----------------------------------------
 
 def void_reserve_transfer(original_tx):
@@ -367,6 +684,62 @@ def void_reserve_transfer(original_tx):
     if not original_tx.voided_from_callback:
         original_tx.voided_from_callback = True
         original_tx.save(update_fields=["voided_from_callback"])
+
+
+
+
+def apply_recovery(tx, recovery_address):
+    """Recover() of a reserve account, after its in-flight sends have been
+    redirected (redirect_reserve_transfer). The node (RecoverReserveAccountTx)
+    gives every contract the reserve owns to the recovery address, a pending
+    Transfer() of one included, and then sweeps the reserve's vBTC on every
+    contract where it holds some to the recovery address.
+
+    Spyglass writes one row per contract for tx, from the ledger as it stood
+    at tx: the ownership settlement (planned_settlement) for a vault the
+    reserve owns, the reserve's whole entry for one it only holds. A replay
+    (reprocess_vbtc_v2 rebuilds the owners in order) plans the same rows."""
+    reserve = tx.from_address
+    if not is_reserve_address(reserve) or not recovery_address or recovery_address == reserve:
+        return
+
+    for token in VbtcV2Token.objects.filter(
+        pending_owner_transaction__from_address=reserve
+    ).select_related("pending_owner_transaction"):
+        pending_tx = token.pending_owner_transaction
+        if not pending_tx.voided_from_callback:
+            # Recovered, not applied: the transfer never takes effect, and
+            # its settlement row is never counted.
+            pending_tx.voided_from_callback = True
+            pending_tx.save(update_fields=["voided_from_callback"])
+        _clear_pending_owner(token)
+
+    # Which vaults the reserve owned at tx comes from the chain, not the
+    # stored owner: a backfill does not reset the stored owner at a mint.
+    candidates = VbtcV2Token.objects.filter(
+        Q(owner_address__in=[reserve, recovery_address])
+        | Q(nft__minter_address=reserve)
+        | Q(vbtcv2tokentransfer__transaction=tx)
+    ).distinct()
+    owned = [token for token in candidates if token.owner_before(tx) == reserve]
+    for token in owned:
+        plan = planned_settlement(token, tx, old_owner=reserve, new_owner=recovery_address)
+        _write_settlement(token, tx, plan, "Recover()")
+        _move_owner(token, recovery_address, tx)
+
+    held = (
+        VbtcV2Token.objects.filter(
+            Q(vbtcv2tokentransfer__from_address=reserve) | Q(vbtcv2tokentransfer__to_address=reserve)
+        )
+        .exclude(pk__in=[token.pk for token in owned])
+        .distinct()
+    )
+    for token in held:
+        entry = token.ledger_entries(before=tx).get(reserve, Decimal(0))
+        if entry > 0:
+            _write_settlement(token, tx, (reserve, recovery_address, entry), "Recover()")
+        else:
+            VbtcV2TokenTransfer.objects.filter(token=token, transaction=tx).delete()
 
 
 def redirect_reserve_transfer(original_tx, recovery_address, recovered_at):
@@ -379,6 +752,14 @@ def redirect_reserve_transfer(original_tx, recovery_address, recovered_at):
     )
     original_tx.unlock_time = recovered_at
     original_tx.save(update_fields=["unlock_time"])
+
+
+def recovery_address_of(tx):
+    """The RecoveryAddress of a Recover() (type RESERVE), else None."""
+    payload = decode_data(tx.data)
+    if net_string(field(payload, "Function")) != "Recover()":
+        return None
+    return net_string(field(payload, "RecoveryAddress"))
 
 
 # --- withdrawal requests (type 27) -----------------------------------------
@@ -500,6 +881,11 @@ def apply_complete(tx):
     token = _token(sc_uid, tx, what)
     if token is None:
         return
+    if token.is_watched:
+        # StateData.CompleteVBTCV2Withdrawal: a watched vault's withdrawals
+        # are completed by the Bitcoin report that shows their transaction.
+        logging.warning(f"{what} {tx.hash}: {sc_uid} is completed by Bitcoin, not by this transaction.")
+        return
     withdrawal = _request_for(token, request_hash)
     if withdrawal is None:
         logging.error(
@@ -562,6 +948,9 @@ def apply_cancel(tx):
             f"{withdrawal.requestor_address}; the node ignores it."
         )
         return
+    if token.is_watched:
+        _close_watched_on_cancel(tx, what, withdrawal)
+        return
     if vbtc_cancellation.rules_active(tx.height):
         _apply_cancel_by_rules(tx, what, withdrawal)
         return
@@ -581,6 +970,460 @@ def apply_cancel(tx):
         )
         return
     _record_cancel(tx, what, withdrawal)
+
+
+def _close_watched_on_cancel(tx, what, withdrawal):
+    """BtcWithdrawals: on a watched vault a cancel closes the request at
+    once and refunds it, with no vote; admission refuses one unless the
+    request is still waiting, so a mined one closed it."""
+    if withdrawal.status in VbtcV2WithdrawalRequest.TERMINAL_STATUSES:
+        if withdrawal.cancel_transaction_id != tx.hash:
+            logging.error(f"{what} {tx.hash}: withdrawal {withdrawal.pk} is already {withdrawal.status}.")
+        return
+    withdrawal.status = VbtcV2WithdrawalRequest.Status.CANCELLED
+    withdrawal.cancel_transaction = tx
+    withdrawal.cancelled_at = tx.date_crafted
+    withdrawal.refunded_amount = None
+    withdrawal.closed_because = "Cancelled"
+    withdrawal.save(update_fields=["status", "cancel_transaction", "cancelled_at", "refunded_amount", "closed_because"])
+    withdrawal.token.recompute_pending_withdrawal()
+    _replan_settlements_since(withdrawal.token, withdrawal.request_transaction)
+
+
+def reconcile_watched_withdrawals(token, after_rewind=False):
+    """A watched vault's open requests take their outcome from the node's
+    GetWithdrawalHistory, which reads the tables every node writes from
+    blocks. Paid: COMPLETED with the Bitcoin txid and the report that
+    completed it. Closed without payment: CANCELLED at the closing block,
+    with the refund the node gave. A row whose report or closing block is
+    not indexed yet waits for the next pass. A node that does not answer
+    changes nothing. Returns the number of rows settled.
+
+    After a Bitcoin rewind (after_rewind), a COMPLETED row the node no
+    longer lists as paid is open again first (BtcWithdrawals.Unsettle): the
+    one way a terminal row is walked back."""
+    from rbx.client import get_vbtc_v2_withdrawal_history
+
+    statuses = list(VbtcV2WithdrawalRequest.ACTIVE_STATUSES)
+    if after_rewind:
+        statuses.append(VbtcV2WithdrawalRequest.Status.COMPLETED)
+    if not token.withdrawal_requests.filter(status__in=statuses).exists():
+        return 0
+    data = get_vbtc_v2_withdrawal_history(token.sc_identifier)
+    if not _usable_history(token, data):
+        return None
+    # One transaction per vault, the token row locked: a block sync and the
+    # sweep do not settle or re-plan the same vault at once.
+    with atomic():
+        VbtcV2Token.objects.select_for_update().filter(pk=token.pk).first()
+        caught_up = _reopen_unpaid(token, data) if after_rewind else True
+        settled = _apply_withdrawal_history(token, data)
+    # A payment made again whose report is not indexed yet: None, as for a
+    # node that did not answer, so the rewind mark holds and the next pass
+    # reads the paid rows again.
+    return settled if caught_up else None
+
+
+def _usable_history(token, data):
+    if not isinstance(data, dict) or not data.get("Success"):
+        # The client has logged the refusal or the failure.
+        return False
+    if not isinstance(data.get("WithdrawalHistory"), list) or not isinstance(data.get("Refunded"), list):
+        logging.error(
+            f"Watched vault {token.sc_identifier}: the node's withdrawal history has no WithdrawalHistory "
+            f"or Refunded list; its withdrawals are left as they are."
+        )
+        return False
+    return True
+
+
+def _reopen_unpaid(token, data):
+    """False when a row paid again waits for its report to be indexed."""
+    paid = data.get("WithdrawalHistory") if isinstance(data, dict) and data.get("Success") else None
+    if not isinstance(paid, list):
+        return True
+    listed = {entry.get("RequestHash"): entry for entry in paid if isinstance(entry, dict)}
+    reopened = []
+    caught_up = True
+    for withdrawal in token.withdrawal_requests.filter(status=VbtcV2WithdrawalRequest.Status.COMPLETED).select_related(
+        "request_transaction"
+    ):
+        if withdrawal.request_transaction_id in listed:
+            if not _repaid(token, withdrawal, listed[withdrawal.request_transaction_id]):
+                caught_up = False
+            continue
+        logging.warning(
+            f"Watched vault {token.sc_identifier}: withdrawal {withdrawal.request_transaction_id} is no longer paid "
+            f"after a Bitcoin rewind; it is open again."
+        )
+        withdrawal.status = VbtcV2WithdrawalRequest.Status.REQUESTED
+        withdrawal.btc_transaction_hash = ""
+        withdrawal.completion_transaction = None
+        withdrawal.completed_at = None
+        withdrawal.save(update_fields=["status", "btc_transaction_hash", "completion_transaction", "completed_at"])
+        reopened.append(withdrawal)
+    if reopened:
+        token.recompute_pending_withdrawal()
+        _replan_settlements_since(token, min((w.request_transaction for w in reopened), key=lambda t: t.height))
+    return caught_up
+
+
+def _repaid(token, withdrawal, entry):
+    """A paid row the node still lists after a rewind may have been paid
+    again since, by another of its pinned transactions (Unsettle keeps the
+    pins, BtcWithdrawals.Rewind.cs:116-121) with a later report: the txid
+    and the completing report are the node's. The amount and the status do
+    not change. False when the report is not indexed yet."""
+    txid = entry.get("BTCTransactionHash")
+    completion = entry.get("CompletionHash")
+    if not txid or not completion:
+        return True
+    if withdrawal.btc_transaction_hash == txid and withdrawal.completion_transaction_id == completion:
+        return True
+    report = Transaction.objects.filter(hash=completion).first()
+    if report is None:
+        _log_once(token, entry, f"was paid again; waits for report {completion} to be indexed")
+        return False
+    logging.warning(
+        f"Watched vault {token.sc_identifier}: withdrawal {withdrawal.request_transaction_id} was paid again after a "
+        f"Bitcoin rewind, by {txid} (report {completion})."
+    )
+    withdrawal.btc_transaction_hash = txid
+    withdrawal.completion_transaction = report
+    withdrawal.completed_at = report.date_crafted
+    withdrawal.save(update_fields=["btc_transaction_hash", "completion_transaction", "completed_at"])
+    return True
+
+
+def _apply_withdrawal_history(token, data):
+    open_rows = {
+        w.request_transaction_id: w
+        for w in token.withdrawal_requests.filter(status__in=VbtcV2WithdrawalRequest.ACTIVE_STATUSES)
+        .select_related("request_transaction")
+    }
+    if not open_rows:
+        return 0
+    paid = data.get("WithdrawalHistory") if isinstance(data, dict) else None
+    closed = data.get("Refunded") if isinstance(data, dict) else None
+    if not isinstance(data, dict) or not data.get("Success"):
+        # The client has logged the refusal or the failure.
+        return 0
+    if not isinstance(paid, list) or not isinstance(closed, list):
+        logging.error(
+            f"Watched vault {token.sc_identifier}: the node's withdrawal history has no WithdrawalHistory "
+            f"or Refunded list; its open withdrawals are left as they are."
+        )
+        return 0
+
+    settled = 0
+    replan_from = None
+    for entry in paid:
+        withdrawal = open_rows.get(entry.get("RequestHash")) if isinstance(entry, dict) else None
+        if withdrawal is None:
+            _log_unknown(token, entry)
+            continue
+        report = Transaction.objects.filter(hash=entry.get("CompletionHash") or "").first()
+        txid = entry.get("BTCTransactionHash")
+        if not txid or not entry.get("CompletionHash"):
+            _log_once(token, entry, "has no Bitcoin txid or completing report; the row stays open")
+            continue
+        if report is None:
+            _log_once(token, entry, f"waits for report {entry.get('CompletionHash')} to be indexed")
+            continue
+        withdrawal.status = VbtcV2WithdrawalRequest.Status.COMPLETED
+        withdrawal.btc_transaction_hash = txid
+        withdrawal.completion_transaction = report
+        withdrawal.completed_at = report.date_crafted
+        withdrawal.save(update_fields=["status", "btc_transaction_hash", "completion_transaction", "completed_at"])
+        settled += 1
+    for entry in closed:
+        withdrawal = open_rows.get(entry.get("RequestHash")) if isinstance(entry, dict) else None
+        if withdrawal is None:
+            _log_unknown(token, entry)
+            continue
+        if withdrawal.status in VbtcV2WithdrawalRequest.TERMINAL_STATUSES:
+            continue
+        closed_at = entry.get("ClosedAtBlock")
+        refunded = net_decimal(entry.get("Refunded"))
+        if closed_at is None or refunded is None:
+            _log_once(token, entry, "has no closing block or refund; the row stays open")
+            continue
+        block = Block.objects.filter(height=closed_at).first()
+        if block is None:
+            _log_once(token, entry, f"waits for block {closed_at} to be synced")
+            continue
+        outcome = entry.get("Outcome")
+        if outcome not in VbtcV2WithdrawalRequest.CLOSE_REASONS:
+            _log_once(token, entry, f"closed with an outcome Spyglass does not know ({outcome!r}); served as unknown")
+            outcome = ""
+        withdrawal.status = VbtcV2WithdrawalRequest.Status.CANCELLED
+        withdrawal.cancelled_at = block.date_crafted
+        withdrawal.refunded_amount = refunded
+        withdrawal.closed_because = outcome
+        withdrawal.save(update_fields=["status", "cancelled_at", "refunded_amount", "closed_because"])
+        settled += 1
+        if replan_from is None or withdrawal.request_transaction.height < replan_from.height:
+            replan_from = withdrawal.request_transaction
+    if settled:
+        token.recompute_pending_withdrawal()
+    if replan_from is not None:
+        _replan_settlements_since(token, replan_from)
+    return settled
+
+
+_LOGGED = set()
+
+
+def _log_once(token, entry, why, level=logging.WARNING):
+    """One line per vault, entry and reason for the life of the process: the
+    sweep reads the same history every ten minutes."""
+    request = entry.get("RequestHash") if isinstance(entry, dict) else repr(entry)
+    key = (token.sc_identifier, request, why)
+    if key in _LOGGED:
+        return
+    _LOGGED.add(key)
+    logging.log(level, f"Watched vault {token.sc_identifier}: withdrawal {request} {why}.")
+
+
+def _log_unknown(token, entry):
+    if not isinstance(entry, dict):
+        _log_once(token, entry, "is not a readable history entry", logging.ERROR)
+        return
+    request = entry.get("RequestHash")
+    if not token.withdrawal_requests.filter(request_transaction_id=request).exists():
+        _log_once(token, entry, "is listed by the node but not held by Spyglass", logging.ERROR)
+
+
+def refresh_watched_backing(token):
+    """For a vault the chain watches, the backing is what the chain records,
+    not what a Bitcoin explorer shows at the mint-time address: the node's
+    GetWithdrawalStatus gives Bitcoin.HeldSats (unspent and pinned coins,
+    Core's DepositBtc) and the current key's DepositAddress, which a rekey
+    moves. Returns True when the node answered for a vault it watches;
+    False sends the caller to the Bitcoin providers (a vault Core does not
+    watch keeps the earlier rules), or leaves the row as it is when the node
+    did not answer."""
+    from rbx.client import get_vbtc_v2_withdrawal_status
+
+    data = get_vbtc_v2_withdrawal_status(token.sc_identifier)
+    if not isinstance(data, dict) or not data.get("Success"):
+        return None
+    bitcoin = data.get("Bitcoin")
+    if not data.get("Attested") or not isinstance(bitcoin, dict):
+        return False
+    held = bitcoin.get("HeldSats")
+    paid = bitcoin.get("PaidOutForBridgeExitsSats")
+    address = bitcoin.get("DepositAddress")
+    if (
+        not all(isinstance(sats, int) and not isinstance(sats, bool) for sats in (held, paid))
+        or not isinstance(address, str)
+        or not address
+    ):
+        logging.error(
+            f"Watched vault {token.sc_identifier}: the node's Bitcoin view has no HeldSats, "
+            f"PaidOutForBridgeExitsSats or DepositAddress."
+        )
+        return None
+    # total_received, total_sent and tx_count are the providers' and are
+    # not kept for a watched vault (see VbtcV2TokenSerializer). Core moves
+    # HeldSats and SettledExitSats in one apply (BtcAttestBalance.cs:52-56):
+    # the owner anchor adds the second to the first, so they are written
+    # together, or a payout seen in one and not the other shrinks the owner.
+    VbtcV2Token.objects.filter(pk=token.pk).update(
+        global_balance=Decimal(held) / Decimal(100_000_000),
+        settled_exit_btc=Decimal(paid) / Decimal(100_000_000),
+        deposit_address=address,
+    )
+    _store_pin_states(token, bitcoin.get("OpenWithdrawals"))
+    return True
+
+
+PIN_STATES = ("Waiting", "Pinned")
+
+
+def _store_pin_states(token, open_withdrawals):
+    """Each open request's pin state as the node describes it, from the same
+    GetWithdrawalStatus answer as the backing: what is served for it, never
+    asked of the node in a request. An open request the node no longer lists
+    (closed there, not yet here) has its pin state cleared; it closes on the
+    next history pass. A view without the list leaves the rows as they are."""
+    if not isinstance(open_withdrawals, list):
+        key = (token.sc_identifier, "OpenWithdrawals")
+        if key not in _LOGGED:
+            _LOGGED.add(key)
+            logging.error(f"Watched vault {token.sc_identifier}: the node's Bitcoin view has no OpenWithdrawals list.")
+        return
+    listed = {}
+    for entry in open_withdrawals:
+        if not isinstance(entry, dict) or entry.get("Kind") != "Withdrawal":
+            continue
+        if entry.get("State") not in PIN_STATES or not entry.get("RequestHash"):
+            _log_once(token, entry, "has no usable pin state; it is left as it was")
+            continue
+        listed[entry["RequestHash"]] = entry
+    for withdrawal in token.withdrawal_requests.filter(status__in=VbtcV2WithdrawalRequest.ACTIVE_STATUSES):
+        entry = listed.get(withdrawal.request_transaction_id)
+        if entry is None:
+            fields = {"pin_state": "", "pin_txid": "", "pin_fee_rate": None, "releasing": False, "expires_at_height": None}
+        else:
+            pinned = entry["State"] == "Pinned"
+            txid = entry.get("BitcoinTxid")
+            expires = entry.get("ExpiresAtVfxHeight")
+            fields = {
+                "pin_state": entry["State"],
+                "pin_txid": txid if pinned and isinstance(txid, str) else "",
+                "pin_fee_rate": net_decimal(entry.get("FeeRate")) if pinned else None,
+                "releasing": pinned and entry.get("Releasing") is True,
+                "expires_at_height": expires if isinstance(expires, int) and not isinstance(expires, bool) else None,
+            }
+        VbtcV2WithdrawalRequest.objects.filter(pk=withdrawal.pk).update(**fields)
+
+
+def refresh_all_watched_backings():
+    """Every watched vault's backing from the node: after a block holding a
+    report, a rewind or a rekey, the transactions that change it on Core."""
+    for token in VbtcV2Token.objects.select_related("nft__mint_transaction"):
+        if token.is_watched:
+            refresh_watched_backing(token)
+
+
+def refresh_pins_after_block(height):
+    """The watched vaults a block's withdrawal requests (type 27, single or
+    multi-contract) or fee bumps and releases (type 44) touched, read again
+    from the node: Core fixes a request's Bitcoin transaction, a higher fee
+    or a release in that block, so its pin state changes there, not at the
+    next Bitcoin report. Only those vaults are asked."""
+    sc_identifiers = set(
+        VbtcV2WithdrawalRequest.objects.filter(request_transaction__height=height).values_list(
+            "token__sc_identifier", flat=True
+        )
+    )
+    for raw in Transaction.objects.filter(height=height, type=Transaction.Type.VBTC_V2_COIN_PIN).values_list(
+        "data", flat=True
+    ):
+        sc_uid = net_string(field(parse_object(raw), "ContractUID"))
+        if sc_uid:
+            sc_identifiers.add(sc_uid)
+    if not sc_identifiers:
+        return
+    for token in VbtcV2Token.objects.filter(sc_identifier__in=sc_identifiers).select_related("nft__mint_transaction"):
+        if token.is_watched:
+            refresh_watched_backing(token)
+
+
+def refresh_backing(token, client):
+    """The vault's backing: from the node for a vault the chain watches,
+    from the Bitcoin providers otherwise. A watched vault whose node does
+    not answer is left as it is: a provider figure counts deposits before
+    the chain does, and loses the coins a rekey moved."""
+    if token.is_watched:
+        watched = refresh_watched_backing(token)
+        if watched is not False:
+            return
+    balance_info = client.get_balance(token.deposit_address)
+    if not balance_info:
+        return
+    update_fields = {"global_balance": balance_info["balance"]}
+    if not balance_info.get("partial"):
+        # The Blockdaemon rung only knows the current balance; never zero the
+        # historical fields from a partial result.
+        update_fields.update(
+            total_received=balance_info["total_received"],
+            total_sent=balance_info["total_sent"],
+            tx_count=balance_info["tx_count"],
+        )
+    # Targeted update: a full save() would clobber fields written by the
+    # vbtc-worker between read and save.
+    VbtcV2Token.objects.filter(pk=token.pk).update(**update_fields)
+
+
+def _latest_rewind_height():
+    return (
+        Transaction.objects.filter(type=Transaction.Type.VBTC_V2_BTC_REORG).aggregate(h=Max("height"))["h"] or 0
+    )
+
+
+# A rewind is held this many indexed blocks without a pass that succeeded
+# for every vault and exit before it is logged as an error: deeper than the
+# chain's reorganisations, so a report that is still to come has come by
+# then, and what is left is a fork or a node fault for an operator.
+REWIND_HOLD_ALERT_BLOCKS = 20
+
+
+def rewind_hold():
+    """The rewind Spyglass is still holding for, or None: the latest
+    rewind block, the latest one reconciled, and how many indexed blocks
+    have passed since the rewind."""
+    latest = _latest_rewind_height()
+    mark = VbtcV2RewindMark.objects.first()
+    reconciled = mark.reconciled_height if mark else 0
+    if latest <= reconciled:
+        return None
+    indexed = Block.objects.aggregate(h=Max("height"))["h"] or latest
+    return {
+        "rewind_height": latest,
+        "reconciled_height": reconciled,
+        "blocks_held": max(0, indexed - latest),
+    }
+
+
+def _report_long_hold(mark):
+    hold = rewind_hold()
+    if hold is None or hold["blocks_held"] < REWIND_HOLD_ALERT_BLOCKS:
+        return
+    if mark.alerted_height >= hold["rewind_height"]:
+        return
+    logging.error(
+        f"vBTC V2 rewind at block {hold['rewind_height']} is still not reconciled after "
+        f"{hold['blocks_held']} blocks: a paid row the node lists again waits for a report "
+        f"that is not indexed, or the node does not answer"
+    )
+    VbtcV2RewindMark.objects.filter(pk=mark.pk).update(alerted_height=hold["rewind_height"])
+
+
+def reconcile_all_watched_vaults(after_rewind=False):
+    """Every watched vault with an open request (and, after a Bitcoin
+    rewind, with a completed one). A rewind is read on every pass, the
+    ten-minute sweep included, until one pass after the latest rewind block
+    has succeeded for every vault and exit (VbtcV2RewindMark): a node that
+    failed during the rewind block's own pass must not leave a payment the
+    rewind took back counted for good."""
+    latest = _latest_rewind_height()
+    mark, _ = VbtcV2RewindMark.objects.get_or_create(pk=1)
+    after_rewind = after_rewind or latest > mark.reconciled_height
+    ok = True
+    settled = 0
+    statuses = list(VbtcV2WithdrawalRequest.ACTIVE_STATUSES)
+    if after_rewind:
+        statuses.append(VbtcV2WithdrawalRequest.Status.COMPLETED)
+    tokens = VbtcV2Token.objects.filter(withdrawal_requests__status__in=statuses).distinct()
+    for token in tokens:
+        if not token.is_watched:
+            continue
+        # One vault's failure does not stop the others.
+        try:
+            result = reconcile_watched_withdrawals(token, after_rewind=after_rewind)
+        except Exception:
+            logging.exception(f"Watched vault {token.sc_identifier}: reading its withdrawals failed")
+            result = None
+        if result is None:
+            ok = False
+        else:
+            settled += result
+    # Exits on watched vaults settle the same way.
+    from rbx.vbtc_bridge import reconcile_watched_exits
+
+    try:
+        if not reconcile_watched_exits(after_rewind=after_rewind):
+            ok = False
+    except Exception:
+        logging.exception("Reading the watched vaults' bridge exits failed")
+        ok = False
+    if after_rewind and ok and latest > mark.reconciled_height:
+        VbtcV2RewindMark.objects.filter(pk=mark.pk).update(reconciled_height=latest)
+    elif latest > mark.reconciled_height:
+        _report_long_hold(mark)
+    return settled
 
 
 def _record_cancel(tx, what, withdrawal):
@@ -659,11 +1502,53 @@ def _settle(withdrawal, result):
             return
         withdrawal.status = VbtcV2WithdrawalRequest.Status.CANCELLED
         withdrawal.cancelled_at = result.decided_by.date_crafted
-        withdrawal.save(update_fields=["status", "cancelled_at"])
+        withdrawal.closed_because = "Cancelled"
+        withdrawal.save(update_fields=["status", "cancelled_at", "closed_because"])
         withdrawal.token.recompute_pending_withdrawal()
+        _replan_settlements_since(withdrawal.token, withdrawal.request_transaction)
     elif result.outcome is vbtc_cancellation.Outcome.REJECTED:
         if _reopen(withdrawal):
             withdrawal.token.recompute_pending_withdrawal()
+
+
+def _replan_settlements_since(token, request_tx):
+    """A refund changes what a handover since the request had to settle
+    (VbtcV2Token.settlement_amount_for), and each handover's row feeds the
+    next one's, so every one since is planned again, in order: each
+    Transfer() and each Recover() that gave the contract to the recovery
+    address."""
+    transfers = [tx for tx in token.ownership_transfers(since_height=request_tx.height) if tx.pk != request_tx.pk]
+    handovers = [(tx, None, None) for tx in transfers]
+    for tx in _recoveries_of(token, request_tx, transfers):
+        handovers.append((tx, tx.from_address, recovery_address_of(tx)))
+    for tx, old_owner, new_owner in sorted(handovers, key=lambda h: (h[0].height, h[0].hash)):
+        what = "Recover()" if old_owner else "V2 ownership transfer"
+        _write_settlement(token, tx, planned_settlement(token, tx, old_owner=old_owner, new_owner=new_owner), what)
+
+
+def _recoveries_of(token, request_tx, transfers):
+    """The Recover()s since request_tx that gave token to their recovery
+    address: those of the reserve that owned it then (apply_recovery). Only
+    a reserve that could have owned it since is read: the owner at the
+    request, a Transfer() recipient since (transfers), or the recovery
+    address of an earlier such recovery."""
+    owners = {token.owner_before(request_tx)} | {tx.to_address for tx in transfers}
+    read = set()
+    found = []
+    while True:
+        reserves = {address for address in owners if is_reserve_address(address)} - read
+        if not reserves:
+            break
+        read |= reserves
+        candidates = Transaction.objects.filter(
+            type=Transaction.Type.RESERVE, height__gte=request_tx.height, from_address__in=reserves
+        )
+        for tx in candidates:
+            recovery_address = recovery_address_of(tx)
+            if recovery_address and recovery_address != tx.from_address and token.owner_before(tx) == tx.from_address:
+                found.append(tx)
+                owners.add(recovery_address)
+    return sorted(found, key=lambda tx: (tx.height, tx.hash))
 
 
 def cancellation_uid_for(withdrawal):
@@ -754,8 +1639,10 @@ def apply_vote(tx):
         return
     withdrawal.status = VbtcV2WithdrawalRequest.Status.CANCELLED
     withdrawal.cancelled_at = tx.date_crafted
-    withdrawal.save(update_fields=["status", "cancelled_at"])
+    withdrawal.closed_because = "Cancelled"
+    withdrawal.save(update_fields=["status", "cancelled_at", "closed_because"])
     withdrawal.token.recompute_pending_withdrawal()
+    _replan_settlements_since(withdrawal.token, withdrawal.request_transaction)
 
 
 def _apply_vote_by_rules(tx, what, uid):

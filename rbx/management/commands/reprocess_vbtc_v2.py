@@ -1,7 +1,9 @@
 from django.core.management.base import BaseCommand
+from django.db import InterfaceError, InternalError, OperationalError
 from django.db.models import Q
+from django.db.transaction import atomic
 
-from rbx.models import Transaction, VbtcV2Token
+from rbx.models import Block, Transaction, VbtcV2Token
 from rbx.tasks import process_transaction
 from rbx.models import VbtcV2TokenTransfer
 from rbx.vbtc_dispatch import (
@@ -10,8 +12,24 @@ from rbx.vbtc_dispatch import (
     OWNERSHIP_TRANSFER_FUNCTION,
     OWNERSHIP_TRANSFER_TYPES,
     SC_ENVELOPE_TYPES,
+    apply_recovery,
+    clear_maturity_refusals,
+    maturity_heights,
+    settle_matured_reserve_sends,
     planned_settlement,
+    reconcile_all_watched_vaults,
+    recovery_address_of,
     replaying,
+)
+from rbx.vbtc_bridge import (
+    BRIDGE_TYPES,
+    SHIELD_TYPES,
+    expire_exits,
+    in_chain_order,
+    lock_bridge_state,
+    read_exit_expiries,
+    reset_bridge_state,
+    shared_bridge_blocks,
 )
 from rbx.vbtc_gates import field, net_string, parse_envelope
 
@@ -24,6 +42,10 @@ VBTC_V2_TYPES = [
     Transaction.Type.VBTC_V2_WITHDRAWAL_CANCEL,
     Transaction.Type.VBTC_V2_WITHDRAWAL_VOTE,
 ]
+
+# The bridge and shield types (rbx/vbtc_bridge.py). Their state outside the
+# ledger is cleared and rebuilt in order by a full run.
+BRIDGE_AND_SHIELD_TYPES = sorted(BRIDGE_TYPES | SHIELD_TYPES)
 
 # Functions inside the legacy smart-contract envelope types that move a vBTC
 # V2 ledger or its contract owner (rbx/vbtc_dispatch.py).
@@ -58,11 +80,22 @@ class Command(BaseCommand):
         )
 
     def handle(self, *args, **options):
+        if options.get("dry_run") or options.get("type"):
+            self.run(**options)
+            return
+        # A full run clears the bridge state and rebuilds it: it holds the
+        # bridge lock from before it reads the transactions to the end, so a
+        # block synced meanwhile is either read here or waits for the run.
+        with atomic():
+            lock_bridge_state()
+            self.run(**options)
+
+    def run(self, **options):
         tx_type = options.get("type")
         dry_run = options.get("dry_run", False)
         skip_envelopes = options.get("skip_envelopes", False)
 
-        types = [tx_type] if tx_type else VBTC_V2_TYPES
+        types = [tx_type] if tx_type else VBTC_V2_TYPES + BRIDGE_AND_SHIELD_TYPES
         selected = Q(type__in=types)
 
         # The envelope types carry many unrelated transactions; keep only the
@@ -88,19 +121,38 @@ class Command(BaseCommand):
             if envelope_hashes:
                 selected |= Q(hash__in=envelope_hashes)
 
+        # Recover() moves the vaults a reserve owns and sweeps its vBTC; only
+        # that part is replayed (the rest of the RESERVE handler is not
+        # idempotent). It moves owners, so it is replayed only with the
+        # ownership transfers that come after it.
+        recoveries = set()
+        if not tx_type and not skip_envelopes:
+            for tx in Transaction.objects.filter(type=Transaction.Type.RESERVE).only("hash", "data"):
+                if recovery_address_of(tx):
+                    recoveries.add(tx.hash)
+            if recoveries:
+                selected |= Q(hash__in=recoveries)
+
         # Block by block. The order inside a block is not stored, so an
-        # ownership transfer goes last in its block: the rows it has to see
-        # to know that it shares the block are back in the table by then.
-        txs = sorted(
-            Transaction.objects.filter(selected),
-            key=lambda tx: (tx.height, tx.hash in ownership_transfers, tx.hash),
+        # ownership transfer or a recovery goes last in its block: the rows
+        # it has to see to know that it shares the block are back in the
+        # table by then. A block in which bridge transactions share a lock or
+        # a burn is taken in the chain's order, read from the node.
+        txs = list(Transaction.objects.filter(selected))
+        shared = shared_bridge_blocks(txs)
+        goes_last = lambda tx: tx.hash in ownership_transfers or tx.hash in recoveries  # noqa: E731
+        txs, unresolved = in_chain_order(
+            txs, shared, lambda tx: (int(goes_last(tx)), tx.hash), last=goes_last
         )
         count = len(txs)
 
         self.stdout.write(
             f"Found {count} transaction(s) to reprocess "
-            f"({len(envelope_hashes)} envelope transaction(s) included)."
+            f"({len(envelope_hashes)} envelope transaction(s) included, "
+            f"{len(recoveries)} recovery transaction(s))."
         )
+
+        self.report_shared_bridge_blocks(shared, unresolved)
 
         if dry_run:
             for tx in txs:
@@ -113,21 +165,72 @@ class Command(BaseCommand):
         processed = 0
         errors = 0
 
+        # Reserve sends are judged again as they fall due, inside the replay:
+        # what a later settlement or sweep reads must already be decided.
+        maturities = []
+        if not tx_type:
+            reset_bridge_state()
+            clear_maturity_refusals()
+            maturities = maturity_heights()
+
+        def judge_through(height):
+            while maturities and maturities[0] <= height:
+                with atomic():
+                    settle_matured_reserve_sends(Block.objects.get(height=maturities.pop(0)))
+
+        # Exits on watched vaults the node failed by rule give their locks
+        # back at the start of that block, before its transactions.
+        expiries = {}
+
         with replaying():
             for tx in txs:
+                # A block's sends fall due at its end, after its transactions.
+                judge_through(tx.height - 1)
+                if not tx_type:
+                    read_exit_expiries(tx.height, expiries)
+                    with atomic():
+                        expire_exits(tx.height, expiries)
                 try:
                     self.stdout.write(
                         f"Processing {tx.hash} (type={tx.type}, height={tx.height})..."
                     )
-                    process_transaction(tx)
+                    # A savepoint each: one failing transaction does not
+                    # abort the run's own.
+                    with atomic():
+                        if tx.hash in recoveries:
+                            apply_recovery(tx, recovery_address_of(tx))
+                        else:
+                            process_transaction(tx)
                     processed += 1
+                except (OperationalError, InterfaceError, InternalError):
+                    # A deadlock or a lost connection: the whole run rolls
+                    # back rather than committing without this transaction.
+                    raise
                 except Exception as e:
                     errors += 1
                     self.stderr.write(f"  ERROR processing {tx.hash}: {e}")
 
+            judge_through(float("inf"))
+
+        if not tx_type:
+            # The outcomes of watched vaults' withdrawals come from the node.
+            reconcile_all_watched_vaults()
+
         self.stdout.write(
             f"Done. Processed: {processed}, Errors: {errors}, Total: {count}"
         )
+
+    def report_shared_bridge_blocks(self, shared, unresolved):
+        """Names the blocks in which bridge transactions share a lock or a
+        burn. Each is replayed in the chain's order; one the node gave no
+        order for is replayed by hash, and its holders and locks need a
+        check against a node."""
+        for height, refs in shared.items():
+            how = "hash order (the node gave none)" if height in unresolved else "the chain's order"
+            for kind, ref, hashes in refs:
+                self.stderr.write(
+                    f"  WARNING block {height}: {', '.join(hashes)} share {kind} {ref}; replayed in {how}."
+                )
 
     def report_settlements(self, txs):
         """The settlement rows the run would write, change or remove, and

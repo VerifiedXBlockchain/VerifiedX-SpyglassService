@@ -102,7 +102,11 @@ class BtcClient:
                              overwrite total_received/total_sent/tx_count)
         5. blockchain.info  (legacy last resort)
 
-    Any single success wins. Testnet keeps the Blockbook endpoint.
+    Any single success wins.
+
+    Testnet runs on our private signet: no public server carries that chain,
+    so every testnet call (balance, history, broadcast, lookup) goes to the
+    one Esplora base in `settings.BTC_TESTNET_ESPLORA_URL`, with no fallback.
     """
 
     satoshi_to_btc_multiplier = 0.00000001
@@ -117,7 +121,7 @@ class BtcClient:
         # Legacy attrs kept for get_transactions(), which still uses the
         # original single-provider paths.
         if self.is_testnet:
-            self.base_url = "https://blockbook.tbtc-1.zelcore.io/api/v2"
+            self.base_url = settings.BTC_TESTNET_ESPLORA_URL
             self.is_blockchain_info = False
         else:
             self.base_url = "https://blockchain.info"
@@ -137,7 +141,11 @@ class BtcClient:
         full totals, and the first partial is returned only if none does.
         """
         if self.is_testnet:
-            return self._balance_blockbook(address)
+            try:
+                return self._balance_esplora(address, self.base_url)
+            except Exception as e:
+                logger.error(f"Error in BtcClient.get_balance() for {address}: {e}")
+                return None
 
         providers = [
             ("vfx-node", self._balance_vfx_node, settings.BTC_NODE_API_URL),
@@ -322,28 +330,6 @@ class BtcClient:
             "tx_count": data.get("n_tx", 0),
         }
 
-    def _balance_blockbook(self, address: str):
-        try:
-            response = requests.get(
-                f"{self.base_url}/address/{address}",
-                headers=self.headers,
-                timeout=(5, 10),
-            )
-            response.raise_for_status()
-            data = response.json()
-        except Exception as e:
-            logger.error(f"Error in BtcClient.get_balance() for {address}: {e}")
-            return None
-
-        total_received = Decimal(int(data.get("totalReceived", 0))) / _SATS
-        total_sent = Decimal(int(data.get("totalSent", 0))) / _SATS
-        return {
-            "total_received": total_received,
-            "total_sent": total_sent,
-            "balance": total_received - total_sent,
-            "tx_count": data.get("txs", 0),
-        }
-
     # -------------------------------------------------------- transactions
 
     def get_transactions(self, address: str):
@@ -352,7 +338,7 @@ class BtcClient:
             if self.is_blockchain_info:
                 url = f"{self.base_url}/rawaddr/{address}?limit=50"
             else:
-                url = f"{self.base_url}/address/{address}?details=txs"
+                url = f"{self.base_url}/address/{address}/txs"
 
             response = requests.get(url, headers=self.headers, timeout=(5, 10))
             response.raise_for_status()
@@ -363,8 +349,8 @@ class BtcClient:
 
         if self.is_blockchain_info:
             return data.get("txs", [])
-        else:
-            return data.get("transactions", [])
+        # Esplora returns the newest transactions as a bare list.
+        return data
 
     # Every provider call has to fit inside gunicorn's 30s worker budget with
     # room for the fallback. 2026-09-26: mempool.space held a testnet4 POST
@@ -377,12 +363,12 @@ class BtcClient:
     def broadcast_transaction(self, raw_tx_hex: str):
         """Broadcast a signed transaction to the Bitcoin network.
 
-        Testnet is TESTNET4 — blockstream.info has no testnet4 Esplora, and its
-        /testnet endpoint is testnet3, where testnet4 UTXOs don't exist. Every
-        broadcast sent there fails `bad-txns-inputs-missingorspent` (2026-08-13:
-        this dead-ended every web-wallet withdrawal at the broadcast step).
-        Providers are tried in order; any success wins. Three providers plus the
-        lookup fit inside gunicorn's 30s worker budget at these timeouts.
+        Testnet is our private signet, which only our own Esplora serves, so it
+        has one provider and the lookup on the same base; a public explorer
+        (testnet3 or testnet4) has none of its UTXOs and would only answer
+        `bad-txns-inputs-missingorspent`. Mainnet providers are tried in order;
+        any success wins. Three providers plus the lookup fit inside gunicorn's
+        30s worker budget at these timeouts.
 
         A transaction the network already holds counts as sent: a provider
         that rejects the re-submission as a duplicate, or a lookup that finds
@@ -391,34 +377,24 @@ class BtcClient:
         accepted but not answered in time (or by a retry from elsewhere)
         reads as a failure forever, and a retry can only ever re-sign.
         """
-        # Submissions from the cluster to mempool.space never get an answer
-        # (2026-09-26: a real testnet4 hex sat 35s and died with a connection
-        # error while GETs and malformed POSTs to the same host returned in
-        # 40ms), so it is not a testnet submission provider here; it is still
-        # the lookup. mempool.emzy.de and mempool.ninja are independent
-        # Esplora-compatible instances that serve testnet4.
         if self.is_testnet:
-            providers = [
-                ("https://blockbook.tbtc-1.zelcore.io/api/v2/sendtx/", "blockbook"),
-                ("https://mempool.emzy.de/testnet4/api/tx", "esplora"),
-                ("https://mempool.ninja/testnet4/api/tx", "esplora"),
-            ]
-            lookup_url = "https://mempool.space/testnet4/api/tx/{txid}"
+            providers = [f"{self.base_url}/tx"]
+            lookup_url = f"{self.base_url}/tx/{{txid}}"
         else:
             providers = [
-                ("https://mempool.space/api/tx", "esplora"),
-                ("https://blockstream.info/api/tx", "esplora"),
-                ("https://mempool.emzy.de/api/tx", "esplora"),
+                "https://mempool.space/api/tx",
+                "https://blockstream.info/api/tx",
+                "https://mempool.emzy.de/api/tx",
             ]
             lookup_url = "https://mempool.space/api/tx/{txid}"
 
         expected_txid = txid_from_raw_hex(raw_tx_hex)
         logger.info(
-            f"BTC broadcast: txid={expected_txid or 'unparsed'} via {[url for url, _ in providers]}"
+            f"BTC broadcast: txid={expected_txid or 'unparsed'} via {providers}"
         )
 
         last_message = "BTC broadcast failed"
-        for url, kind in providers:
+        for url in providers:
             try:
                 response = requests.post(
                     url,
@@ -428,11 +404,7 @@ class BtcClient:
                 )
 
                 if response.status_code == 200:
-                    if kind == "blockbook":
-                        # Blockbook wraps the txid: {"result": "<txid>"}
-                        txid = response.json().get("result", "")
-                    else:
-                        txid = response.text.strip()
+                    txid = response.text.strip()
                     if txid:
                         return {"success": True, "txid": txid}
                     last_message = "broadcast accepted but no txid returned"

@@ -41,21 +41,101 @@ class TxidFromRawHexTests(SimpleTestCase):
         self.assertIsNone(txid_from_raw_hex(SEGWIT_HEX + "00"))
 
 
-@override_settings(ENVIRONMENT="testnet")
-class BroadcastTransactionTests(SimpleTestCase):
-    BLOCKBOOK = "https://blockbook.tbtc-1.zelcore.io/api/v2/sendtx/"
-    ESPLORA = "https://mempool.emzy.de/testnet4/api/tx"
-    THIRD = "https://mempool.ninja/testnet4/api/tx"
+SIGNET = "https://signet.verifiedx.io/api"
+PUBLIC_HOSTS = ("mempool.space", "blockstream.info", "emzy", "mempool.ninja", "zelcore")
 
-    def test_testnet_tries_blockbook_first_and_never_submits_to_mempool_space(self):
+
+@override_settings(ENVIRONMENT="testnet", BTC_TESTNET_ESPLORA_URL=SIGNET)
+class TestnetSignetTests(SimpleTestCase):
+    """Testnet's Bitcoin chain is our private signet: every call goes to the
+    one configured Esplora base and never to a public explorer."""
+
+    def test_broadcast_submits_and_looks_up_on_the_signet_only(self):
+        with patch("btc.btc_client.requests.post") as post, \
+                patch("btc.btc_client.requests.get") as get:
+            post.side_effect = requests.Timeout("read timed out")
+            get.return_value = _response(404)
+            result = BtcClient().broadcast_transaction(SEGWIT_HEX)
+        self.assertFalse(result["success"])
+        self.assertEqual([c.args[0] for c in post.call_args_list], [f"{SIGNET}/tx"])
+        self.assertEqual(get.call_args.args[0], f"{SIGNET}/tx/{SEGWIT_TXID}")
+
+    def test_broadcast_returns_the_txid_esplora_answers(self):
+        with patch("btc.btc_client.requests.post") as post:
+            post.return_value = _response(200, text=f"{SEGWIT_TXID}\n")
+            result = BtcClient().broadcast_transaction(SEGWIT_HEX)
+        self.assertEqual(result, {"success": True, "txid": SEGWIT_TXID})
+
+    def test_transaction_found_after_provider_errors_counts_as_sent(self):
+        with patch("btc.btc_client.requests.post") as post, \
+                patch("btc.btc_client.requests.get") as get:
+            post.side_effect = requests.Timeout("read timed out")
+            get.return_value = _response(200, text="{}")
+            result = BtcClient().broadcast_transaction(SEGWIT_HEX)
+        self.assertEqual(result, {"success": True, "txid": SEGWIT_TXID, "already_known": True})
+
+    def test_balance_reads_esplora_chain_stats_from_the_signet(self):
+        stats = {"chain_stats": {"funded_txo_sum": 150_000_000, "spent_txo_sum": 50_000_000, "tx_count": 3}}
+        with patch("btc.btc_client.requests.get") as get:
+            get.return_value = _response(200, json_body=stats)
+            result = BtcClient().get_balance("tb1qexample")
+        self.assertEqual(get.call_args.args[0], f"{SIGNET}/address/tb1qexample")
+        self.assertEqual(result["balance"], Decimal("1"))
+        self.assertEqual(result["total_received"], Decimal("1.5"))
+        self.assertEqual(result["tx_count"], 3)
+
+    def test_balance_failure_returns_none_without_a_public_fallback(self):
+        with patch("btc.btc_client.requests.get") as get:
+            get.side_effect = requests.ConnectionError("refused")
+            self.assertIsNone(BtcClient().get_balance("tb1qexample"))
+        self.assertEqual(get.call_count, 1)
+        self.assertTrue(get.call_args.args[0].startswith(SIGNET))
+
+    def test_transactions_come_from_the_esplora_address_txs_list(self):
+        txs = [{"txid": SEGWIT_TXID, "vin": [], "vout": []}]
+        with patch("btc.btc_client.requests.get") as get:
+            get.return_value = _response(200, json_body=txs)
+            result = BtcClient().get_transactions("tb1qexample")
+        self.assertEqual(get.call_args.args[0], f"{SIGNET}/address/tb1qexample/txs")
+        self.assertEqual(result, txs)
+
+    @override_settings(BTC_TESTNET_ESPLORA_URL="https://esplora.example/api")
+    def test_the_base_follows_the_setting(self):
+        with patch("btc.btc_client.requests.post") as post:
+            post.return_value = _response(200, text=SEGWIT_TXID)
+            BtcClient().broadcast_transaction(SEGWIT_HEX)
+        self.assertEqual(post.call_args.args[0], "https://esplora.example/api/tx")
+
+    def test_no_call_reaches_a_public_explorer(self):
+        with patch("btc.btc_client.requests.post") as post, \
+                patch("btc.btc_client.requests.get") as get:
+            post.side_effect = requests.Timeout("read timed out")
+            get.side_effect = requests.Timeout("read timed out")
+            client = BtcClient()
+            client.broadcast_transaction(SEGWIT_HEX)
+            client.get_balance("tb1qexample")
+            client.get_transactions("tb1qexample")
+        urls = [c.args[0] for c in post.call_args_list + get.call_args_list]
+        self.assertTrue(urls)
+        for url in urls:
+            self.assertFalse(any(host in url for host in PUBLIC_HOSTS), url)
+
+
+@override_settings(ENVIRONMENT="mainnet")
+class BroadcastTransactionTests(SimpleTestCase):
+    FIRST = "https://mempool.space/api/tx"
+    SECOND = "https://blockstream.info/api/tx"
+    THIRD = "https://mempool.emzy.de/api/tx"
+
+    def test_mainnet_keeps_its_three_public_providers_in_order(self):
         with patch("btc.btc_client.requests.post") as post, \
                 patch("btc.btc_client.requests.get") as get:
             post.side_effect = requests.Timeout("read timed out")
             get.return_value = _response(404)
             BtcClient().broadcast_transaction(SEGWIT_HEX)
         urls = [call.args[0] for call in post.call_args_list]
-        self.assertEqual(urls, [self.BLOCKBOOK, self.ESPLORA, self.THIRD])
-        self.assertFalse(any("mempool.space" in u for u in urls))
+        self.assertEqual(urls, [self.FIRST, self.SECOND, self.THIRD])
+        self.assertEqual(get.call_args.args[0], f"https://mempool.space/api/tx/{SEGWIT_TXID}")
 
     def test_every_provider_call_fits_the_worker_budget(self):
         with patch("btc.btc_client.requests.post") as post, \
@@ -77,7 +157,7 @@ class BroadcastTransactionTests(SimpleTestCase):
             post.side_effect = [requests.Timeout("read timed out"), _response(200, text=SEGWIT_TXID)]
             result = BtcClient().broadcast_transaction(SEGWIT_HEX)
         self.assertEqual(result, {"success": True, "txid": SEGWIT_TXID})
-        self.assertEqual(post.call_args_list[1].args[0], self.ESPLORA)
+        self.assertEqual(post.call_args_list[1].args[0], self.SECOND)
 
     def test_third_provider_is_reached(self):
         with patch("btc.btc_client.requests.post") as post:
@@ -91,7 +171,7 @@ class BroadcastTransactionTests(SimpleTestCase):
         self.assertEqual(post.call_args_list[2].args[0], self.THIRD)
 
     def test_utxo_set_duplicate_counts_as_sent(self):
-        # Blockbook's wording once the transaction has confirmed.
+        # Bitcoin Core's wording once the transaction has confirmed.
         with patch("btc.btc_client.requests.post") as post:
             post.return_value = _response(400, text='{"error":"-27: Transaction outputs already in utxo set"}')
             result = BtcClient().broadcast_transaction(SEGWIT_HEX)
@@ -132,7 +212,7 @@ class BroadcastTransactionTests(SimpleTestCase):
             get.return_value = _response(200, text="{}")
             result = BtcClient().broadcast_transaction(SEGWIT_HEX)
         self.assertEqual(result, {"success": True, "txid": SEGWIT_TXID, "already_known": True})
-        self.assertEqual(get.call_args.args[0], f"https://mempool.space/testnet4/api/tx/{SEGWIT_TXID}")
+        self.assertEqual(get.call_args.args[0], f"https://mempool.space/api/tx/{SEGWIT_TXID}")
 
     def test_unparseable_hex_reports_the_provider_message(self):
         with patch("btc.btc_client.requests.post") as post, \
