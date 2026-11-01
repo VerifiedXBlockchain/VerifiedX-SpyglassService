@@ -7,6 +7,9 @@ from rest_framework.response import Response
 from api import exceptions
 from api.transaction.serializers import TransactionSerializer
 from api.transaction.querysets import ALL_TRANSACTIONS_QUERYSET
+from api.transaction.filters import TransactionFilter
+from api.filters import PrefixSearchFilter, ReversibleOrderingFilter
+from django_filters.rest_framework import DjangoFilterBackend
 from rbx.models import Transaction
 from django.conf import settings
 from django.db.models import Q
@@ -18,8 +21,16 @@ class TransactionView(GenericAPIView):
     serializer_class = TransactionSerializer
     queryset = ALL_TRANSACTIONS_QUERYSET
 
+    filter_backends = [
+        DjangoFilterBackend,
+        ReversibleOrderingFilter,
+        PrefixSearchFilter,
+    ]
+    filterset_class = TransactionFilter
+
     ordering_fields = ["date_crafted"]
     ordering = ["-date_crafted"]
+    # Prefix match, 4 characters or more (PrefixSearchFilter).
     search_fields = ["hash", "to_address", "from_address"]
 
 
