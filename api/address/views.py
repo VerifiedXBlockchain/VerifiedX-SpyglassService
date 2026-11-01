@@ -11,6 +11,7 @@ from api.address.serializers import AddressSerializer
 from api.address.querysets import ALL_ADDRESSES_QUERYSET
 from decimal import Decimal
 from django_filters.rest_framework import DjangoFilterBackend
+from api.filters import PrefixSearchFilter
 
 
 class AddressView(GenericAPIView):
@@ -19,10 +20,12 @@ class AddressView(GenericAPIView):
     filter_backends = [
         DjangoFilterBackend,
         filters.OrderingFilter,
-        filters.SearchFilter,
+        PrefixSearchFilter,
     ]
 
-    order_fields = ["balance"]
+    ordering_fields = ["balance", "address"]
+    # Prefix match, 4 characters or more (PrefixSearchFilter).
+    search_fields = ["address"]
 
 
 class AddressListView(ListModelMixin, AddressView):

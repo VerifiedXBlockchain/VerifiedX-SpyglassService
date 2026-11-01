@@ -687,6 +687,7 @@ class Address(models.Model):
     class Meta:
         verbose_name = _("Address")
         verbose_name_plural = _("Addresses")
+        indexes = [models.Index(fields=["balance"], name="rbx_address_balance_idx")]
 
 
 class TempAddress(models.Model):
