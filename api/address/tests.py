@@ -32,3 +32,23 @@ class AddressListTests(TestCase):
             ["Adnr_Base", "xBBBB3333", "RAAAB2222", "RAAAA1111"],
         )
         self.assertEqual(self.addresses(ordering="balance")[0], "RAAAA1111")
+
+
+class TopHoldersTests(TestCase):
+    def setUp(self):
+        cache.clear()
+
+    def test_largest_indexed_balances_first_without_system_names(self):
+        for i in range(105):
+            Address.objects.create(address=f"R{i:08d}", balance=Decimal(i))
+        Address.objects.create(address="Reserve_Base", balance=Decimal("100000"))
+
+        response = self.client.get("/api/addresses/top-holders/")
+
+        self.assertEqual(response.status_code, 200)
+        rows = response.json()
+        self.assertEqual(len(rows), 100)
+        self.assertEqual(rows[0]["address"], "R00000104")
+        self.assertEqual(float(rows[0]["balance"]), 104)
+        self.assertEqual(set(rows[0]), {"address", "balance", "adnr"})
+        self.assertNotIn("Reserve_Base", [row["address"] for row in rows])

@@ -11,6 +11,9 @@ from api.address.serializers import AddressSerializer
 from api.address.querysets import ALL_ADDRESSES_QUERYSET
 from decimal import Decimal
 from django_filters.rest_framework import DjangoFilterBackend
+from django.conf import settings
+from django.utils.decorators import method_decorator
+from api.decorators import cache_request
 from api.filters import PrefixSearchFilter
 
 
@@ -33,57 +36,19 @@ class AddressListView(ListModelMixin, AddressView):
         return self.list(request, *args, **kwargs)
 
 
+@method_decorator(cache_request(settings.CACHE_TIMEOUT_MEDIUM), name="get")
 class AddressTopHoldersListView(GenericAPIView):
-    # This view returns a custom list, so it doesn't need filter backends
+    """The 100 addresses with the largest indexed balance (Address.balance,
+    the balance the address list serves), read through its index."""
 
     def get(self, request, *args, **kwargs):
-        from django.db.models import Sum, F, Value
-        from django.db.models.functions import Coalesce
-        from django.db.models import Subquery, OuterRef, ExpressionWrapper, DecimalField
-
-        sent_subquery = (
-            Transaction.objects.filter(from_address=OuterRef("to_address"))
-            .values("from_address")
-            .annotate(
-                total_sent_with_fees=Coalesce(
-                    Sum(
-                        ExpressionWrapper(
-                            F("total_amount") + F("total_fee"),
-                            output_field=DecimalField(decimal_places=16, max_digits=32),
-                        )
-                    ),
-                    Value(Decimal(0)),
-                )
-            )
-            .values("total_sent_with_fees")
-        )
-
-        received_qs = (
-            Transaction.objects.values("to_address")
-            .annotate(
-                total_received=Coalesce(Sum("total_amount"), Value(Decimal(0))),
-                total_sent=Coalesce(Subquery(sent_subquery), Value(Decimal(0))),
-            )
-            .annotate(
-                balance=ExpressionWrapper(
-                    F("total_received") - F("total_sent"),
-                    output_field=DecimalField(decimal_places=16, max_digits=32),
-                )
-            )
+        holders = (
+            Address.objects.select_related("adnr")
+            # System names such as Adnr_Base are not addresses.
+            .exclude(address__contains="_")
             .order_by("-balance")[:100]
         )
-
-        top_balances = [
-            {
-                "address": row["to_address"],
-                "balance": row["balance"],
-                "received": row["total_received"],
-                "sent": row["total_sent"],
-            }
-            for row in received_qs
-        ]
-
-        return Response(top_balances, status=200)
+        return Response(AddressSerializer(holders, many=True).data, status=200)
 
 
 class AddressDetailView(AddressView):
