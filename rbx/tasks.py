@@ -1445,30 +1445,29 @@ def sync_circulation():
 
     # Block zero balance
     query = Transaction.objects.filter(height=0).aggregate(Sum("total_amount"))
-    amount = query["total_amount__sum"]
-    total = amount
+    total = query["total_amount__sum"] or Decimal(0)
 
     rewards = Transaction.objects.filter(from_address="Coinbase_BlkRwd").aggregate(
         Sum("total_amount")
     )
 
-    total = total + Decimal(rewards["total_amount__sum"])
+    total = total + (rewards["total_amount__sum"] or Decimal(0))
 
     # burn fees
     query = Transaction.objects.all().aggregate(Sum("total_fee"))
-    fees = query["total_fee__sum"]
+    fees = query["total_fee__sum"] or Decimal(0)
 
     # adnr
     query = Transaction.objects.filter(type=Transaction.Type.ADDRESS).aggregate(
         Sum("total_amount")
     )
-    adnr_burned_sum = Decimal(query["total_amount__sum"])
+    adnr_burned_sum = query["total_amount__sum"] or Decimal(0)
 
     # decshop
     query = Transaction.objects.filter(
         type=Transaction.Type.DST_REGISTRATION
     ).aggregate(Sum("total_amount"))
-    dst_burned_sum = Decimal(query["total_amount__sum"])
+    dst_burned_sum = query["total_amount__sum"] or Decimal(0)
 
     # vault activations
     vault_burned_sum = Transaction.objects.filter(

@@ -13,10 +13,9 @@ from django.conf import settings
 @api_view(("GET",))
 def circulation(request):
     circulation = Circulation.load()
-    if not circulation:
+    if circulation.updated_at < timezone.now() - datetime.timedelta(seconds=30):
         sync_circulation()
-    elif circulation.updated_at < timezone.now() - datetime.timedelta(seconds=30):
-        sync_circulation()
+        circulation.refresh_from_db()
 
     data = {
         "balance": circulation.balance,
@@ -59,6 +58,7 @@ def circulation_balance(request):
 
     if circulation.updated_at < timezone.now() - datetime.timedelta(seconds=30):
         sync_circulation()
+        circulation.refresh_from_db()
 
     return Response(
         circulation.balance, status=status.HTTP_200_OK, content_type="text/plain"
@@ -71,6 +71,7 @@ def lifetime_balance(request):
 
     if circulation.updated_at < timezone.now() - datetime.timedelta(seconds=30):
         sync_circulation()
+        circulation.refresh_from_db()
 
     return Response(
         circulation.lifetime_supply,
