@@ -2283,3 +2283,19 @@ class HealthCheckAlertTests(TestCase):
             self.assertFalse(send_discord_alert("x"))
 
 
+
+
+class GetCliVersionTests(TestCase):
+    def test_reads_the_plain_text_version(self):
+        from rbx import client
+
+        response = type("R", (), {"status_code": 200, "text": "9.0.2\n"})()
+        with patch.object(client._http, "get", return_value=response):
+            self.assertEqual(client.get_cli_version(), "9.0.2")
+
+    def test_an_unreachable_node_is_none(self):
+        import requests
+        from rbx import client
+
+        with patch.object(client._http, "get", side_effect=requests.ConnectionError("down")):
+            self.assertIsNone(client.get_cli_version())

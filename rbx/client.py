@@ -127,6 +127,22 @@ def get_status() -> str:
     return response.text
 
 
+def get_cli_version() -> Optional[str]:
+    """The node's CLI version string, or None when the node does not answer."""
+    url = join_url(BASE_URL, "api/V1/GetCLIVersion")
+    try:
+        response = _http.get(url, timeout=NODE_READ_TIMEOUT)
+    except requests.RequestException as e:
+        logging.getLogger(__name__).warning(f"GetCLIVersion failed: {e}")
+        return None
+
+    if response.status_code != 200:
+        logging.getLogger(__name__).warning(f"GetCLIVersion answered {response.status_code}")
+        return None
+
+    return response.text.strip().strip('"') or None
+
+
 def get_info() -> Optional[dict]:
     url = join_url(BASE_URL, "api/V1/GetWalletInfo")
     response = _get_session().get(url, timeout=CLI_TIMEOUT)

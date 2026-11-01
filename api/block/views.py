@@ -11,7 +11,11 @@ from django_filters.rest_framework import DjangoFilterBackend
 from api.decorators import cache_request
 from api.block.serializers import BlockSerializer
 from api.block.querysets import ALL_BLOCKS_QUERYSET
-from rbx.models import Block
+from api.filters import PrefixSearchFilter
+from rbx.models import Block, MasterNode
+
+# Block.height is a Postgres integer.
+MAX_HEIGHT = 2**31 - 1
 
 
 class BlockView(GenericAPIView):
@@ -20,10 +24,26 @@ class BlockView(GenericAPIView):
     filter_backends = [
         DjangoFilterBackend,
         filters.OrderingFilter,
-        filters.SearchFilter,
+        PrefixSearchFilter,
     ]
 
-    search_fields = ["hash", "height", "validator_address", "master_node__name"]
+    search_fields = ["hash", "validator_address", "master_node__name"]
+
+    def search_q(self, term):
+        """An all-digit term is an exact height; any other term is a prefix
+        of the hash, the validator address or the validator name."""
+        if term.isascii() and term.isdigit():
+            if int(term) > MAX_HEIGHT:
+                return None
+            return Q(height=int(term))
+        if len(term) < 3:
+            return None
+        named = MasterNode.objects.filter(name__istartswith=term).values("address")
+        return (
+            Q(hash__startswith=term)
+            | Q(validator_address__startswith=term)
+            | Q(master_node__in=named)
+        )
 
     ordering_fields = ["height"]
     ordering = ["-height"]

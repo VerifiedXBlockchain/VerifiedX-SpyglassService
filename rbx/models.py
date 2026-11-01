@@ -443,6 +443,11 @@ class Nft(models.Model):
 
     on_chain = models.BooleanField(default=True)
     asset_urls = models.JSONField(blank=True, null=True)
+    # When and by whom asset_urls were last set through the media API. An empty
+    # address means the write came without a token (only allowed while the
+    # NFT had no asset URLs).
+    asset_urls_associated_at = models.DateTimeField(blank=True, null=True)
+    asset_urls_associated_by = models.CharField(max_length=64, blank=True, default="")
 
     is_fungible_token = models.BooleanField(default=False)
     is_vbtc = models.BooleanField(default=False)
@@ -682,6 +687,7 @@ class Address(models.Model):
     class Meta:
         verbose_name = _("Address")
         verbose_name_plural = _("Addresses")
+        indexes = [models.Index(fields=["balance"], name="rbx_address_balance_idx")]
 
 
 class TempAddress(models.Model):

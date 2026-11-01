@@ -1,6 +1,6 @@
 from unittest import mock
 
-from django.test import TestCase
+from django.test import TestCase, override_settings
 
 from rbx.tests import make_token
 
@@ -128,3 +128,205 @@ class VbtcV2WithdrawRequestMultiPrepareViewTests(TestCase):
 
             self.assertEqual(response.status_code, 400, inputs)
             prepare.assert_not_called()
+
+
+def _esplora(routes):
+    """A requests.get stand-in that answers Esplora paths from `routes`."""
+
+    def get(url, timeout=None, **kwargs):
+        for suffix, (status, body) in routes.items():
+            if url.endswith(suffix):
+                response = mock.MagicMock()
+                response.status_code = status
+                response.text = str(body)
+                response.json.return_value = body
+                if status >= 400:
+                    import requests
+
+                    response.raise_for_status.side_effect = requests.HTTPError(str(status))
+                return response
+        raise AssertionError(f"unexpected url {url}")
+
+    return get
+
+
+ADDRESS_STATS = {"chain_stats": {"funded_txo_sum": 150000, "spent_txo_sum": 50000, "tx_count": 2}}
+TXS = [
+    {
+        "txid": "t2",
+        "status": {"confirmed": True, "block_time": 1730000100},
+        "fee": 141,
+        "vin": [{"prevout": {"scriptpubkey_address": "addr", "value": 50141}}],
+        "vout": [{"scriptpubkey_address": "other", "value": 50000}],
+    },
+    {
+        "txid": "t1",
+        "status": {"confirmed": True, "block_time": 1730000000},
+        "fee": 200,
+        "vin": [{"prevout": {"scriptpubkey_address": "src", "value": 150200}}],
+        "vout": [{"scriptpubkey_address": "addr", "value": 150000}],
+    },
+]
+UTXOS = [{"txid": "t1", "vout": 0, "value": 100000, "status": {"confirmed": True, "block_height": 5, "block_time": 1730000000}}]
+
+
+class BtcAddressViewTests(TestCase):
+    def setUp(self):
+        from django.core.cache import cache
+
+        cache.clear()
+
+    @override_settings(ENVIRONMENT="testnet", BTC_TESTNET_ESPLORA_URL="https://signet.example/api")
+    def test_testnet_reads_the_signet_esplora(self):
+        routes = {
+            "signet.example/api/address/tb1qaddr": (200, ADDRESS_STATS),
+            "signet.example/api/address/tb1qaddr/txs/chain": (200, TXS),
+            "signet.example/api/address/tb1qaddr/utxo": (200, UTXOS),
+        }
+        with mock.patch("btc.client.requests.get", side_effect=_esplora(routes)):
+            response = self.client.get("/api/btc/address/tb1qaddr/")
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["balance"], "0.001")
+        self.assertEqual(body["transactions"]["total"], 2)
+        first = body["transactions"]["results"][0]
+        self.assertEqual(first["hash"], "t2")
+        self.assertEqual(first["timestamp"], 1730000100)
+        self.assertEqual(first["fee"], "0.00000141")
+        self.assertEqual(first["senders"], [{"address": "addr", "amount": "0.00050141"}])
+        self.assertEqual(body["utxos"]["total"], 1)
+        self.assertEqual(body["utxos"]["results"][0]["transaction_id"], "t1")
+        self.assertEqual(body["utxos"]["results"][0]["amount"], "0.001")
+
+    @override_settings(ENVIRONMENT="mainnet")
+    def test_mainnet_falls_back_to_the_next_esplora(self):
+        routes = {
+            "mempool.space/api/address/bc1qaddr": (502, {}),
+            "blockstream.info/api/address/bc1qaddr": (200, ADDRESS_STATS),
+            "blockstream.info/api/address/bc1qaddr/txs/chain": (200, TXS),
+            "blockstream.info/api/address/bc1qaddr/utxo": (200, UTXOS),
+        }
+        with mock.patch("btc.client.requests.get", side_effect=_esplora(routes)):
+            response = self.client.get("/api/btc/address/bc1qaddr/")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["transactions"]["total"], 2)
+
+    @override_settings(ENVIRONMENT="mainnet")
+    def test_every_provider_down_is_503(self):
+        routes = {
+            "mempool.space/api/address/bc1qdown": (502, {}),
+            "blockstream.info/api/address/bc1qdown": (500, {}),
+        }
+        with mock.patch("btc.client.requests.get", side_effect=_esplora(routes)):
+            response = self.client.get("/api/btc/address/bc1qdown/")
+
+        self.assertEqual(response.status_code, 503)
+        self.assertIn("message", response.json())
+
+    @override_settings(ENVIRONMENT="mainnet")
+    def test_an_address_the_provider_refuses_is_400(self):
+        routes = {"mempool.space/api/address/notanaddress": (400, "Invalid Bitcoin address")}
+        with mock.patch("btc.client.requests.get", side_effect=_esplora(routes)):
+            response = self.client.get("/api/btc/address/notanaddress/")
+
+        self.assertEqual(response.status_code, 400)
+
+    @override_settings(ENVIRONMENT="mainnet")
+    def test_a_refused_utxo_list_leaves_the_rest_of_the_answer(self):
+        routes = {
+            "mempool.space/api/address/bc1qbusy": (200, ADDRESS_STATS),
+            "mempool.space/api/address/bc1qbusy/txs/chain": (200, TXS),
+            "mempool.space/api/address/bc1qbusy/utxo": (400, "Too many unspent transaction outputs (>500)."),
+        }
+        with mock.patch("btc.client.requests.get", side_effect=_esplora(routes)):
+            response = self.client.get("/api/btc/address/bc1qbusy/")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["utxos"], {"total": None, "results": []})
+        self.assertEqual(response.json()["balance"], "0.001")
+
+    @override_settings(ENVIRONMENT="mainnet")
+    def test_an_offset_past_the_cap_is_400_without_a_provider_call(self):
+        with mock.patch("btc.client.requests.get") as get:
+            response = self.client.get("/api/btc/address/bc1qaddr/", {"offset": 150})
+            negative = self.client.get("/api/btc/address/bc1qaddr/", {"offset": -1})
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(negative.status_code, 400)
+        get.assert_not_called()
+
+    @override_settings(ENVIRONMENT="testnet", BTC_TESTNET_ESPLORA_URL="https://signet.example/api")
+    def test_an_offset_walks_the_history_pages(self):
+        def tx(i):
+            return {"txid": f"t{i:03d}", "status": {"block_time": i}, "fee": 1, "vin": [], "vout": []}
+
+        history = [tx(i) for i in range(120)]
+
+        def get(url, timeout=None, **kwargs):
+            response = mock.MagicMock()
+            response.status_code = 200
+            if url.endswith("/address/tb1qbig"):
+                response.json.return_value = {"chain_stats": {"funded_txo_sum": 0, "spent_txo_sum": 0, "tx_count": 120}}
+            elif url.endswith("/utxo"):
+                response.json.return_value = []
+            else:
+                after = url.rsplit("/txs/chain", 1)[1].lstrip("/")
+                start = 0 if not after else int(after[1:]) + 1
+                response.json.return_value = history[start: start + 25]
+            return response
+
+        with mock.patch("btc.client.requests.get", side_effect=get):
+            response = self.client.get("/api/btc/address/tb1qbig/", {"offset": 100})
+
+        hashes = [row["hash"] for row in response.json()["transactions"]["results"]]
+        self.assertEqual(hashes, [f"t{i:03d}" for i in range(100, 120)])
+
+    @override_settings(ENVIRONMENT="mainnet")
+    def test_a_lookup_past_its_time_budget_is_503_without_the_fallback(self):
+        clock = iter([0.0, 0.0, 0.0, 19.5, 19.5, 19.5])
+        routes = {
+            "mempool.space/api/address/bc1qslow": (200, ADDRESS_STATS),
+            "mempool.space/api/address/bc1qslow/txs/chain": (200, TXS),
+        }
+        with mock.patch("btc.client.time.monotonic", side_effect=lambda: next(clock)), \
+                mock.patch("btc.client.requests.get", side_effect=_esplora(routes)) as get:
+            response = self.client.get("/api/btc/address/bc1qslow/")
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(get.call_count, 1)
+        self.assertTrue(all("blockstream" not in c.args[0] for c in get.call_args_list))
+
+
+class VbtcV2CeremonyStatusViewTests(TestCase):
+    URL = "/api/btc/vbtc-v2/ceremony/abc/"
+
+    def test_unknown_ceremony_is_404(self):
+        with mock.patch(
+            "api.btc.views.get_vbtc_v2_ceremony_status",
+            return_value={"Success": False, "Message": "Ceremony not found"},
+        ):
+            response = self.client.get(self.URL)
+
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.json()["message"], "Ceremony not found")
+
+    def test_node_unreachable_is_503(self):
+        with mock.patch(
+            "api.btc.views.get_vbtc_v2_ceremony_status",
+            return_value={"Success": False, "Message": "timed out", "Unreachable": True},
+        ):
+            response = self.client.get(self.URL)
+
+        self.assertEqual(response.status_code, 503)
+
+    def test_known_ceremony_is_200(self):
+        with mock.patch(
+            "api.btc.views.get_vbtc_v2_ceremony_status",
+            return_value={"Success": True, "Status": "Completed", "ProgressPercentage": 100},
+        ):
+            response = self.client.get(self.URL)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "Completed")

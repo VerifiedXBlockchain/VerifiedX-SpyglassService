@@ -23,6 +23,8 @@ class FungibleTokenView(GenericAPIView):
 
 
 class FungibleTokenListView(FungibleTokenView, ListModelMixin):
+    # Substring match: the token table is small.
+    search_fields = ["name", "ticker", "sc_identifier", "owner_address"]
 
     def get_queryset(self):
         return FungibleToken.objects.all().order_by('-create_transaction__date_crafted')

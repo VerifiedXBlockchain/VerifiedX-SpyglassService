@@ -32,7 +32,9 @@ class LatestPriceView(GenericAPIView):
     schema = None
 
     def get(self, request, *args, **kwargs):
-        p = Price.objects.all().order_by("-created_at")[0]
+        p = Price.objects.all().order_by("-created_at").first()
+        if p is None:
+            return Response({"message": "No price recorded"}, status=404)
         data = {
             "price": p.price,
             "created_at": p.created_at,
