@@ -246,3 +246,36 @@ class BtcAddressViewTests(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["utxos"], {"total": None, "results": []})
         self.assertEqual(response.json()["balance"], "0.001")
+
+
+class VbtcV2CeremonyStatusViewTests(TestCase):
+    URL = "/api/btc/vbtc-v2/ceremony/abc/"
+
+    def test_unknown_ceremony_is_404(self):
+        with mock.patch(
+            "api.btc.views.get_vbtc_v2_ceremony_status",
+            return_value={"Success": False, "Message": "Ceremony not found"},
+        ):
+            response = self.client.get(self.URL)
+
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.json()["message"], "Ceremony not found")
+
+    def test_node_unreachable_is_503(self):
+        with mock.patch(
+            "api.btc.views.get_vbtc_v2_ceremony_status",
+            return_value={"Success": False, "Message": "timed out", "Unreachable": True},
+        ):
+            response = self.client.get(self.URL)
+
+        self.assertEqual(response.status_code, 503)
+
+    def test_known_ceremony_is_200(self):
+        with mock.patch(
+            "api.btc.views.get_vbtc_v2_ceremony_status",
+            return_value={"Success": True, "Status": "Completed", "ProgressPercentage": 100},
+        ):
+            response = self.client.get(self.URL)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "Completed")

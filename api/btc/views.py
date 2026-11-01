@@ -379,9 +379,17 @@ class VbtcV2CeremonyStatusView(GenericAPIView):
                 "raw": result,
             })
 
+        message = result.get("Message") or "Could not get ceremony status"
+        if result.get("Unreachable"):
+            status_code = 503
+        elif message.startswith("Ceremony not found"):
+            status_code = 404
+        else:
+            status_code = 500
+
         return Response(
-            {"success": False, "message": result.get("Message", "Could not get ceremony status"), "raw": result},
-            status=500,
+            {"success": False, "message": message, "raw": result},
+            status=status_code,
         )
 
 
