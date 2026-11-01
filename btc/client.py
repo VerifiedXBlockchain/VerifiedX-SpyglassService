@@ -1,4 +1,5 @@
 import logging
+import time
 from decimal import Decimal
 
 import requests
@@ -18,6 +19,9 @@ PAGE_SIZE = 50
 # back than this costs more provider calls than a request can wait for.
 ESPLORA_TX_PAGE = 25
 MAX_TX_OFFSET = 100
+# Every provider call of one lookup, fallbacks included, must end within
+# this, leaving room inside gunicorn's 30-second worker timeout.
+LOOKUP_BUDGET_SECONDS = 20
 
 
 class BtcAddressNotFound(Exception):
@@ -81,6 +85,7 @@ class BtcExplorerClient:
     timeout = (3, 5)
 
     def __init__(self):
+        self.deadline = time.monotonic() + LOOKUP_BUDGET_SECONDS
         if settings.ENVIRONMENT == "testnet":
             self.base_urls = (settings.BTC_TESTNET_ESPLORA_URL,)
         else:
@@ -90,11 +95,15 @@ class BtcExplorerClient:
         offset = int(offset)
         if offset < 0 or offset > MAX_TX_OFFSET:
             raise BtcOffsetUnsupported(f"offset must be between 0 and {MAX_TX_OFFSET}")
+        self.deadline = time.monotonic() + LOOKUP_BUDGET_SECONDS
         last_error = None
         for base_url in self.base_urls:
             try:
                 return self._get_address(base_url, address, offset)
             except BtcAddressNotFound:
+                raise
+            except BtcProviderUnavailable:
+                logger.warning(f"BTC address lookup for {address} ran out of time")
                 raise
             except (requests.RequestException, ValueError, KeyError) as e:
                 logger.warning(f"BTC address lookup via {base_url} failed for {address}: {e}")
@@ -102,7 +111,13 @@ class BtcExplorerClient:
         raise BtcProviderUnavailable(str(last_error))
 
     def _get(self, url: str):
-        response = requests.get(url, timeout=self.timeout)
+        remaining = self.deadline - time.monotonic()
+        if remaining < 1:
+            raise BtcProviderUnavailable("lookup time budget spent")
+        connect, read = self.timeout
+        response = requests.get(
+            url, timeout=(min(connect, remaining), min(read, remaining))
+        )
         if response.status_code == 400:
             raise BtcAddressNotFound(response.text[:200])
         response.raise_for_status()
