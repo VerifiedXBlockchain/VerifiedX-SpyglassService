@@ -24,6 +24,10 @@ class BtcAddressNotFound(Exception):
     """The provider refused the address (malformed or for another network)."""
 
 
+class BtcOffsetUnsupported(Exception):
+    """The offset is negative or past MAX_TX_OFFSET."""
+
+
 class BtcProviderUnavailable(Exception):
     """No provider answered."""
 
@@ -83,7 +87,9 @@ class BtcExplorerClient:
             self.base_urls = MAINNET_ESPLORA_URLS
 
     def get_address(self, address: str, offset: int = 0) -> dict:
-        offset = max(0, min(int(offset), MAX_TX_OFFSET))
+        offset = int(offset)
+        if offset < 0 or offset > MAX_TX_OFFSET:
+            raise BtcOffsetUnsupported(f"offset must be between 0 and {MAX_TX_OFFSET}")
         last_error = None
         for base_url in self.base_urls:
             try:

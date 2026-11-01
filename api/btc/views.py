@@ -51,7 +51,12 @@ from rbx.models import (
 )
 from rbx.vbtc_gates import bitcoin_attestation_height, bitcoin_attestation_record_height, served_height
 from btc.btc_client import BtcClient
-from btc.client import BtcAddressNotFound, BtcExplorerClient, BtcProviderUnavailable
+from btc.client import (
+    BtcAddressNotFound,
+    BtcExplorerClient,
+    BtcOffsetUnsupported,
+    BtcProviderUnavailable,
+)
 from api.decorators import cache_request
 from django.utils.decorators import method_decorator
 from django.conf import settings
@@ -75,6 +80,8 @@ class BtcAddressView(GenericAPIView):
 
         try:
             data = BtcExplorerClient().get_address(address, offset)
+        except BtcOffsetUnsupported as e:
+            return Response({"message": str(e)}, status=400)
         except BtcAddressNotFound:
             return Response({"message": "Invalid Bitcoin address for this network"}, status=400)
         except BtcProviderUnavailable:

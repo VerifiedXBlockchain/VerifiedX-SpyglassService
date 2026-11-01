@@ -279,3 +279,39 @@ class VbtcV2CeremonyStatusViewTests(TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["status"], "Completed")
+
+    @override_settings(ENVIRONMENT="mainnet")
+    def test_an_offset_past_the_cap_is_400_without_a_provider_call(self):
+        with mock.patch("btc.client.requests.get") as get:
+            response = self.client.get("/api/btc/address/bc1qaddr/", {"offset": 150})
+            negative = self.client.get("/api/btc/address/bc1qaddr/", {"offset": -1})
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(negative.status_code, 400)
+        get.assert_not_called()
+
+    @override_settings(ENVIRONMENT="testnet", BTC_TESTNET_ESPLORA_URL="https://signet.example/api")
+    def test_an_offset_walks_the_history_pages(self):
+        def tx(i):
+            return {"txid": f"t{i:03d}", "status": {"block_time": i}, "fee": 1, "vin": [], "vout": []}
+
+        history = [tx(i) for i in range(120)]
+
+        def get(url, timeout=None, **kwargs):
+            response = mock.MagicMock()
+            response.status_code = 200
+            if url.endswith("/address/tb1qbig"):
+                response.json.return_value = {"chain_stats": {"funded_txo_sum": 0, "spent_txo_sum": 0, "tx_count": 120}}
+            elif url.endswith("/utxo"):
+                response.json.return_value = []
+            else:
+                after = url.rsplit("/txs/chain", 1)[1].lstrip("/")
+                start = 0 if not after else int(after[1:]) + 1
+                response.json.return_value = history[start: start + 25]
+            return response
+
+        with mock.patch("btc.client.requests.get", side_effect=get):
+            response = self.client.get("/api/btc/address/tb1qbig/", {"offset": 100})
+
+        hashes = [row["hash"] for row in response.json()["transactions"]["results"]]
+        self.assertEqual(hashes, [f"t{i:03d}" for i in range(100, 120)])
