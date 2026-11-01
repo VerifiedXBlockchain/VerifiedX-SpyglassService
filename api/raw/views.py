@@ -83,14 +83,6 @@ class ValidateSignatureView(GenericAPIView):
 #         return Response(data, status=status.HTTP_200_OK)
 
 
-class RetrieveSmartContractView(GenericAPIView):
-    def get(self, request, *args, **kwargs):
-        data = client.retrieve_smart_contract(id=kwargs["id"])
-        if not data:
-            return Response({}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-        return Response(data, status=status.HTTP_200_OK)
-
-
 class SmartContractDataView(GenericAPIView):
     def post(self, request, *args, **kwargs):
 
