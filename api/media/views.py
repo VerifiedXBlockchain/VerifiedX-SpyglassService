@@ -5,6 +5,7 @@ import string
 
 import boto3
 from django.conf import settings
+from django.db import transaction
 from django.utils import timezone
 from rest_framework import status
 from rest_framework.generics import GenericAPIView
@@ -122,21 +123,35 @@ class AssociateMediaView(GenericAPIView):
                 }
             )
 
-        authenticated = bool(nft.owner_address) and is_authenticated_with_address(
-            request, nft.owner_address
-        )
+        # Re-read the row under a lock: of two requests that both found no
+        # asset URLs above, the second sees the first one's write here and
+        # needs the owner's token like any other replacement.
+        with transaction.atomic():
+            nft = Nft.objects.select_for_update().get(identifier=sc_id)
 
-        if nft.asset_urls and not authenticated:
-            return Response(
-                {"message": "Not authenticated"}, status=status.HTTP_401_UNAUTHORIZED
+            authenticated = bool(nft.owner_address) and is_authenticated_with_address(
+                request, nft.owner_address
             )
 
-        if not authenticated:
-            logging.info(f"First media association for {sc_id} without a token")
+            if nft.asset_urls and not authenticated:
+                return Response(
+                    {"message": "Not authenticated"},
+                    status=status.HTTP_401_UNAUTHORIZED,
+                )
 
-        nft.asset_urls = media_map
-        nft.asset_urls_associated_at = timezone.now()
-        nft.asset_urls_associated_by = nft.owner_address if authenticated else ""
-        nft.save()
+            if not authenticated:
+                logging.info(f"First media association for {sc_id} without a token")
+
+            nft.asset_urls = media_map
+            nft.asset_urls_associated_at = timezone.now()
+            nft.asset_urls_associated_by = nft.owner_address if authenticated else ""
+            nft.save(
+                update_fields=[
+                    "asset_urls",
+                    "asset_urls_associated_at",
+                    "asset_urls_associated_by",
+                    "updated_at",
+                ]
+            )
 
         return Response(NftSerializer(nft).data, status=200)

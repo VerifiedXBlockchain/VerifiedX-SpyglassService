@@ -1,4 +1,5 @@
 from datetime import timedelta
+from unittest import mock
 
 from django.test import TestCase, override_settings
 from django.utils import timezone
@@ -64,6 +65,21 @@ class AssociateMediaViewTests(TestCase):
         response = self.post({"a.png": f"{ORIGIN}abc/a.png"})
 
         self.assertEqual(response.status_code, 200)
+
+    def test_a_second_first_writer_that_lost_the_race_is_401(self):
+        make_nft(asset_urls={})
+        winner = {"a.png": f"{ORIGIN}first/a.png"}
+
+        def fill_the_row_meanwhile():
+            # Another request writes between this one's first read and its lock.
+            Nft.objects.filter(identifier="sc:media").update(asset_urls=winner)
+            return ORIGIN
+
+        with mock.patch("api.media.views.nft_asset_origin", side_effect=fill_the_row_meanwhile):
+            response = self.post({"a.png": f"{ORIGIN}second/a.png"})
+
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(Nft.objects.get(identifier="sc:media").asset_urls, winner)
 
     def test_overwrite_without_a_token_is_401_and_keeps_the_urls(self):
         make_nft(asset_urls={"a.png": f"{ORIGIN}old/a.png"})
