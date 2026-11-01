@@ -51,7 +51,7 @@ from rbx.models import (
 )
 from rbx.vbtc_gates import bitcoin_attestation_height, bitcoin_attestation_record_height, served_height
 from btc.btc_client import BtcClient
-from btc.client import BtcExplorerClient
+from btc.client import BtcAddressNotFound, BtcExplorerClient, BtcProviderUnavailable
 from api.decorators import cache_request
 from django.utils.decorators import method_decorator
 from django.conf import settings
@@ -68,25 +68,20 @@ class BtcAddressView(GenericAPIView):
         if not address:
             return Response({"message": "address required"}, status=400)
 
-        client = BtcExplorerClient()
+        try:
+            offset = int(offset)
+        except (TypeError, ValueError):
+            return Response({"message": "offset must be an integer"}, status=400)
 
-        balance = client.get_balance(address)
-        transactions, total_transactions = client.get_confirmed_transactions(
-            address, offset
-        )
-        utxos, total_utxos = client.get_utxos(address, offset)
-
-        data = {
-            "balance": balance,
-            "transactions": {
-                "total": total_transactions,
-                "results": [t.serialize() for t in transactions],
-            },
-            "utxos": {
-                "total": total_utxos,
-                "results": [u.serialize() for u in utxos],
-            },
-        }
+        try:
+            data = BtcExplorerClient().get_address(address, offset)
+        except BtcAddressNotFound:
+            return Response({"message": "Invalid Bitcoin address for this network"}, status=400)
+        except BtcProviderUnavailable:
+            return Response(
+                {"message": "Bitcoin address data is unavailable, try again later"},
+                status=503,
+            )
 
         return Response(data, status=200)
 
