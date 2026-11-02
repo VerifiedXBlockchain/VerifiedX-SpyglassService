@@ -22,7 +22,10 @@ logging.getLogger("django.request").setLevel(logging.CRITICAL)
 # Everything else is sampled at SENTRY_TRACES_SAMPLE_RATE (default 5%).
 SENTRY_TRACES_SAMPLE_RATE = ENV.float("SENTRY_TRACES_SAMPLE_RATE", default=0.05)
 SENTRY_UNTRACED_PATHS = ("api/masternodes/send/",)
-SENTRY_UNTRACED_TASKS = ("vfx-explorer.health_check",)
+# Matched as suffixes: Celery registers the health check under the app name
+# ("vfx-explorer.health_check" in Sentry today), which can change with the
+# module it is defined in.
+SENTRY_UNTRACED_TASK_SUFFIXES = (".health_check",)
 
 
 def sentry_traces_sampler(sampling_context):
@@ -38,7 +41,10 @@ def sentry_traces_sampler(sampling_context):
 
     if any(untraced in name or untraced in path for untraced in SENTRY_UNTRACED_PATHS):
         return 0.0
-    if name in SENTRY_UNTRACED_TASKS or task in SENTRY_UNTRACED_TASKS:
+    if any(
+        name.endswith(suffix) or task.endswith(suffix)
+        for suffix in SENTRY_UNTRACED_TASK_SUFFIXES
+    ):
         return 0.0
     parent_sampled = sampling_context.get("parent_sampled")
     if parent_sampled is not None:
