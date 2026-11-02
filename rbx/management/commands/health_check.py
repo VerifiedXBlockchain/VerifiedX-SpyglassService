@@ -78,10 +78,7 @@ class Command(BaseCommand):
         ).select_related("token")
 
         for withdrawal in stale:
-            # cache.add only succeeds when the key is absent, so the error is
-            # reported the first time and then once a day while it stays stuck.
-            alert_key = f"health_check:stale_withdrawal:{withdrawal.pk}"
-            if not cache.add(alert_key, 1, STALE_WITHDRAWAL_ALERT_TTL):
+            if not self.first_report_today(withdrawal.pk):
                 continue
             logging.error(
                 f"vBTC v2 withdrawal {withdrawal.pk} on token "
@@ -89,6 +86,23 @@ class Command(BaseCommand):
                 f"{withdrawal.created_at:%Y-%m-%d %H:%M} "
                 f"({withdrawal.amount} BTC to {withdrawal.btc_address})"
             )
+
+    @staticmethod
+    def first_report_today(withdrawal_pk):
+        """True the first time a withdrawal is seen stuck each day.
+
+        cache.add only succeeds when the key is absent. If the cache itself is
+        down, report anyway: a Redis outage must not hide a stuck withdrawal.
+        """
+        alert_key = f"health_check:stale_withdrawal:{withdrawal_pk}"
+        try:
+            return cache.add(alert_key, 1, STALE_WITHDRAWAL_ALERT_TTL)
+        except Exception:
+            logging.warning(
+                "health_check: alert cache unavailable, reporting without dedupe",
+                exc_info=True,
+            )
+            return True
 
     def handle_problem(self, height, delta):
         print(f"PROBLEM. Last block is {height}")
