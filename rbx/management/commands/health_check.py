@@ -2,6 +2,7 @@ import logging
 from datetime import datetime, timedelta
 
 from django.db.models import Q, Sum
+from django.core.cache import cache
 from django.core.management.base import BaseCommand
 from django.utils import timezone
 from rbx.models import Transaction, VbtcV2WithdrawalRequest
@@ -17,6 +18,9 @@ python manage.py health_check
 
 THRESHOLD_SECONDS = 250
 STALE_WITHDRAWAL_HOURS = 24
+# One Sentry event per stuck withdrawal per day. This command runs every
+# 3 minutes, and one withdrawal stuck since July produced 87K identical events.
+STALE_WITHDRAWAL_ALERT_TTL = 24 * 60 * 60
 ALERT_NUMBERS = [
     "+14169974264",
     "+19729982871",
@@ -60,7 +64,7 @@ class Command(BaseCommand):
 
         # Isolated from the node check above: a DB hiccup here must not
         # page "Explorer Wallet is Unreachable". Alerts via Sentry
-        # (logging.error), not SMS — this runs every 3 minutes undeduped.
+        # (logging.error), not SMS, once per withdrawal per day.
         try:
             self.check_stale_withdrawals()
         except Exception:
@@ -74,6 +78,11 @@ class Command(BaseCommand):
         ).select_related("token")
 
         for withdrawal in stale:
+            # cache.add only succeeds when the key is absent, so the error is
+            # reported the first time and then once a day while it stays stuck.
+            alert_key = f"health_check:stale_withdrawal:{withdrawal.pk}"
+            if not cache.add(alert_key, 1, STALE_WITHDRAWAL_ALERT_TTL):
+                continue
             logging.error(
                 f"vBTC v2 withdrawal {withdrawal.pk} on token "
                 f"{withdrawal.token.sc_identifier} stuck in 'requested' since "
