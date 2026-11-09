@@ -14,7 +14,7 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.connection import HTTPConnection, HTTPSConnection
 from urllib3.connectionpool import HTTPConnectionPool, HTTPSConnectionPool
-from urllib3.exceptions import ConnectTimeoutError, NewConnectionError
+from urllib3.exceptions import ConnectTimeoutError, NewConnectionError, ReadTimeoutError
 
 CONNECT_TIMEOUT = 10
 READ_TIMEOUT = 30
@@ -129,8 +129,19 @@ class _PublicOnlyAdapter(HTTPAdapter):
         }
 
 
+class _NoRedirectSession(requests.Session):
+    """fetch_to_file follows redirects itself, checking each hop.
+
+    With allow_redirects=False, Session.send still prepares Response.next by
+    reading the whole redirect body, before any size check can run.
+    """
+
+    def resolve_redirects(self, *args, **kwargs):
+        return iter(())
+
+
 def _public_session() -> requests.Session:
-    session = requests.Session()
+    session = _NoRedirectSession()
     # No proxy from the environment: a proxy would connect for the server, unchecked.
     session.trust_env = False
     adapter = _PublicOnlyAdapter(max_retries=0)
@@ -141,7 +152,11 @@ def _public_session() -> requests.Session:
 
 def check_url(url: str) -> None:
     """UnsafeUrl unless `url` is an http(s) URL with a host."""
-    parsed = urlparse(url)
+    try:
+        parsed = urlparse(url)
+        parsed.port
+    except ValueError as e:
+        raise UnsafeUrl("invalid_url", f"URL {url!r} is not a valid URL: {e}")
     if parsed.scheme.lower() not in ALLOWED_SCHEMES:
         raise UnsafeUrl("scheme", f"Only http and https URLs can be fetched, not {url!r}.")
     if not parsed.hostname:
@@ -198,5 +213,8 @@ def _write_body(url, response, file, max_bytes) -> int:
     except requests.Timeout as e:
         raise FetchFailed("timeout", f"Timed out reading {url!r}: {e}")
     except requests.RequestException as e:
+        # iter_content wraps a read timeout in a ConnectionError.
+        if e.args and isinstance(e.args[0], ReadTimeoutError):
+            raise FetchFailed("timeout", f"Timed out reading {url!r}: {e}")
         raise FetchFailed("unreachable", f"Lost the connection reading {url!r}: {e}")
     return written

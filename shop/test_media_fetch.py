@@ -28,6 +28,8 @@ class _Handler(BaseHTTPRequestHandler):
             "/big.png": lambda: self._send(200, b"x" * 64, length=10**12),
             "/stream.png": self._stream_unsized,
             "/slow.png": self._slow,
+            "/stall.png": self._stall_body,
+            "/big-redirect": self._big_redirect,
             "/to-metadata": lambda: self._redirect("http://169.254.169.254/latest/meta-data/"),
             "/to-file": lambda: self._redirect("file:///etc/passwd"),
             "/to-image": lambda: self._redirect("/image.png"),
@@ -51,6 +53,25 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.end_headers()
         self.wfile.write(b"y" * 4096)
+        self.close_connection = True
+
+    def _stall_body(self):
+        self.send_response(200)
+        self.send_header("Content-Length", "100")
+        self.end_headers()
+        self.wfile.write(b"z" * 10)
+        self.wfile.flush()
+        time.sleep(1.5)
+
+    def _big_redirect(self):
+        self.send_response(302)
+        self.send_header("Location", "/image.png")
+        self.end_headers()
+        try:
+            for _ in range(64):
+                self.wfile.write(b"r" * 65536)
+        except OSError:
+            pass
         self.close_connection = True
 
     def _slow(self):
@@ -188,6 +209,21 @@ class FetchTests(_LocalServerTestCase):
                 fetch_to_file(f"{self.base}/slow.png", io.BytesIO())
         self.assertEqual(caught.exception.reason, "timeout")
 
+    def test_a_body_that_stalls_times_out(self):
+        with patch.object(safe_fetch, "READ_TIMEOUT", 0.3):
+            with self.assertRaises(FetchFailed) as caught:
+                fetch_to_file(f"{self.base}/stall.png", io.BytesIO())
+        self.assertEqual(caught.exception.reason, "timeout")
+
+    def test_a_redirect_body_is_not_read(self):
+        out = io.BytesIO()
+        with patch.object(
+            safe_fetch.requests.models.Response, "content",
+            new_callable=lambda: property(lambda r: self.fail("a response body was buffered")),
+        ):
+            fetch_to_file(f"{self.base}/big-redirect", out)
+        self.assertEqual(out.getvalue(), b"PNGDATA")
+
     def test_a_closed_port_is_unreachable(self):
         sock = socket.socket()
         sock.bind(("127.0.0.1", 0))
@@ -241,6 +277,13 @@ class SmartContractDataErrorTests(SimpleTestCase):
         payload = {"SmartContractAsset": {"Name": "image.png", "Location": location}}
         request = APIRequestFactory().post("/raw/smart-contract-data/", payload, format="json")
         return SmartContractDataView.as_view()(request)
+
+    def test_a_malformed_url_is_refused_with_json(self):
+        for location in ("http://[broken/a.png", "http://example.com:99999/a.png", "http://example.com:abc/a.png"):
+            with self.subTest(location=location):
+                response = self._post(location)
+                self.assertEqual(response.status_code, 400)
+                self.assertEqual(response.data["reason"], "invalid_url")
 
     def test_a_private_url_is_refused_with_json(self):
         with patch.object(media, "scp_up_file") as scp:
