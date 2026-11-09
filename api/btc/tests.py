@@ -1,5 +1,7 @@
 from unittest import mock
 
+import requests
+
 from django.test import TestCase, override_settings
 
 from rbx.tests import make_token
@@ -417,4 +419,74 @@ class VbtcV2WalletViewTests(TestCase):
         self.assertEqual(set(second["results"][0]["nft"]), self.WALLET_NFT_KEYS)
         self.assertNotEqual(
             first["results"][0]["sc_identifier"], second["results"][0]["sc_identifier"]
+        )
+
+
+class VbtcV2NodeMessageTests(TestCase):
+    """A node refusal keeps its 500 and every field it had, and adds the
+    node's reason as node_message; an unreachable node gives null there."""
+
+    TRANSFER = {"sc_identifier": "sc:1", "from_address": "xA", "to_address": "xB", "amount": 0.001}
+    SIGNED = {"hash": "h", "signature": "s", "public_key": "p"}
+    ROUTES = [
+        ("/api/btc/vbtc-v2/transfer/prepare/", TRANSFER),
+        ("/api/btc/vbtc-v2/transfer/send/", SIGNED),
+        ("/api/btc/vbtc-v2/withdraw/request/send/", SIGNED),
+        ("/api/btc/vbtc-v2/withdraw/cancel/send/", SIGNED),
+    ]
+
+    def node_answers(self, body=None, error=None):
+        response = mock.MagicMock(ok=True, status_code=200)
+        response.json.return_value = body
+        return mock.patch("rbx.client._http.post", return_value=response, side_effect=error)
+
+    def test_a_refusal_adds_the_node_reason(self):
+        refusal = {"Success": False, "Message": "Insufficient vBTC balance"}
+        for url, body in self.ROUTES:
+            with self.subTest(url=url):
+                with self.assertLogs(level="ERROR"), self.node_answers(refusal):
+                    response = self.client.post(url, body, content_type="application/json")
+                self.assertEqual(response.status_code, 500)
+                self.assertEqual(
+                    response.json(),
+                    {
+                        "success": False,
+                        "message": "Insufficient vBTC balance",
+                        "raw": refusal,
+                        "node_message": "Insufficient vBTC balance",
+                    },
+                )
+
+    def test_an_unreachable_node_has_no_node_message(self):
+        with self.assertLogs(level="ERROR"), self.node_answers(error=requests.ConnectTimeout("slow")):
+            response = self.client.post(
+                "/api/btc/vbtc-v2/transfer/send/", self.SIGNED, content_type="application/json"
+            )
+
+        self.assertEqual(response.status_code, 500)
+        body = response.json()
+        self.assertEqual(body["message"], "slow")
+        self.assertTrue(body["raw"]["Unreachable"])
+        self.assertIsNone(body["node_message"])
+
+    def test_success_is_unchanged(self):
+        with self.node_answers({"Success": True, "Hash": "abc"}):
+            response = self.client.post(
+                "/api/btc/vbtc-v2/transfer/send/", self.SIGNED, content_type="application/json"
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"success": True, "Hash": "abc"})
+
+    def test_ceremony_prepare_refusal_adds_the_node_reason(self):
+        refusal = {"Success": False, "Message": "Not enough validators"}
+        with mock.patch("api.btc.views.prepare_vbtc_v2_ceremony", return_value=refusal):
+            response = self.client.post(
+                "/api/btc/vbtc-v2/ceremony/prepare/", {"owner_address": "xA"}, content_type="application/json"
+            )
+
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(
+            response.json(),
+            {"success": False, "message": "Not enough validators", "node_message": "Not enough validators"},
         )

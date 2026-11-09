@@ -309,6 +309,15 @@ class VbtcV2WithdrawalsView(GenericAPIView):
         return Response({"results": results}, status=200)
 
 
+def _node_message(result):
+    """The reason the node gave for refusing, or None when it did not answer
+    (a timeout, a refused connection, a body that is not JSON), so a wallet
+    can show the node's own words and tell a refusal from an outage."""
+    if result.get("Unreachable"):
+        return None
+    return result.get("Message") or None
+
+
 def _vbtc_v2_proxy(cli_func, payload, error_msg="Operation failed"):
     """Shared proxy helper — calls CLI, normalizes response."""
     result = cli_func(payload) if payload is not None else cli_func()
@@ -316,7 +325,12 @@ def _vbtc_v2_proxy(cli_func, payload, error_msg="Operation failed"):
     if success:
         return Response({"success": True, **{k: v for k, v in result.items() if k != "Success"}})
     return Response(
-        {"success": False, "message": result.get("Message", error_msg), "raw": result},
+        {
+            "success": False,
+            "message": result.get("Message", error_msg),
+            "raw": result,
+            "node_message": _node_message(result),
+        },
         status=500,
     )
 
@@ -358,7 +372,11 @@ class VbtcV2CeremonyPrepareView(GenericAPIView):
             })
 
         return Response(
-            {"success": False, "message": result.get("Message", "Ceremony preparation failed")},
+            {
+                "success": False,
+                "message": result.get("Message", "Ceremony preparation failed"),
+                "node_message": _node_message(result),
+            },
             status=500,
         )
 
