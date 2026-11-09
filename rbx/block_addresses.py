@@ -71,11 +71,22 @@ def affected_addresses(height: int, extra=()) -> list:
     return sorted(addresses - {None, ""})
 
 
-def withdrawal_states() -> dict:
-    """Every withdrawal request's state, to diff around a reconcile."""
+def withdrawal_states(after_rewind: bool = False, include=()) -> dict:
+    """The state of each withdrawal request a reconcile can change, to diff
+    around it: the requests of every vault with an open request (and, after
+    a rewind, with a completed one), as reconcile_all_watched_vaults picks
+    them, plus the requests in `include` (the first snapshot's, which the
+    reconcile may have just closed). Closed history on other vaults is not
+    read."""
+    statuses = list(VbtcV2WithdrawalRequest.ACTIVE_STATUSES)
+    if after_rewind:
+        statuses.append(VbtcV2WithdrawalRequest.Status.COMPLETED)
+    tokens = VbtcV2WithdrawalRequest.objects.filter(status__in=statuses).values("token_id")
     return {
         pk: (state, requestor)
-        for pk, requestor, *state in VbtcV2WithdrawalRequest.objects.values_list(
+        for pk, requestor, *state in VbtcV2WithdrawalRequest.objects.filter(
+            Q(token_id__in=tokens) | Q(pk__in=list(include))
+        ).values_list(
             "pk", "requestor_address", "status", "refunded_amount", "closed_because", "btc_transaction_hash"
         )
     }

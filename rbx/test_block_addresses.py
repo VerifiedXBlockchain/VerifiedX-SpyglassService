@@ -165,7 +165,7 @@ class ReconciledWithdrawalsTests(TestCase):
 
         self.refund()
 
-        self.assertEqual(changed_requestors(before, withdrawal_states()), {"xREQ"})
+        self.assertEqual(changed_requestors(before, withdrawal_states(include=before.keys())), {"xREQ"})
 
     def test_a_report_block_lists_the_refunded_requestor(self):
         data = dict(BlockSocketEventsTests.DATA, Height=2, Hash="block-2", PrevHash="block-1")
@@ -193,3 +193,32 @@ class ReconciledWithdrawalsTests(TestCase):
         addresses = [e for e in events if e["type"] == "block_addresses"][0]["data"]["affected_addresses"]
         self.assertIn("xREQ", addresses)
         self.assertIn("xVALIDATOR", addresses)
+
+    def test_closed_history_on_other_vaults_is_not_read(self):
+        other = make_token(owner="xOTHER", sc_identifier="sc:2")
+        old = make_tx(make_block(3), "req-old", Transaction.Type.VBTC_V2_WITHDRAWAL_REQUEST, from_address="xOLD")
+        add_withdrawal(other, old, "xOLD", "0.001", VbtcV2WithdrawalRequest.Status.COMPLETED)
+
+        self.assertEqual({requestor for _, requestor in withdrawal_states().values()}, {"xREQ"})
+        self.assertIn("xOLD", {requestor for _, requestor in withdrawal_states(after_rewind=True).values()})
+
+    def test_a_failed_snapshot_still_sends_the_block_events(self):
+        data = dict(BlockSocketEventsTests.DATA, Height=2, Hash="block-2", PrevHash="block-1")
+        data["Transactions"] = [
+            {
+                "Hash": "report2", "TransactionType": Transaction.Type.VBTC_V2_BTC_REPORT,
+                "FromAddress": "xVALIDATOR", "ToAddress": "xVALIDATOR", "Amount": 0, "Fee": 0,
+                "Nonce": 0, "Timestamp": 1700000000, "Data": None, "Signature": "", "Height": 2,
+            }
+        ]
+        with patch("rbx.tasks.withdrawal_states", side_effect=RuntimeError("db")), patch(
+            "rbx.tasks.vbtc_dispatch.reconcile_all_watched_vaults"
+        ) as reconcile, patch("rbx.tasks.vbtc_dispatch.refresh_all_watched_backings"), patch(
+            "rbx.tasks.notify_socket_service"
+        ) as notify, self.assertLogs(level="ERROR"):
+            sync_block(2, data=data, notify=True)
+
+        reconcile.assert_called_once()
+        self.assertEqual(
+            [json.loads(call.args[0])["type"] for call in notify.call_args_list], ["new_block", "block_addresses"]
+        )

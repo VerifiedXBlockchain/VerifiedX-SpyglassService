@@ -299,13 +299,23 @@ def sync_block(height: int, data: Optional[dict] = None, notify: bool = True) ->
     reconciled_requestors = set()
     if any(t.get("TransactionType") in ATTESTATION_TYPES for t in data["Transactions"]):
         rewound = any(t.get("TransactionType") == Transaction.Type.VBTC_V2_BTC_REORG for t in data["Transactions"])
-        before = withdrawal_states() if block_created and notify else None
+        before = None
+        if block_created and notify:
+            try:
+                before = withdrawal_states(after_rewind=rewound)
+            except Exception:
+                logging.exception(f"Reading withdrawals before block {height}'s reconcile failed")
         try:
             vbtc_dispatch.reconcile_all_watched_vaults(after_rewind=rewound)
         except Exception:
             logging.exception(f"Reading the watched vaults' outcomes after block {height} failed")
         if before is not None:
-            reconciled_requestors = changed_requestors(before, withdrawal_states())
+            try:
+                reconciled_requestors = changed_requestors(
+                    before, withdrawal_states(after_rewind=rewound, include=before.keys())
+                )
+            except Exception:
+                logging.exception(f"Reading withdrawals after block {height}'s reconcile failed")
         try:
             vbtc_dispatch.refresh_all_watched_backings()
         except Exception:
