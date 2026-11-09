@@ -79,6 +79,28 @@ class SignTokenTests(TestCase):
         self.assertEqual(self.sign_in(FLUTTER_MESSAGE)[0].status_code, 400)
         self.assertEqual(AuthToken.objects.count(), 1)
 
+    def test_a_racing_request_that_loses_the_claim_gets_no_token(self):
+        # No stored token yet, but another request holds the claim.
+        with mock.patch("api.auth.serializers.cache.add", return_value=False):
+            response, _ = self.sign_in(sdk_message())
+
+        self.assertEqual(response.status_code, 400)
+        self.assertFalse(AuthToken.objects.exists())
+
+    def test_a_legacy_nonce_stays_used_when_its_token_is_deleted(self):
+        self.assertEqual(self.sign_in(FLUTTER_MESSAGE)[0].status_code, 201)
+        AuthToken.objects.all().delete()
+
+        self.assertEqual(self.sign_in(FLUTTER_MESSAGE)[0].status_code, 400)
+
+    def test_only_a_legacy_claim_never_expires(self):
+        with mock.patch("api.auth.serializers.cache.add", return_value=True) as add:
+            self.sign_in(FLUTTER_MESSAGE)
+            self.sign_in(sdk_message())
+
+        self.assertIsNone(add.call_args_list[0].kwargs["timeout"])
+        self.assertEqual(add.call_args_list[1].kwargs["timeout"], 2 * SIGN_TOKEN_MAX_SKEW_SECONDS + 60)
+
     def test_a_bad_signature_does_not_use_up_the_nonce(self):
         message = sdk_message()
         self.assertEqual(self.sign_in(message, valid=False)[0].status_code, 400)

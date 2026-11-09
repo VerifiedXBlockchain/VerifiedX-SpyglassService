@@ -62,9 +62,10 @@ SIGN_TOKEN_MAX_SKEW_SECONDS = 10 * 60
 # signed payload has this shape. Without a time, freshness cannot be
 # checked; a message is accepted once per address, ever.
 LEGACY_MESSAGE = re.compile(r"^[A-Za-z0-9]{32}$")
-# A timed message is dead after the skew window on either side; the
-# legacy one is also checked against the stored tokens, so the cache entry
-# only has to cover two requests racing.
+# A timed message is dead after the skew window on either side, so its
+# claim only has to outlive that. A legacy message never goes stale: its
+# claim never expires, and the stored tokens are checked as well, so an
+# old proof comes back only if a token is deleted and the cache is lost.
 NONCE_TTL_SECONDS = 2 * SIGN_TOKEN_MAX_SKEW_SECONDS + 60
 
 
@@ -86,7 +87,8 @@ def claim_sign_token_nonce(address, message):
     """Mark `message` used for `address`; False if it already was."""
     if AuthToken.objects.filter(address=address, message=message).exists():
         return False
-    return cache.add(f"sign-token-nonce:{address}:{message}", 1, timeout=NONCE_TTL_SECONDS)
+    timeout = None if LEGACY_MESSAGE.match(message) else NONCE_TTL_SECONDS
+    return cache.add(f"sign-token-nonce:{address}:{message}", 1, timeout=timeout)
 
 
 class SignTokenSerializer(serializers.ModelSerializer):
