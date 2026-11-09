@@ -222,3 +222,29 @@ class ReconciledWithdrawalsTests(TestCase):
         self.assertEqual(
             [json.loads(call.args[0])["type"] for call in notify.call_args_list], ["new_block", "block_addresses"]
         )
+
+    def test_a_pending_rewind_snapshots_completed_requests(self):
+        VbtcV2WithdrawalRequest.objects.filter(pk=self.withdrawal.pk).update(
+            status=VbtcV2WithdrawalRequest.Status.COMPLETED
+        )
+
+        def repin():
+            VbtcV2WithdrawalRequest.objects.filter(pk=self.withdrawal.pk).update(btc_transaction_hash="newtxid")
+
+        data = dict(BlockSocketEventsTests.DATA, Height=2, Hash="block-2", PrevHash="block-1")
+        data["Transactions"] = [
+            {
+                "Hash": "report2", "TransactionType": Transaction.Type.VBTC_V2_BTC_REPORT,
+                "FromAddress": "xVALIDATOR", "ToAddress": "xVALIDATOR", "Amount": 0, "Fee": 0,
+                "Nonce": 0, "Timestamp": 1700000000, "Data": None, "Signature": "", "Height": 2,
+            }
+        ]
+        with patch("rbx.tasks.vbtc_dispatch.rewind_pending", return_value=True), patch(
+            "rbx.tasks.vbtc_dispatch.reconcile_all_watched_vaults", side_effect=lambda **kw: repin()
+        ), patch("rbx.tasks.vbtc_dispatch.refresh_all_watched_backings"), patch(
+            "rbx.tasks.notify_socket_service"
+        ) as notify:
+            sync_block(2, data=data, notify=True)
+
+        events = [json.loads(call.args[0]) for call in notify.call_args_list]
+        self.assertIn("xREQ", [e for e in events if e["type"] == "block_addresses"][0]["data"]["affected_addresses"])

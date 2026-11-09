@@ -300,9 +300,13 @@ def sync_block(height: int, data: Optional[dict] = None, notify: bool = True) ->
     if any(t.get("TransactionType") in ATTESTATION_TYPES for t in data["Transactions"]):
         rewound = any(t.get("TransactionType") == Transaction.Type.VBTC_V2_BTC_REORG for t in data["Transactions"])
         before = None
+        snapshot_rewind = rewound
         if block_created and notify:
             try:
-                before = withdrawal_states(after_rewind=rewound)
+                # Completed requests too while an earlier rewind is still
+                # being read, as the reconcile includes them then.
+                snapshot_rewind = rewound or vbtc_dispatch.rewind_pending()
+                before = withdrawal_states(after_rewind=snapshot_rewind)
             except Exception:
                 logging.exception(f"Reading withdrawals before block {height}'s reconcile failed")
         try:
@@ -312,7 +316,7 @@ def sync_block(height: int, data: Optional[dict] = None, notify: bool = True) ->
         if before is not None:
             try:
                 reconciled_requestors = changed_requestors(
-                    before, withdrawal_states(after_rewind=rewound, include=before.keys())
+                    before, withdrawal_states(after_rewind=snapshot_rewind, include=before.keys())
                 )
             except Exception:
                 logging.exception(f"Reading withdrawals after block {height}'s reconcile failed")
