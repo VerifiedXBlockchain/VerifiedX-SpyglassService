@@ -1,10 +1,11 @@
-import random
+import secrets
 import string
 from distutils.util import strtobool
 
 
 def get_random_string(characters, length):
-    return "".join(random.choice(characters) for _ in range(length))
+    # secrets, not random: these strings are auth tokens and storage paths.
+    return "".join(secrets.choice(characters) for _ in range(length))
 
 
 def get_random_slug(length):
