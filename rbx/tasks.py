@@ -19,6 +19,7 @@ from django.utils import timezone
 from api.block.serializers import BlockSerializer
 from project.celery import app
 from project.utils.encoders import DecimalEncoder
+from rbx.block_addresses import affected_addresses
 from rbx.chain_contract import smart_contract_from_chain
 from rbx.client import get_master_nodes, get_block, get_nft, get_topics
 from shop.media import scp_down_folder, upload_to_s3
@@ -336,6 +337,27 @@ def sync_block(height: int, data: Optional[dict] = None, notify: bool = True) ->
                 # Best effort: a socket-service hiccup must not fail (or
                 # celery-retry) a block that already committed.
                 logging.exception(f"Failed to send new_block event for {height}")
+
+            # A separate event, sent after new_block, which stays as it was.
+            # The relay forwards only type, data and message, so the list
+            # rides in data of its own event type; listeners that check for
+            # new_block ignore it.
+            try:
+                addresses_payload = json.dumps(
+                    {
+                        "type": "block_addresses",
+                        "data": {
+                            "height": b.height,
+                            "hash": b.hash,
+                            "affected_addresses": affected_addresses(b.height),
+                        },
+                        "message": f"block {b.height} addresses",
+                        "api_key": settings.SOCKET_TOKEN,
+                    }
+                )
+                notify_socket_service(addresses_payload)
+            except Exception:
+                logging.exception(f"Failed to send block_addresses event for {height}")
 
     end = time.time()
     logging.info(f"Synchronized Block {height} [elapsed: {end - start}]")
