@@ -5,7 +5,7 @@ from django.test import TestCase, override_settings
 
 from api.block.serializers import BlockSerializer
 from project.utils.encoders import DecimalEncoder
-from rbx.block_addresses import affected_addresses
+from rbx.block_addresses import affected_addresses, changed_requestors, withdrawal_states
 from rbx.models import Block, Callback, FungibleToken, FungibleTokenTx, Recovery, Transaction, VbtcV2WithdrawalRequest
 from rbx.tasks import sync_block
 from rbx.tests import add_transfer, add_withdrawal, make_block, make_token, make_tx
@@ -142,3 +142,54 @@ class BlockSocketEventsTests(TestCase):
             events, _ = self._sync()
 
         self.assertEqual([event["type"] for event in events], ["new_block"])
+
+
+class ReconciledWithdrawalsTests(TestCase):
+    """A Bitcoin report refunds or reopens withdrawals that no transaction of
+    its block links to; their requestors still reach block_addresses."""
+
+    def setUp(self):
+        earlier = make_block(1)
+        token = make_token(owner="xOWNER", sc_identifier="sc:1")
+        request = make_tx(earlier, "req1", Transaction.Type.VBTC_V2_WITHDRAWAL_REQUEST, from_address="xREQ")
+        self.withdrawal = add_withdrawal(token, request, "xREQ", "0.001", VbtcV2WithdrawalRequest.Status.PENDING_BTC)
+
+    def refund(self, **kwargs):
+        VbtcV2WithdrawalRequest.objects.filter(pk=self.withdrawal.pk).update(
+            status=VbtcV2WithdrawalRequest.Status.CANCELLED, closed_because="Expired"
+        )
+
+    def test_only_rows_the_reconcile_changed_are_listed(self):
+        before = withdrawal_states()
+        self.assertEqual(changed_requestors(before, withdrawal_states()), set())
+
+        self.refund()
+
+        self.assertEqual(changed_requestors(before, withdrawal_states()), {"xREQ"})
+
+    def test_a_report_block_lists_the_refunded_requestor(self):
+        data = dict(BlockSocketEventsTests.DATA, Height=2, Hash="block-2", PrevHash="block-1")
+        data["Transactions"] = [
+            {
+                "Hash": "report2",
+                "TransactionType": Transaction.Type.VBTC_V2_BTC_REPORT,
+                "FromAddress": "xVALIDATOR",
+                "ToAddress": "xVALIDATOR",
+                "Amount": 0,
+                "Fee": 0,
+                "Nonce": 0,
+                "Timestamp": 1700000000,
+                "Data": None,
+                "Signature": "",
+                "Height": 2,
+            }
+        ]
+        with patch("rbx.tasks.vbtc_dispatch.reconcile_all_watched_vaults", side_effect=self.refund), patch(
+            "rbx.tasks.vbtc_dispatch.refresh_all_watched_backings"
+        ), patch("rbx.tasks.notify_socket_service") as notify:
+            sync_block(2, data=data, notify=True)
+
+        events = [json.loads(call.args[0]) for call in notify.call_args_list]
+        addresses = [e for e in events if e["type"] == "block_addresses"][0]["data"]["affected_addresses"]
+        self.assertIn("xREQ", addresses)
+        self.assertIn("xVALIDATOR", addresses)

@@ -4,6 +4,7 @@ import requests
 
 from django.test import TestCase, override_settings
 
+from rbx.models import VbtcV2Token
 from rbx.tests import make_token
 
 
@@ -407,6 +408,19 @@ class VbtcV2WalletViewTests(TestCase):
         for query in ("?page=1", "?page=2", "?limit=1", "?page=2&limit=1", "?view=explorer&limit=1"):
             with self.subTest(query=query):
                 self.assertEqual(self.client.get(f"/api/btc/vbtc-v2/{query}").json(), full)
+
+    def test_wallet_pages_keep_vaults_with_one_mint_time_apart(self):
+        same_time = VbtcV2Token.objects.first().created_at
+        for i in range(3, 8):
+            make_token(owner="xOWNER", sc_identifier=f"sc:{i}")
+        VbtcV2Token.objects.update(created_at=same_time)
+
+        seen = []
+        for page in (1, 2, 3, 4):
+            body = self.client.get(f"/api/btc/vbtc-v2/?view=wallet&limit=2&page={page}").json()
+            seen += [row["sc_identifier"] for row in body["results"]]
+
+        self.assertEqual(sorted(seen), sorted(VbtcV2Token.objects.values_list("sc_identifier", flat=True)))
 
     def test_list_all_pages_when_asked(self):
         first = self.client.get("/api/btc/vbtc-v2/?limit=1&view=wallet").json()

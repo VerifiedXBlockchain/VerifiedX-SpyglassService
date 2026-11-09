@@ -211,8 +211,10 @@ class VbtcV2ListAllView(GenericAPIView):
         # `view` and reads every vault from the one response.
         wants_page = "page" in request.query_params or "limit" in request.query_params
         if serializer_class is VbtcV2WalletTokenSerializer and wants_page:
+            # Vaults minted in one block share created_at: a unique
+            # tie-break keeps each vault on one page between requests.
             paginator = StandardPagination()
-            page = paginator.paginate_queryset(tokens, request, view=self)
+            page = paginator.paginate_queryset(tokens.order_by("-created_at", "-sc_identifier"), request, view=self)
             return paginator.get_paginated_response(serializer_class(page, many=True).data)
         results = serializer_class(tokens, many=True).data
         return Response({"results": results}, status=200)

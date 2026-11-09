@@ -19,7 +19,7 @@ from django.utils import timezone
 from api.block.serializers import BlockSerializer
 from project.celery import app
 from project.utils.encoders import DecimalEncoder
-from rbx.block_addresses import affected_addresses
+from rbx.block_addresses import affected_addresses, changed_requestors, withdrawal_states
 from rbx.chain_contract import smart_contract_from_chain
 from rbx.client import get_master_nodes, get_block, get_nft, get_topics
 from shop.media import scp_down_folder, upload_to_s3
@@ -294,12 +294,18 @@ def sync_block(height: int, data: Optional[dict] = None, notify: bool = True) ->
     # exits take their outcome from the node, once, after the block is
     # committed. A failure here is logged; the block and its transactions
     # stand, and the next pass (or the ten-minute sweep) reads them again.
+    # Requestors whose withdrawals the reconcile below changes, for the
+    # block_addresses event: a refund or reopen links to no transaction.
+    reconciled_requestors = set()
     if any(t.get("TransactionType") in ATTESTATION_TYPES for t in data["Transactions"]):
         rewound = any(t.get("TransactionType") == Transaction.Type.VBTC_V2_BTC_REORG for t in data["Transactions"])
+        before = withdrawal_states() if block_created and notify else None
         try:
             vbtc_dispatch.reconcile_all_watched_vaults(after_rewind=rewound)
         except Exception:
             logging.exception(f"Reading the watched vaults' outcomes after block {height} failed")
+        if before is not None:
+            reconciled_requestors = changed_requestors(before, withdrawal_states())
         try:
             vbtc_dispatch.refresh_all_watched_backings()
         except Exception:
@@ -349,7 +355,7 @@ def sync_block(height: int, data: Optional[dict] = None, notify: bool = True) ->
                         "data": {
                             "height": b.height,
                             "hash": b.hash,
-                            "affected_addresses": affected_addresses(b.height),
+                            "affected_addresses": affected_addresses(b.height, reconciled_requestors),
                         },
                         "message": f"block {b.height} addresses",
                         "api_key": settings.SOCKET_TOKEN,

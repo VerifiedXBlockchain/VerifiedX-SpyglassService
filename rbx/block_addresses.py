@@ -6,6 +6,10 @@ parties of the rows the indexer derived from the block that do not show in
 to/from: vBTC V2 ledger moves and withdrawal requests, bridge locks and
 exits, VFX20 transfers, reserve callbacks and recoveries.
 
+A Bitcoin report or rewind changes withdrawals that no transaction of the
+block links to (a refund, a reopen); sync_block diffs the withdrawal rows
+around that reconcile and passes the requestors it changed as `extra`.
+
 Best effort: an address left out only delays that wallet's refresh to the
 next block that touches it, or to its own reconcile poll. Effects applied
 later than the block that carries them (a reserve send settling at its
@@ -26,8 +30,8 @@ from rbx.models import (
 )
 
 
-def affected_addresses(height: int) -> list:
-    addresses = set()
+def affected_addresses(height: int, extra=()) -> list:
+    addresses = set(extra)
 
     def add(rows):
         for row in rows:
@@ -65,3 +69,17 @@ def affected_addresses(height: int) -> list:
     add(Recovery.objects.filter(transaction_id__in=hashes).values_list("original_address", "new_address"))
 
     return sorted(addresses - {None, ""})
+
+
+def withdrawal_states() -> dict:
+    """Every withdrawal request's state, to diff around a reconcile."""
+    return {
+        pk: (state, requestor)
+        for pk, requestor, *state in VbtcV2WithdrawalRequest.objects.values_list(
+            "pk", "requestor_address", "status", "refunded_amount", "closed_because", "btc_transaction_hash"
+        )
+    }
+
+
+def changed_requestors(before: dict, after: dict) -> set:
+    return {requestor for pk, (state, requestor) in after.items() if before.get(pk, (None,))[0] != state}
