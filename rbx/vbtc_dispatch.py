@@ -1381,6 +1381,13 @@ def _report_long_hold(mark):
     VbtcV2RewindMark.objects.filter(pk=mark.pk).update(alerted_height=hold["rewind_height"])
 
 
+def rewind_pending():
+    """Whether a Bitcoin rewind is still being read on every pass (see
+    reconcile_all_watched_vaults), so completed requests are in scope."""
+    mark = VbtcV2RewindMark.objects.filter(pk=1).first()
+    return _latest_rewind_height() > (mark.reconciled_height if mark else -1)
+
+
 def reconcile_all_watched_vaults(after_rewind=False):
     """Every watched vault with an open request (and, after a Bitcoin
     rewind, with a completed one). A rewind is read on every pass, the

@@ -1,3 +1,6 @@
+import json
+import logging
+
 from rest_framework import status, filters
 from rest_framework.generics import GenericAPIView
 from rest_framework.mixins import RetrieveModelMixin, ListModelMixin
@@ -185,3 +188,69 @@ class AddressAdnrDetailView(RetrieveModelMixin, AddressView):
             return Response(data, status=200)
         except Address.DoesNotExist:
             return Response({}, status=404)
+
+
+class AddressActivityView(GenericAPIView):
+    """Whether addresses were ever used, without a balance recompute.
+
+    GET /addresses/activity/?addresses=a,b
+
+    Answers {"results": [...]} with one row per address, in the order asked:
+    - has_transactions: a transaction to or from it is indexed;
+    - has_balance: its indexed balance (Address.balance, what the address
+      list serves) is above zero;
+    - vault_activated: it sent a Register() reserve transaction, as
+      `activated` on /addresses/<address>/ reads it;
+    - register_recovery_addresses: the RecoveryAddress of each Register() it
+      sent to Reserve_Base, oldest first.
+    An address the explorer has never seen answers all false. Any failure
+    is an error status, never "no activity".
+    """
+
+    MAX_ADDRESSES = 20
+    RESERVE_BASE_ADDRESS = "Reserve_Base"
+
+    def get(self, request, *args, **kwargs):
+        addresses = list(dict.fromkeys(a for a in request.query_params.get("addresses", "").split(",") if a))
+        if not addresses:
+            return Response({"error": "addresses is required"}, status=status.HTTP_400_BAD_REQUEST)
+        if len(addresses) > self.MAX_ADDRESSES:
+            return Response(
+                {"error": f"at most {self.MAX_ADDRESSES} addresses"}, status=status.HTTP_400_BAD_REQUEST
+            )
+
+        funded = set(
+            Address.objects.filter(address__in=addresses, balance__gt=0).values_list("address", flat=True)
+        )
+        return Response({"results": [self._activity(address, address in funded) for address in addresses]})
+
+    def _activity(self, address, has_balance):
+        has_transactions = (
+            Transaction.objects.filter(to_address=address).exists()
+            or Transaction.objects.filter(from_address=address).exists()
+        )
+
+        vault_activated = False
+        recovery_addresses = []
+        registers = Transaction.objects.filter(from_address=address, type=Transaction.Type.RESERVE).order_by(
+            "height", "hash"
+        )
+        for tx_hash, to_address, raw in registers.values_list("hash", "to_address", "data"):
+            try:
+                data = json.loads(raw) if isinstance(raw, str) else raw
+            except ValueError:
+                logging.warning(f"Reserve transaction {tx_hash} has data that is not JSON")
+                continue
+            if not isinstance(data, dict) or data.get("Function") != "Register()":
+                continue
+            vault_activated = True
+            if to_address == self.RESERVE_BASE_ADDRESS and data.get("RecoveryAddress"):
+                recovery_addresses.append(data["RecoveryAddress"])
+
+        return {
+            "address": address,
+            "has_transactions": has_transactions,
+            "has_balance": has_balance,
+            "vault_activated": vault_activated,
+            "register_recovery_addresses": recovery_addresses,
+        }

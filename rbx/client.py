@@ -79,6 +79,13 @@ CLI_TIMEOUT = (5, 30)
 # The reads block sync and the sweep make for each watched vault: a hung
 # node must not hold a block for vaults x 30s.
 NODE_READ_TIMEOUT = (5, 5)
+# The /raw/* proxies for wallets: gunicorn runs sync workers, so a node that
+# holds these open takes the API down with it. A timeout raises
+# requests.Timeout, a RequestException like the ConnectionError of a dead
+# node, and fails through the same 500. Verify and send get a longer read
+# so a healthy but slow node is not cut off while it accepts a transaction.
+RAW_TX_TIMEOUT = (3, 5)
+RAW_TX_SEND_TIMEOUT = (3, 15)
 
 
 def _get_session() -> requests.Session:
@@ -185,7 +192,7 @@ def get_block(height: int) -> Optional[dict]:
 def tx_get_fee(transaction: dict, *args) -> Tuple[dict, int]:
     url = join_url(BASE_URL, "txapi/txV1/GetRawTxFee")
 
-    response = _http.post(url, json=transaction)
+    response = _http.post(url, json=transaction, timeout=RAW_TX_TIMEOUT)
     if response.status_code != 200:
         raise RBXException
 
@@ -199,7 +206,7 @@ def tx_get_hash(transaction: dict) -> Tuple[dict, int]:
     url = join_url(BASE_URL, "txapi/txV1/GetTxHash")
     data = _fix_decimals(transaction)
 
-    response = _http.post(url, json=data)
+    response = _http.post(url, json=data, timeout=RAW_TX_TIMEOUT)
     if response.status_code != 200:
         raise RBXException
 
@@ -214,7 +221,7 @@ def tx_verify(transaction: dict) -> Tuple[dict, int]:
 
     data = _fix_decimals(transaction)
 
-    response = _http.post(url, json=data)
+    response = _http.post(url, json=data, timeout=RAW_TX_SEND_TIMEOUT)
     if response.status_code != 200:
         raise RBXException
 
@@ -229,7 +236,7 @@ def tx_send(transaction: dict) -> Tuple[dict, int]:
 
     data = _fix_decimals(transaction)
 
-    response = _http.post(url, json=data)
+    response = _http.post(url, json=data, timeout=RAW_TX_SEND_TIMEOUT)
 
     if response.status_code != 200:
         raise RBXException
@@ -509,7 +516,7 @@ def beacon_upload_request(
 
 def get_timestamp() -> Optional[int]:
     url = join_url(BASE_URL, "/txapi/txV1/GetTimestamp")
-    response = _http.get(url)
+    response = _http.get(url, timeout=RAW_TX_TIMEOUT)
 
     if response.status_code != 200:
         raise RBXException
@@ -524,7 +531,7 @@ def get_timestamp() -> Optional[int]:
 def get_address_nonce(address: str) -> Optional[Decimal]:
     logger = logging.getLogger(__name__)
     url = join_url(BASE_URL, f"/txapi/txV1/GetAddressNonce/{address}")
-    response = _http.get(url)
+    response = _http.get(url, timeout=RAW_TX_TIMEOUT)
 
     logger.debug(f"Address nonce response: {response.json()}")
 
