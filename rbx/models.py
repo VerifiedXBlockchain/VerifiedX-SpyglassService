@@ -385,12 +385,6 @@ class Transaction(models.Model):
         verbose_name = _("Transaction")
         verbose_name_plural = _("Transactions")
         ordering = ["-date_crafted"]
-        # The cursor activity route (/transaction/activity/) walks one
-        # address's rows by (-height, -hash) and stops after a page.
-        indexes = [
-            models.Index(fields=["to_address", "height", "hash"], name="rbx_tx_to_height_hash_idx"),
-            models.Index(fields=["from_address", "height", "hash"], name="rbx_tx_from_height_hash_idx"),
-        ]
 
 
 class Nft(models.Model):

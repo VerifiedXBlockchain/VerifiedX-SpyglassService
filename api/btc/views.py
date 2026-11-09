@@ -6,7 +6,7 @@ from decimal import Decimal
 from datetime import datetime
 from django.utils import timezone
 from django.core.cache import cache
-from django.db import connection
+from django.db import close_old_connections
 from django.db.models import Case, F, Max, Q, Value, When
 from rest_framework.response import Response
 from rest_framework.generics import GenericAPIView, RetrieveAPIView
@@ -16,11 +16,8 @@ from api.btc.serializers import (
     VbtcTokenSerializer,
     VbtcV2TokenSerializer,
     VbtcV2TokenTransferSerializer,
-    VbtcV2WalletTokenSerializer,
     VbtcV2WithdrawalRequestSerializer,
-    vbtc_v2_token_serializer_class,
 )
-from api.pagination import StandardPagination
 from rbx.client import (
     get_default_vbtc_base64_image_data,
     get_vbtc_compile_data,
@@ -204,17 +201,7 @@ class VbtcV2ListAllView(GenericAPIView):
 
     def get(self, request, *args, **kwargs):
         tokens = VbtcV2Token.objects.select_related("nft__mint_transaction").order_by("-created_at")
-        serializer_class = vbtc_v2_token_serializer_class(request)
-        # Unpaginated unless the caller opts in with `view=wallet` and sends
-        # `page` or `limit`; then the standard page envelope (count, page,
-        # num_pages, results). The explorer app already sends `page` without
-        # `view` and reads every vault from the one response.
-        wants_page = "page" in request.query_params or "limit" in request.query_params
-        if serializer_class is VbtcV2WalletTokenSerializer and wants_page:
-            paginator = StandardPagination()
-            page = paginator.paginate_queryset(tokens, request, view=self)
-            return paginator.get_paginated_response(serializer_class(page, many=True).data)
-        results = serializer_class(tokens, many=True).data
+        results = VbtcV2TokenSerializer(tokens, many=True).data
         return Response({"results": results}, status=200)
 
 
@@ -242,7 +229,7 @@ class VbtcV2ListView(GenericAPIView):
             sc_identifier__in=sc_identifiers
         ).select_related("nft__mint_transaction").order_by("-created_at")
 
-        results = vbtc_v2_token_serializer_class(request)(tokens, many=True).data
+        results = VbtcV2TokenSerializer(tokens, many=True).data
         return Response({"results": results}, status=200)
 
 
@@ -266,9 +253,6 @@ class VbtcV2DetailView(RetrieveAPIView):
             refresh_watched_backing(token)
             token.refresh_from_db()
         return Response(self.get_serializer(token).data)
-
-    def get_serializer_class(self):
-        return vbtc_v2_token_serializer_class(self.request)
 
 
 class VbtcV2HeightsView(GenericAPIView):
@@ -309,15 +293,6 @@ class VbtcV2WithdrawalsView(GenericAPIView):
         return Response({"results": results}, status=200)
 
 
-def _node_message(result):
-    """The reason the node gave for refusing, or None when it did not answer
-    (a timeout, a refused connection, a body that is not JSON), so a wallet
-    can show the node's own words and tell a refusal from an outage."""
-    if result.get("Unreachable"):
-        return None
-    return result.get("Message") or None
-
-
 def _vbtc_v2_proxy(cli_func, payload, error_msg="Operation failed"):
     """Shared proxy helper — calls CLI, normalizes response."""
     result = cli_func(payload) if payload is not None else cli_func()
@@ -325,12 +300,7 @@ def _vbtc_v2_proxy(cli_func, payload, error_msg="Operation failed"):
     if success:
         return Response({"success": True, **{k: v for k, v in result.items() if k != "Success"}})
     return Response(
-        {
-            "success": False,
-            "message": result.get("Message", error_msg),
-            "raw": result,
-            "node_message": _node_message(result),
-        },
+        {"success": False, "message": result.get("Message", error_msg), "raw": result},
         status=500,
     )
 
@@ -372,11 +342,7 @@ class VbtcV2CeremonyPrepareView(GenericAPIView):
             })
 
         return Response(
-            {
-                "success": False,
-                "message": result.get("Message", "Ceremony preparation failed"),
-                "node_message": _node_message(result),
-            },
+            {"success": False, "message": result.get("Message", "Ceremony preparation failed")},
             status=500,
         )
 
@@ -822,9 +788,8 @@ class VbtcV2WithdrawCompleteExecuteView(GenericAPIView):
                 )
             finally:
                 # This thread opens its own connection when the withdrawal is
-                # marked; nothing else will ever close it. Closed outright:
-                # close_old_connections() keeps one younger than CONN_MAX_AGE.
-                connection.close()
+                # marked; nothing else will ever close it.
+                close_old_connections()
 
         threading.Thread(target=_run_frost, daemon=True).start()
 

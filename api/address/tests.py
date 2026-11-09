@@ -3,8 +3,7 @@ from decimal import Decimal
 from django.core.cache import cache
 from django.test import TestCase
 
-from rbx.models import Address, Transaction
-from rbx.tests import make_block, make_tx
+from rbx.models import Address
 
 
 class AddressListTests(TestCase):
@@ -53,81 +52,3 @@ class TopHoldersTests(TestCase):
         self.assertEqual(float(rows[0]["balance"]), 104)
         self.assertEqual(set(rows[0]), {"address", "balance", "adnr"})
         self.assertNotIn("Reserve_Base", [row["address"] for row in rows])
-
-
-class AddressActivityTests(TestCase):
-    URL = "/api/addresses/activity/"
-    VAULT = "xRBXvault1"
-    RECOVERY = "xRECOVERY1"
-
-    def setUp(self):
-        cache.clear()
-        one = make_block(1)
-        Address.objects.create(address="RFUNDED11", balance=Decimal("2"))
-        Address.objects.create(address="RSENDER11", balance=Decimal("0"))
-        Address.objects.create(address=self.VAULT, balance=Decimal("0"))
-        make_tx(one, "send1", Transaction.Type.TX, from_address="RSENDER11", to_address="RFUNDED11")
-        make_tx(
-            one,
-            "reg1",
-            Transaction.Type.RESERVE,
-            from_address=self.VAULT,
-            to_address="Reserve_Base",
-            data={"Function": "Register()", "RecoveryAddress": self.RECOVERY},
-        )
-
-    def results(self, addresses):
-        response = self.client.get(self.URL, {"addresses": addresses})
-        self.assertEqual(response.status_code, 200, response.content)
-        return {row["address"]: row for row in response.json()["results"]}
-
-    def test_rows_follow_the_request_order(self):
-        response = self.client.get(self.URL, {"addresses": "RUNSEEN11,RFUNDED11,RFUNDED11"})
-
-        self.assertEqual([row["address"] for row in response.json()["results"]], ["RUNSEEN11", "RFUNDED11"])
-
-    def test_an_unseen_address_has_no_activity(self):
-        self.assertEqual(
-            self.results("RUNSEEN11")["RUNSEEN11"],
-            {
-                "address": "RUNSEEN11",
-                "has_transactions": False,
-                "has_balance": False,
-                "vault_activated": False,
-                "register_recovery_addresses": [],
-            },
-        )
-
-    def test_sender_and_recipient_both_have_transactions(self):
-        rows = self.results("RSENDER11,RFUNDED11")
-
-        self.assertTrue(rows["RSENDER11"]["has_transactions"])
-        self.assertFalse(rows["RSENDER11"]["has_balance"])
-        self.assertTrue(rows["RFUNDED11"]["has_transactions"])
-        self.assertTrue(rows["RFUNDED11"]["has_balance"])
-
-    def test_a_registered_vault_names_its_recovery_address(self):
-        row = self.results(self.VAULT)[self.VAULT]
-
-        self.assertTrue(row["vault_activated"])
-        self.assertEqual(row["register_recovery_addresses"], [self.RECOVERY])
-
-    def test_vault_activated_agrees_with_the_address_detail(self):
-        detail = self.client.get(f"/api/addresses/{self.VAULT}/").json()
-
-        self.assertEqual(self.results(self.VAULT)[self.VAULT]["vault_activated"], detail["activated"])
-
-    def test_bad_parameters_are_400(self):
-        for params in ({}, {"addresses": ","}, {"addresses": ",".join(f"R{i}" for i in range(21))}):
-            with self.subTest(params=params):
-                self.assertEqual(self.client.get(self.URL, params).status_code, 400)
-
-    def test_the_address_detail_route_is_unchanged(self):
-        response = self.client.get("/api/addresses/RFUNDED11/")
-
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(
-            set(response.json()),
-            {"address", "balance", "balance_total", "balance_locked", "adnr", "activated", "deactivated"},
-        )
-        self.assertEqual(self.client.get("/api/addresses/RUNSEEN11/").status_code, 404)

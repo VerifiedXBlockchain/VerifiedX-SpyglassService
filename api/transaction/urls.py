@@ -5,7 +5,6 @@ from api.transaction.views import (
     TransactionQueryListView,
     TransactionBlockListView,
     TransactionMultiAddressListView,
-    TransactionActivityView,
 )
 
 urlpatterns = [
@@ -13,7 +12,5 @@ urlpatterns = [
     path("address/<str:address>/", TransactionQueryListView.as_view()),
     path("addresses/<str:addresses>/", TransactionMultiAddressListView.as_view()),
     path("block/<int:height>/", TransactionBlockListView.as_view()),
-    # Before <str:hash>/, so "activity" is never read as a hash.
-    path("activity/", TransactionActivityView.as_view()),
     path("<str:hash>/", TransactionDetailView.as_view()),
 ]

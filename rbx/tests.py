@@ -1948,7 +1948,7 @@ class WithdrawCompleteExecuteMultiInputTests(TestCase):
         return VbtcV2WithdrawCompleteStatusView.as_view()(request, job_id=job_id)
 
     def execute_capturing_payload(self, data, result):
-        # The job runs inline (no real thread), so connection.close() must
+        # The job runs inline (no real thread), so close_old_connections must
         # be a no-op — on the test's own thread it would close the connection
         # the test transaction lives on. Every result here is a failure, so
         # the job always logs one ERROR line.
@@ -1960,7 +1960,7 @@ class WithdrawCompleteExecuteMultiInputTests(TestCase):
 
         with self.assertLogs(level="ERROR"):
             with patch("api.btc.views.threading.Thread", _InlineThread):
-                with patch("api.btc.views.connection"):
+                with patch("api.btc.views.close_old_connections"):
                     with patch("api.btc.views.execute_complete_withdrawal", fake_execute):
                         response = self.post(data)
 
