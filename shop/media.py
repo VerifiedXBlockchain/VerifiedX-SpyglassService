@@ -7,10 +7,10 @@ import shutil
 import os
 import paramiko
 from urllib.parse import urlparse
-import requests
 import os
 import string
 from stat import S_ISDIR, S_ISREG
+from project.utils.safe_fetch import FetchError, UnsafeUrl, check_url, fetch_to_file
 from project.utils.string import get_random_string
 from project.celery import app
 from rbx.exceptions import RBXException
@@ -223,10 +223,13 @@ def scp_up_file(local_path: str, remote_path: str):
 
 
 def scp_up_url(url: str):
+    """Fetch `url` and put it on the shop wallet; raises FetchError when it is refused or fails."""
 
-    response = requests.get(url)
+    check_url(url)
     url_parts = url.split("/")
     filename = url_parts[len(url_parts) - 1]
+    if not filename:
+        raise UnsafeUrl("invalid_url", f"URL {url!r} does not end in a file name.")
 
     temp_folder_name = get_random_string(string.ascii_letters + string.digits, 16)
     temp_folder_path = f"{settings.RBX_TEMP_PATH}/{temp_folder_name}"
@@ -236,8 +239,12 @@ def scp_up_url(url: str):
 
     temp_path = f"{temp_folder_path}/{filename}"
 
-    with open(temp_path, "wb") as file:
-        file.write(response.content)
+    try:
+        with open(temp_path, "wb") as file:
+            fetch_to_file(url, file)
+    except FetchError:
+        shutil.rmtree(temp_folder_path, ignore_errors=True)
+        raise
 
     remote_path = f"{settings.RBX_WALLET_TEMP_PATH}/{filename}"  # TODO generate new folder on remote with random string
     scp_up_file(temp_path, remote_path)

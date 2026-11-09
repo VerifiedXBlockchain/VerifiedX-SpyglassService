@@ -1,3 +1,4 @@
+import requests
 from rest_framework.generics import GenericAPIView
 from rest_framework.response import Response
 from rest_framework import status
@@ -5,7 +6,8 @@ from typing import Tuple
 
 import rbx.client as client
 from api.raw.serializers import RawTransactionSerializer
-from rbx.exceptions import UnsafeAssetFileName
+from project.utils.safe_fetch import FetchFailed, UnsafeUrl
+from rbx.exceptions import RBXException, UnsafeAssetFileName
 from shop.tasks import remote_nft_media_to_urls
 
 
@@ -93,6 +95,16 @@ class SmartContractDataView(GenericAPIView):
                 {"error": str(e), "file_name": e.file_name},
                 status=status.HTTP_400_BAD_REQUEST,
             )
+        except UnsafeUrl as e:
+            return Response(
+                {"error": str(e), "reason": e.reason},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        except FetchFailed as e:
+            return Response(
+                {"error": str(e), "reason": e.reason},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
 
         if not data:
             return Response({}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
@@ -167,18 +179,28 @@ class BeaconAssetsView(GenericAPIView):
 
         sc_id = kwargs["id"]
 
-        success = client.get_beacon_assets(
-            id=sc_id,
-            locators=kwargs["locators"],
-            address=kwargs["address"],
-            signature=kwargs["signature"],
-        )
+        try:
+            success, answer = client.get_beacon_assets(
+                id=sc_id,
+                locators=kwargs["locators"],
+                address=kwargs["address"],
+                signature=kwargs["signature"],
+            )
+        except (RBXException, requests.RequestException) as e:
+            # Not str(e): a requests error names the shop node's address.
+            return Response(
+                {"success": False, "error": f"The node did not answer ({type(e).__name__})."},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
 
         if success:
             remote_nft_media_to_urls.apply_async(args=[sc_id], countdown=30)
             return Response({"success": True}, status=status.HTTP_200_OK)
 
-        return Response({}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        return Response(
+            {"success": False, "error": answer[:500] or "The node gave no answer."},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
 
 
 class WithdrawVbtcView(GenericAPIView):
