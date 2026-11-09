@@ -462,7 +462,12 @@ def get_locators(id: str, *args) -> Tuple[dict, int]:
 
 def get_beacon_assets(
     id: str, locators: str, address: str, signature: str, *args
-) -> bool:
+) -> Tuple[bool, str]:
+    """Ask the shop node to pull an NFT's assets from its beacon.
+
+    Returns whether the node answered "Success", and the node's answer (its
+    reason when it is anything else).
+    """
     logger = logging.getLogger(__name__)
     url = join_url(
         SHOP_BASE_URL,
@@ -477,7 +482,9 @@ def get_beacon_assets(
     if response.status_code != 200:
         raise RBXException
 
-    return response.text == "Success"
+    if response.text != "Success":
+        logger.warning(f"Beacon assets for {id} refused by the node: {response.text[:500]}")
+    return response.text == "Success", response.text
 
 
 def beacon_upload_request(
