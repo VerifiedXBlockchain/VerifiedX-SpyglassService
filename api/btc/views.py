@@ -16,6 +16,7 @@ from api.btc.serializers import (
     VbtcTokenSerializer,
     VbtcV2TokenSerializer,
     VbtcV2TokenTransferSerializer,
+    VbtcV2WalletTokenSerializer,
     VbtcV2WithdrawalRequestSerializer,
     vbtc_v2_token_serializer_class,
 )
@@ -204,9 +205,12 @@ class VbtcV2ListAllView(GenericAPIView):
     def get(self, request, *args, **kwargs):
         tokens = VbtcV2Token.objects.select_related("nft__mint_transaction").order_by("-created_at")
         serializer_class = vbtc_v2_token_serializer_class(request)
-        # Unpaginated unless the caller sends `page` or `limit`; then the
-        # standard page envelope (count, page, num_pages, results).
-        if "page" in request.query_params or "limit" in request.query_params:
+        # Unpaginated unless the caller opts in with `view=wallet` and sends
+        # `page` or `limit`; then the standard page envelope (count, page,
+        # num_pages, results). The explorer app already sends `page` without
+        # `view` and reads every vault from the one response.
+        wants_page = "page" in request.query_params or "limit" in request.query_params
+        if serializer_class is VbtcV2WalletTokenSerializer and wants_page:
             paginator = StandardPagination()
             page = paginator.paginate_queryset(tokens, request, view=self)
             return paginator.get_paginated_response(serializer_class(page, many=True).data)

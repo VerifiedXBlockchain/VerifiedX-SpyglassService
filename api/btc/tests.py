@@ -399,8 +399,15 @@ class VbtcV2WalletViewTests(TestCase):
         self.assertEqual(set(body), {"results"})
         self.assertEqual(len(body["results"]), 2)
 
+    def test_list_all_ignores_page_and_limit_without_the_wallet_view(self):
+        # The explorer app sends ?page= today and reads every vault from it.
+        full = self.client.get("/api/btc/vbtc-v2/").json()
+        for query in ("?page=1", "?page=2", "?limit=1", "?page=2&limit=1", "?view=explorer&limit=1"):
+            with self.subTest(query=query):
+                self.assertEqual(self.client.get(f"/api/btc/vbtc-v2/{query}").json(), full)
+
     def test_list_all_pages_when_asked(self):
-        first = self.client.get("/api/btc/vbtc-v2/?limit=1").json()
+        first = self.client.get("/api/btc/vbtc-v2/?limit=1&view=wallet").json()
         second = self.client.get("/api/btc/vbtc-v2/?limit=1&page=2&view=wallet").json()
 
         self.assertEqual(set(first), {"count", "page", "num_pages", "results"})
