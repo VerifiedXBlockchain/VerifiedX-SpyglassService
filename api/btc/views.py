@@ -17,7 +17,9 @@ from api.btc.serializers import (
     VbtcV2TokenSerializer,
     VbtcV2TokenTransferSerializer,
     VbtcV2WithdrawalRequestSerializer,
+    vbtc_v2_token_serializer_class,
 )
+from api.pagination import StandardPagination
 from rbx.client import (
     get_default_vbtc_base64_image_data,
     get_vbtc_compile_data,
@@ -201,7 +203,14 @@ class VbtcV2ListAllView(GenericAPIView):
 
     def get(self, request, *args, **kwargs):
         tokens = VbtcV2Token.objects.select_related("nft__mint_transaction").order_by("-created_at")
-        results = VbtcV2TokenSerializer(tokens, many=True).data
+        serializer_class = vbtc_v2_token_serializer_class(request)
+        # Unpaginated unless the caller sends `page` or `limit`; then the
+        # standard page envelope (count, page, num_pages, results).
+        if "page" in request.query_params or "limit" in request.query_params:
+            paginator = StandardPagination()
+            page = paginator.paginate_queryset(tokens, request, view=self)
+            return paginator.get_paginated_response(serializer_class(page, many=True).data)
+        results = serializer_class(tokens, many=True).data
         return Response({"results": results}, status=200)
 
 
@@ -229,7 +238,7 @@ class VbtcV2ListView(GenericAPIView):
             sc_identifier__in=sc_identifiers
         ).select_related("nft__mint_transaction").order_by("-created_at")
 
-        results = VbtcV2TokenSerializer(tokens, many=True).data
+        results = vbtc_v2_token_serializer_class(request)(tokens, many=True).data
         return Response({"results": results}, status=200)
 
 
@@ -253,6 +262,9 @@ class VbtcV2DetailView(RetrieveAPIView):
             refresh_watched_backing(token)
             token.refresh_from_db()
         return Response(self.get_serializer(token).data)
+
+    def get_serializer_class(self):
+        return vbtc_v2_token_serializer_class(self.request)
 
 
 class VbtcV2HeightsView(GenericAPIView):

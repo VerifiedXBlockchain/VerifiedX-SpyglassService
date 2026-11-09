@@ -330,3 +330,84 @@ class VbtcV2CeremonyStatusViewTests(TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["status"], "Completed")
+
+
+class VbtcV2WalletViewTests(TestCase):
+    FULL_NFT_KEYS = {
+        "identifier",
+        "name",
+        "description",
+        "minter_address",
+        "owner_address",
+        "minter_name",
+        "smart_contract_data",
+        "primary_asset_name",
+        "primary_asset_size",
+        "minted_at",
+        "mint_transaction",
+        "burn_transaction",
+        "is_burned",
+        "data",
+        "asset_urls",
+        "is_listed",
+    }
+    WALLET_NFT_KEYS = {"identifier", "name", "minted_at", "mint_transaction"}
+
+    def setUp(self):
+        make_token(owner="xOWNER", sc_identifier="sc:1")
+        make_token(owner="xOWNER", sc_identifier="sc:2")
+
+    def _routes(self):
+        return [
+            ("/api/btc/vbtc-v2/", lambda body: body["results"]),
+            ("/api/btc/vbtc-v2/xOWNER/", lambda body: body["results"]),
+            ("/api/btc/vbtc-v2/detail/sc:1/", lambda body: [body]),
+        ]
+
+    def test_without_the_param_every_route_keeps_the_full_nft(self):
+        for url, rows in self._routes():
+            with self.subTest(url=url):
+                body = self.client.get(url).json()
+                for row in rows(body):
+                    self.assertEqual(set(row["nft"]), self.FULL_NFT_KEYS)
+
+    def test_an_unknown_view_value_keeps_the_full_shape(self):
+        full = self.client.get("/api/btc/vbtc-v2/xOWNER/").json()
+        other = self.client.get("/api/btc/vbtc-v2/xOWNER/?view=explorer").json()
+
+        self.assertEqual(other, full)
+
+    def test_wallet_view_slims_only_the_nft(self):
+        for url, rows in self._routes():
+            with self.subTest(url=url):
+                full_rows = rows(self.client.get(url).json())
+                wallet_rows = rows(self.client.get(f"{url}?view=wallet").json())
+                self.assertEqual(len(wallet_rows), len(full_rows))
+                for full, wallet in zip(full_rows, wallet_rows):
+                    self.assertEqual(set(wallet["nft"]), self.WALLET_NFT_KEYS)
+                    self.assertEqual(
+                        wallet["nft"], {key: full["nft"][key] for key in self.WALLET_NFT_KEYS}
+                    )
+                    self.assertEqual(
+                        {k: v for k, v in wallet.items() if k != "nft"},
+                        {k: v for k, v in full.items() if k != "nft"},
+                    )
+
+    def test_list_all_is_unpaginated_without_page_or_limit(self):
+        body = self.client.get("/api/btc/vbtc-v2/").json()
+
+        self.assertEqual(set(body), {"results"})
+        self.assertEqual(len(body["results"]), 2)
+
+    def test_list_all_pages_when_asked(self):
+        first = self.client.get("/api/btc/vbtc-v2/?limit=1").json()
+        second = self.client.get("/api/btc/vbtc-v2/?limit=1&page=2&view=wallet").json()
+
+        self.assertEqual(set(first), {"count", "page", "num_pages", "results"})
+        self.assertEqual((first["count"], first["page"], first["num_pages"]), (2, 1, 2))
+        self.assertEqual(len(first["results"]), 1)
+        self.assertEqual(second["page"], 2)
+        self.assertEqual(set(second["results"][0]["nft"]), self.WALLET_NFT_KEYS)
+        self.assertNotEqual(
+            first["results"][0]["sc_identifier"], second["results"][0]["sc_identifier"]
+        )
