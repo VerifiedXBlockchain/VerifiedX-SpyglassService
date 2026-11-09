@@ -6,7 +6,7 @@ from decimal import Decimal
 from datetime import datetime
 from django.utils import timezone
 from django.core.cache import cache
-from django.db import close_old_connections
+from django.db import connection
 from django.db.models import Case, F, Max, Q, Value, When
 from rest_framework.response import Response
 from rest_framework.generics import GenericAPIView, RetrieveAPIView
@@ -800,8 +800,9 @@ class VbtcV2WithdrawCompleteExecuteView(GenericAPIView):
                 )
             finally:
                 # This thread opens its own connection when the withdrawal is
-                # marked; nothing else will ever close it.
-                close_old_connections()
+                # marked; nothing else will ever close it. Closed outright:
+                # close_old_connections() keeps one younger than CONN_MAX_AGE.
+                connection.close()
 
         threading.Thread(target=_run_frost, daemon=True).start()
 
