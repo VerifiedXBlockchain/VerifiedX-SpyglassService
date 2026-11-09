@@ -103,10 +103,27 @@ class TransactionActivityTests(TestCase):
             {"addresses": "xMAIN", "limit": "ten"},
             {"addresses": "xMAIN", "before": "two:b1"},
             {"addresses": "xMAIN", "before": "2"},
-            {"addresses": ",".join(f"x{i}" for i in range(51))},
+            {"addresses": ",".join(f"x{i}" for i in range(21))},
         ):
             with self.subTest(params=params):
                 self.assertEqual(self.client.get(self.URL, params).status_code, 400)
+
+    def test_a_send_to_oneself_and_a_repeated_address_are_listed_once(self):
+        make_tx(make_block(4), "d1", 0, from_address="xVAULT", to_address="xVAULT")
+
+        body = self.page(addresses="xVAULT,xVAULT", limit=2)
+
+        self.assertEqual([row["hash"] for row in body["results"]], ["d1", "c1"])
+        self.assertEqual(body["next_cursor"], "3:c1")
+
+    def test_a_busy_address_does_not_crowd_out_the_other(self):
+        for height in range(10, 16):
+            make_tx(make_block(height), f"busy{height}", 0, from_address="xOTHER", to_address="xMAIN")
+        make_tx(make_block(20), "vault-newest", 0, from_address="xVAULT", to_address="xOTHER")
+
+        body = self.page(addresses="xMAIN,xVAULT", limit=3)
+
+        self.assertEqual([row["hash"] for row in body["results"]], ["vault-newest", "busy15", "busy14"])
 
     def test_the_existing_address_list_keeps_its_envelope(self):
         body = self.client.get("/api/transaction/address/xMAIN/").json()

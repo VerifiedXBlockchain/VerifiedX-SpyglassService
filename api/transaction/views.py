@@ -108,10 +108,10 @@ class TransactionActivityView(GenericAPIView):
     pagination_class = None
     DEFAULT_LIMIT = 30
     MAX_LIMIT = 100
-    MAX_ADDRESSES = 50
+    MAX_ADDRESSES = 20
 
     def get(self, request, *args, **kwargs):
-        addresses = [a for a in request.query_params.get("addresses", "").split(",") if a]
+        addresses = list(dict.fromkeys(a for a in request.query_params.get("addresses", "").split(",") if a))
         if not addresses:
             return Response({"error": "addresses is required"}, status=status.HTTP_400_BAD_REQUEST)
         if len(addresses) > self.MAX_ADDRESSES:
@@ -141,17 +141,19 @@ class TransactionActivityView(GenericAPIView):
                 )
             cursor = Q(height__lte=height) & (Q(height__lt=height) | Q(height=height, hash__lt=tx_hash))
 
-        # Each side reads one address index and stops after limit + 1 rows;
-        # the union drops a row that is on both (a send between two of the
-        # addresses).
+        # One side per address and direction, each a range of the
+        # (address, height, hash) index that stops after limit + 1 rows; the
+        # union drops a row that is on two sides (a send between two of the
+        # addresses, or to oneself).
         order = ("-height", "-hash")
         sides = [
-            Transaction.objects.filter(cursor, **{f"{field}__in": addresses})
+            Transaction.objects.filter(cursor, **{field: address})
             .order_by(*order)
             .values_list("hash", flat=True)[: limit + 1]
+            for address in addresses
             for field in ("to_address", "from_address")
         ]
-        hashes = list(sides[0].union(sides[1]))
+        hashes = list(sides[0].union(*sides[1:]))
         rows = list(Transaction.objects.filter(hash__in=hashes).order_by(*order)[: limit + 1])
 
         next_cursor = None
