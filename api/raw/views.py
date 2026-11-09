@@ -5,6 +5,7 @@ from typing import Tuple
 
 import rbx.client as client
 from api.raw.serializers import RawTransactionSerializer
+from project.utils.safe_fetch import FetchFailed, UnsafeUrl
 from rbx.exceptions import UnsafeAssetFileName
 from shop.tasks import remote_nft_media_to_urls
 
@@ -92,6 +93,16 @@ class SmartContractDataView(GenericAPIView):
             return Response(
                 {"error": str(e), "file_name": e.file_name},
                 status=status.HTTP_400_BAD_REQUEST,
+            )
+        except UnsafeUrl as e:
+            return Response(
+                {"error": str(e), "reason": e.reason},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        except FetchFailed as e:
+            return Response(
+                {"error": str(e), "reason": e.reason},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
 
         if not data:
