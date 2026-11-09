@@ -33,33 +33,35 @@ def affected_addresses(height: int) -> list:
         for row in rows:
             addresses.update(row)
 
-    add(Transaction.objects.filter(height=height).values_list("from_address", "to_address"))
-    add(
-        VbtcV2TokenTransfer.objects.filter(transaction__height=height).values_list(
-            "from_address", "to_address"
-        )
-    )
+    # Through the block foreign key (Block's primary key is its height), which
+    # is indexed; Transaction.height is not. The related rows are then read
+    # through their indexed transaction foreign keys.
+    rows = list(Transaction.objects.filter(block_id=height).values_list("hash", "from_address", "to_address"))
+    hashes = [tx_hash for tx_hash, _, _ in rows]
+    add((from_address, to_address) for _, from_address, to_address in rows)
+    if not hashes:
+        return sorted(addresses - {None, ""})
+
+    add(VbtcV2TokenTransfer.objects.filter(transaction_id__in=hashes).values_list("from_address", "to_address"))
     add(
         VbtcV2WithdrawalRequest.objects.filter(
-            Q(request_transaction__height=height)
-            | Q(completion_transaction__height=height)
-            | Q(cancel_transaction__height=height)
+            Q(request_transaction_id__in=hashes)
+            | Q(completion_transaction_id__in=hashes)
+            | Q(cancel_transaction_id__in=hashes)
         ).values_list("requestor_address")
     )
     add(
         VbtcV2BridgeLock.objects.filter(
-            Q(lock_transaction__height=height) | Q(unlock_transaction__height=height)
+            Q(lock_transaction_id__in=hashes) | Q(unlock_transaction_id__in=hashes)
         ).values_list("owner_address")
     )
-    add(VbtcV2BridgeExit.objects.filter(exit_transaction__height=height).values_list("owner_address"))
+    add(VbtcV2BridgeExit.objects.filter(exit_transaction_id__in=hashes).values_list("owner_address"))
     add(
-        FungibleTokenTx.objects.filter(transaction__height=height).values_list(
+        FungibleTokenTx.objects.filter(transaction_id__in=hashes).values_list(
             "sending_address", "receiving_address"
         )
     )
-    add(Callback.objects.filter(transaction__height=height).values_list("from_address", "to_address"))
-    add(Recovery.objects.filter(transaction__height=height).values_list("original_address", "new_address"))
+    add(Callback.objects.filter(transaction_id__in=hashes).values_list("from_address", "to_address"))
+    add(Recovery.objects.filter(transaction_id__in=hashes).values_list("original_address", "new_address"))
 
-    addresses.discard(None)
-    addresses.discard("")
-    return sorted(addresses)
+    return sorted(addresses - {None, ""})

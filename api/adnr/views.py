@@ -67,16 +67,19 @@ class AdnrAvailableView(GenericAPIView):
     """GET /adnr/available/<domain>/ -> {domain, available, indexed_height}.
 
     Not cached. `available` is false when any name that is not deleted
-    matches, ignoring case; the answer is as of `indexed_height`, so a name
-    registered in a block not yet indexed still reads as available. A
+    matches, ignoring case; the answer is as of `indexed_height` or later,
+    so a name registered in a block not yet indexed still reads as
+    available. A
     failure is an error status, never "available": a client must treat
     only a 200 with `available: true` as free.
     """
 
     def get(self, request, *args, **kwargs):
         domain = kwargs["domain"]
-        taken = ALL_ADNR_QUERYSET.filter(domain__iexact=domain).exists()
+        # The height first: a block that commits between the two reads can
+        # only make `available` newer than `indexed_height`, never older.
         indexed_height = Block.objects.aggregate(height=Max("height"))["height"]
+        taken = ALL_ADNR_QUERYSET.filter(domain__iexact=domain).exists()
         return Response({"domain": domain, "available": not taken, "indexed_height": indexed_height})
 
 
