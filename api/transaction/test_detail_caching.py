@@ -44,6 +44,43 @@ class TransactionDetailCachingTests(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertFalse(response.has_header("Cache-Control"))
 
+    def assert_no_lifetime(self, tx_hash):
+        response = self.client.get(f"/api/transaction/{tx_hash}/")
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn("max-age", response.get("Cache-Control", ""))
+        self.assertIn("ETag", response)  # revalidation still works
+
+    def test_a_mint_whose_nft_is_not_attached_yet_gets_no_lifetime(self):
+        # retry_unindexed_mints attaches the NFT later.
+        make_tx(self.block, "mint-pending", Transaction.Type.NFT_MINT, from_address="RA", to_address="RA")
+        self.assert_no_lifetime("mint-pending")
+
+    def test_a_pending_reserve_vbtc_send_gets_no_lifetime(self):
+        # redirect_reserve_transfer moves its unlock time on a recovery.
+        send = make_tx(self.block, "vbtc-send", Transaction.Type.VBTC_V2_TRANSFER, from_address="xRBXv", to_address="RB")
+        send.unlock_time = timezone.now() + timezone.timedelta(days=1)
+        send.save()
+        self.assert_no_lifetime("vbtc-send")
+
+    def test_reserve_rows_and_locked_sends_get_no_lifetime(self):
+        locked = make_tx(self.block, "locked", Transaction.Type.TX, from_address="xRBXv", to_address="RB")
+        locked.unlock_time = timezone.now() + timezone.timedelta(days=1)
+        locked.save()
+        make_tx(self.block, "to-vault", Transaction.Type.TX, from_address="RA", to_address="xRBXv")
+        make_tx(self.block, "from-vault", Transaction.Type.TX, from_address="xRBXv", to_address="RB")
+        make_tx(self.block, "reserve", Transaction.Type.RESERVE, from_address="xRBXv", to_address="Reserve_Base",
+                data={"Function": "Register()", "RecoveryAddress": "RA"})
+        for tx_hash in ("locked", "to-vault", "from-vault", "reserve"):
+            with self.subTest(tx_hash=tx_hash):
+                self.assert_no_lifetime(tx_hash)
+
+    def test_other_types_get_no_lifetime(self):
+        for tx_type in (Transaction.Type.NFT_TX, Transaction.Type.FTKN_TX, Transaction.Type.VBTC_V2_TRANSFER,
+                        Transaction.Type.ADDRESS, Transaction.Type.VFX_UNSHIELD):
+            with self.subTest(tx_type=tx_type):
+                make_tx(self.block, f"type-{tx_type}", tx_type, from_address="RA", to_address="RB")
+                self.assert_no_lifetime(f"type-{tx_type}")
+
     def test_a_404_is_never_cached(self):
         response = self.client.get("/api/transaction/pending/")
         self.assertEqual(response.status_code, 404)

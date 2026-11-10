@@ -54,17 +54,12 @@ class TransactionBlockListView(ListModelMixin, TransactionView):
         return self.list(request, *args, **kwargs)
 
 
-def _holds_an_nft(row):
-    return row is not None and row.get("nft") is not None
-
-
 # @method_decorator(cache_request(settings.CACHE_TIMEOUT_LONG), name="get")
 class TransactionDetailView(RetrieveModelMixin, TransactionView):
-    """A transaction is served only once its block is indexed, and its row
-    does not change after that, so a found one may be cached by clients for
-    TRANSACTION_DETAIL_MAX_AGE. Not when the body nests an NFT: the NFT's
-    owner, listing and assets move. A 404 (not indexed yet, or never) is
-    never cached."""
+    """A found transaction whose body cannot change after indexing may be
+    cached by clients for TRANSACTION_DETAIL_MAX_AGE; every other body gets
+    no lifetime (ETag revalidation still applies), and a 404 (not indexed
+    yet, or never) is never cached. See _immutable for the rule."""
 
     lookup_field = "hash"
 
@@ -83,10 +78,22 @@ class TransactionDetailView(RetrieveModelMixin, TransactionView):
 
     @staticmethod
     def _immutable(data):
-        if _holds_an_nft(data) or _holds_an_nft(data.get("callback_details")):
-            return False
-        recovery = data.get("recovery_details") or {}
-        return not any(_holds_an_nft(row) for row in recovery.get("outstanding_transactions") or [])
+        """Only a plain VFX transfer (type TX) with no unlock time, not to or
+        from a reserve (xRBX) address, nesting nothing. Every later writer of
+        a serialized field skips it: an NFT is attached only to mint types,
+        and later too (retry_unindexed_mints); unlock times are moved only on
+        reserve sends (redirect_reserve_transfer); callback and recovery
+        details exist only on RESERVE rows; the voided and refused flags are
+        not serialized."""
+        return (
+            data.get("type") == Transaction.Type.TX
+            and data.get("unlock_time") is None
+            and data.get("nft") is None
+            and data.get("callback_details") is None
+            and data.get("recovery_details") is None
+            and not str(data.get("to_address") or "").startswith("xRBX")
+            and not str(data.get("from_address") or "").startswith("xRBX")
+        )
 
 
 @method_decorator(cache_request(settings.CACHE_TIMEOUT_SHORT), name="get")
