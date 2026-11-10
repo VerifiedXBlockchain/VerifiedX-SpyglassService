@@ -21,6 +21,7 @@ from api.btc.serializers import (
     vbtc_v2_token_serializer_class,
 )
 from api.pagination import StandardPagination
+from api.prefetch import prefetch_nft_listings
 from rbx.client import (
     get_default_vbtc_base64_image_data,
     get_vbtc_compile_data,
@@ -225,24 +226,27 @@ class VbtcV2ListView(GenericAPIView):
     def get(self, request, *args, **kwargs):
         vfx_address = self.kwargs["vfx_address"]
 
-        sc_identifiers = set()
-
-        transfers = VbtcV2TokenTransfer.objects.filter(
-            to_address=vfx_address
-        ) | VbtcV2TokenTransfer.objects.filter(from_address=vfx_address)
-        for transfer in transfers:
-            sc_identifiers.add(transfer.token.sc_identifier)
+        # The contracts of every transfer to or from the address, read in
+        # one query instead of one per transfer.
+        sc_identifiers = set(
+            VbtcV2TokenTransfer.objects.filter(
+                Q(to_address=vfx_address) | Q(from_address=vfx_address)
+            ).values_list("token__sc_identifier", flat=True)
+        )
 
         owned = VbtcV2Token.objects.filter(
             Q(owner_address=vfx_address) | Q(pending_owner_address=vfx_address)
-        )
+        ).select_related("pending_owner_transaction")
         for token in owned:
             if token.current_owner() == vfx_address:
                 sc_identifiers.add(token.sc_identifier)
 
-        tokens = VbtcV2Token.objects.filter(
-            sc_identifier__in=sc_identifiers
-        ).select_related("nft__mint_transaction").order_by("-created_at")
+        tokens = list(
+            VbtcV2Token.objects.filter(sc_identifier__in=sc_identifiers)
+            .select_related("nft__mint_transaction", "pending_owner_transaction")
+            .order_by("-created_at")
+        )
+        prefetch_nft_listings([token.nft for token in tokens])
 
         results = vbtc_v2_token_serializer_class(request)(tokens, many=True).data
         return Response({"results": results}, status=200)

@@ -265,6 +265,9 @@ class Transaction(models.Model):
             return None
 
         original_tx_hash = parsed["Hash"]
+        # Loaded for a whole page by api.prefetch.prefetch_transaction_details.
+        if hasattr(self, "_prefetched_callback_details"):
+            return self._prefetched_callback_details
         return Transaction.objects.filter(hash=original_tx_hash).first()
 
     @property
@@ -277,6 +280,8 @@ class Transaction(models.Model):
         if func != "Recover()":
             return None
 
+        if hasattr(self, "_prefetched_recovery_details"):
+            return self._prefetched_recovery_details
         return Recovery.objects.filter(transaction=self).first()
 
     def __str__(self):
@@ -486,10 +491,14 @@ class Nft(models.Model):
 
     @property
     def is_burned(self):
-        return bool(self.burn_transaction is not None)
+        # The foreign key column, not the row: same answer without a query.
+        return self.burn_transaction_id is not None
 
     @property
     def is_listed(self):
+        # Loaded for a whole page by api.prefetch.prefetch_nft_listings.
+        if hasattr(self, "_prefetched_is_listed"):
+            return self._prefetched_is_listed
         return Listing.objects.filter(nft=self, is_deleted=False).exists()
 
     class Meta:
