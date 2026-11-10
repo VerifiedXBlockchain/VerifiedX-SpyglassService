@@ -20,6 +20,7 @@ from api.block.serializers import BlockSerializer
 from project.celery import app
 from project.utils.encoders import DecimalEncoder
 from rbx.block_addresses import affected_addresses, changed_requestors, withdrawal_states
+from rbx import balance_cache
 from rbx.chain_contract import smart_contract_from_chain
 from rbx.client import get_master_nodes, get_block, get_nft, get_topics
 from shop.media import scp_down_folder, upload_to_s3
@@ -289,6 +290,14 @@ def sync_block(height: int, data: Optional[dict] = None, notify: bool = True) ->
             MasterNode.objects.filter(address=master_node.address).update(
                 block_count=F("block_count") + 1
             )
+
+    # The block is committed: drop the cached balances of every address it
+    # touched (the saves above queued theirs too; this also covers rows the
+    # indexer derived without a signal). Best effort, the block stands.
+    try:
+        balance_cache.invalidate(affected_addresses(height))
+    except Exception:
+        logging.exception(f"Invalidating the cached balances of block {height} failed")
 
     # A Bitcoin report, rewind or rekey: the watched vaults' withdrawals and
     # exits take their outcome from the node, once, after the block is

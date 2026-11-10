@@ -3,6 +3,7 @@ import logging
 from tqdm import tqdm
 from django.db.models import Q, Sum
 from django.core.management.base import BaseCommand
+from rbx import balance_cache
 from rbx.models import Block, Transaction
 from rbx.tasks import sync_block
 from rbx.client import get_block
@@ -81,6 +82,8 @@ def fix_blocks(heights):
             sync_block(h)
     except Exception as e:
         sync_error = e
+    # The delete above sends no signal, so no cached balance learned of it.
+    balance_cache.invalidate_all()
     # Also when a sync failed partway: the blocks already synced again would
     # otherwise keep their second draws.
     if touched or Transaction.objects.filter(height__in=heights, type__in=bridge).exists():

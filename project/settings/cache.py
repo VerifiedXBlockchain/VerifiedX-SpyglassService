@@ -31,3 +31,9 @@ CACHES = {
     }
     for (index, cache) in enumerate(["default", "session"])
 }
+
+# Address.get_balance() for /addresses/<a>/, cached per address and replaced
+# when a block touches it or a lock unlocks (rbx.balance_cache). The age is
+# a backstop only.
+ADDRESS_BALANCE_CACHE_ENABLED = ENV.bool("ADDRESS_BALANCE_CACHE_ENABLED", default=CACHE_ENABLED)
+ADDRESS_BALANCE_CACHE_MAX_AGE = ENV.int("ADDRESS_BALANCE_CACHE_MAX_AGE", default=300)

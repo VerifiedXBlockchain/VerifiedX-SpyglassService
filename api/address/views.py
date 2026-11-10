@@ -9,6 +9,7 @@ from rest_framework.response import Response
 
 from api import exceptions
 from api.fungible_token.serializers import FungibleTokenSerializer
+from rbx import balance_cache
 from rbx.models import Address, Transaction
 from api.address.serializers import AddressSerializer
 from api.address.querysets import ALL_ADDRESSES_QUERYSET
@@ -69,7 +70,7 @@ class AddressDetailView(AddressView):
             balance_available,
             balance_locked,
             balance_total,
-        ) = address.get_balance()
+        ) = balance_cache.balance(address)
 
         if "e" in str(balance_available).lower():
             balance_available_value = "{:.16f}".format(balance_available)
@@ -160,7 +161,7 @@ class AddressAdnrDetailView(RetrieveModelMixin, AddressView):
                 balance_available,
                 balance_locked,
                 balance_total,
-            ) = address.get_balance()
+            ) = balance_cache.balance(address)
 
             if "e" in str(balance_available).lower():
                 balance_available_value = "{:.16f}".format(balance_available)
