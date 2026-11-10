@@ -11,6 +11,7 @@ so its property runs (and fails) as it did before.
 """
 
 import json
+from decimal import Decimal
 
 from django.db.models import prefetch_related_objects
 
@@ -88,3 +89,47 @@ def prefetch_transaction_details(transactions):
     rows = transactions + nested
     prefetch_related_objects([tx for tx in rows if tx.nft_id is not None], "nft")
     prefetch_nft_listings([tx.nft for tx in rows if tx.nft_id is not None])
+
+
+def prefetch_fungible_tokens(tokens):
+    """Load what FungibleTokenSerializer reads per token (its create
+    transaction, the description of its contract, its circulating supply)
+    for a list of tokens."""
+    from django.db.models import Q, Sum
+
+    from rbx.models import FungibleTokenTx, Nft
+
+    tokens = [token for token in tokens if token is not None]
+    if not tokens:
+        return
+
+    prefetch_related_objects(tokens, "create_transaction")
+
+    # FungibleToken.description: Nft.objects.get(identifier=sc_identifier),
+    # None when there is none.
+    descriptions = dict(
+        Nft.objects.filter(identifier__in={token.sc_identifier for token in tokens}).values_list(
+            "identifier", "description"
+        )
+    )
+    for token in tokens:
+        token._prefetched_description = descriptions.get(token.sc_identifier)
+
+    # FungibleToken.circulating_supply, for the tokens that can mint or burn.
+    supply_tokens = [token for token in tokens if token.can_mint or token.can_burn]
+    if supply_tokens:
+        totals = {
+            row["token_id"]: row
+            for row in FungibleTokenTx.objects.filter(token__in=[token.pk for token in supply_tokens])
+            .values("token_id")
+            .annotate(
+                minted=Sum("amount", filter=Q(type=FungibleTokenTx.Type.MINT)),
+                burned=Sum("amount", filter=Q(type=FungibleTokenTx.Type.BURN)),
+            )
+            .order_by()
+        }
+        for token in supply_tokens:
+            row = totals.get(token.pk, {})
+            token._prefetched_circulating_supply = (
+                token.initial_supply + (row.get("minted") or Decimal(0)) - (row.get("burned") or Decimal(0))
+            )

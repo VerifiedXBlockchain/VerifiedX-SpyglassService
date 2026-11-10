@@ -9,6 +9,7 @@ from rest_framework.response import Response
 
 from api import exceptions
 from api.fungible_token.serializers import FungibleTokenSerializer
+from api.prefetch import prefetch_fungible_tokens
 from rbx import balance_cache
 from rbx.models import Address, Transaction
 from api.address.serializers import AddressSerializer
@@ -135,6 +136,10 @@ class AddressTokensDetailView(AddressView):
             )
 
         results = address.get_fungible_token_balances(serialize_token=True)
+        # Optional: leave out the tokens the address holds none of.
+        if request.query_params.get("nonzero") in ("1", "true"):
+            results = [result for result in results if result["balance"] != 0]
+        prefetch_fungible_tokens([result["token"] for result in results])
 
         token_balances = [
             {
