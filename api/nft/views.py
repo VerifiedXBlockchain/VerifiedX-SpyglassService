@@ -79,7 +79,9 @@ class NftHistoryView(GenericAPIView):
         except Nft.DoesNotExist:
             return Response(status=status.HTTP_404_NOT_FOUND)
 
-        transactions = [nft.mint_transaction]
+        # An NFT indexed without its mint transaction (mint_transaction is
+        # null) lists the rest of its history.
+        transactions = [nft.mint_transaction] if nft.mint_transaction else []
         for tx in nft.transfer_transactions.all():
             transactions.append(tx)
 

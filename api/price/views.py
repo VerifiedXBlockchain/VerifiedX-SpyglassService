@@ -53,13 +53,18 @@ class PriceListView(GenericAPIView):
         s = round(timezone.now().timestamp()) - 3600
         e = round(timezone.now().timestamp())
 
-        if "start" in request.query_params:
-            s = int(request.query_params["start"])
-        if "end" in request.query_params:
-            e = int(request.query_params["end"])
+        try:
+            if "start" in request.query_params:
+                s = int(request.query_params["start"])
+            if "end" in request.query_params:
+                e = int(request.query_params["end"])
 
-        start = datetime.fromtimestamp(s)
-        end = datetime.fromtimestamp(e)
+            start = datetime.fromtimestamp(s)
+            end = datetime.fromtimestamp(e)
+        except (ValueError, OverflowError, OSError):
+            return Response(
+                {"error": "start and end must be Unix timestamps in seconds"}, status=400
+            )
 
         prices = Price.objects.filter(
             created_at__gte=start,
