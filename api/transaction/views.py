@@ -13,6 +13,7 @@ from django_filters.rest_framework import DjangoFilterBackend
 from rbx.models import Transaction
 from django.conf import settings
 from django.db.models import Q
+from django.utils.cache import patch_cache_control
 from django.utils.decorators import method_decorator
 from api.decorators import cache_request
 
@@ -53,12 +54,39 @@ class TransactionBlockListView(ListModelMixin, TransactionView):
         return self.list(request, *args, **kwargs)
 
 
+def _holds_an_nft(row):
+    return row is not None and row.get("nft") is not None
+
+
 # @method_decorator(cache_request(settings.CACHE_TIMEOUT_LONG), name="get")
 class TransactionDetailView(RetrieveModelMixin, TransactionView):
+    """A transaction is served only once its block is indexed, and its row
+    does not change after that, so a found one may be cached by clients for
+    TRANSACTION_DETAIL_MAX_AGE. Not when the body nests an NFT: the NFT's
+    owner, listing and assets move. A 404 (not indexed yet, or never) is
+    never cached."""
+
     lookup_field = "hash"
 
     def get(self, request, *args, **kwargs):
         return self.retrieve(request, *args, **kwargs)
+
+    def finalize_response(self, request, response, *args, **kwargs):
+        response = super().finalize_response(request, response, *args, **kwargs)
+        if request.method not in ("GET", "HEAD"):
+            return response
+        if response.status_code == status.HTTP_404_NOT_FOUND:
+            patch_cache_control(response, no_store=True)
+        elif response.status_code == status.HTTP_200_OK and self._immutable(response.data):
+            patch_cache_control(response, public=True, max_age=settings.TRANSACTION_DETAIL_MAX_AGE)
+        return response
+
+    @staticmethod
+    def _immutable(data):
+        if _holds_an_nft(data) or _holds_an_nft(data.get("callback_details")):
+            return False
+        recovery = data.get("recovery_details") or {}
+        return not any(_holds_an_nft(row) for row in recovery.get("outstanding_transactions") or [])
 
 
 @method_decorator(cache_request(settings.CACHE_TIMEOUT_SHORT), name="get")

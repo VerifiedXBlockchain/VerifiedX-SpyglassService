@@ -15,6 +15,12 @@ MIDDLEWARE = [
     "django.middleware.common.CommonMiddleware",
     # X-Indexed-Height on API reads (api.indexed_height).
     "api.indexed_height.IndexedHeightMiddleware",
+    # ETags on GET responses; a matching If-None-Match answers 304. Below
+    # GZip, so the ETag is taken over the uncompressed body (GZip then marks
+    # it weak), and below CORS and the height header, which the 304 it
+    # builds would otherwise lose. A client that sends no If-None-Match sees
+    # no difference.
+    "django.middleware.http.ConditionalGetMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
     "django.middleware.locale.LocaleMiddleware",
     "django.contrib.auth.middleware.AuthenticationMiddleware",

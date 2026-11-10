@@ -41,3 +41,6 @@ ADDRESS_BALANCE_CACHE_MAX_AGE = ENV.int("ADDRESS_BALANCE_CACHE_MAX_AGE", default
 # X-Indexed-Height on API reads: the latest indexed height, cached this long.
 INDEXED_HEIGHT_HEADER_ENABLED = ENV.bool("INDEXED_HEIGHT_HEADER_ENABLED", default=True)
 INDEXED_HEIGHT_CACHE_SECONDS = ENV.int("INDEXED_HEIGHT_CACHE_SECONDS", default=1)
+
+# Cache-Control max-age of a found /transaction/<hash>/ that nests no NFT.
+TRANSACTION_DETAIL_MAX_AGE = ENV.int("TRANSACTION_DETAIL_MAX_AGE", default=86400)
