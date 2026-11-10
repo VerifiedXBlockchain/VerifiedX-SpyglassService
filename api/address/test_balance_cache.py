@@ -80,6 +80,8 @@ def tx_data(tx_hash, from_address, to_address, amount):
     }
 
 
+# Counts the view's own queries: no height header lookup.
+@override_settings(INDEXED_HEIGHT_HEADER_ENABLED=False)
 class AddressBalanceCacheTests(TestCase):
     """/addresses/<a>/ through rbx.balance_cache answers what an uncached
     read answers."""

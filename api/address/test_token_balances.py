@@ -3,7 +3,7 @@ from unittest.mock import patch
 
 from django.core.cache import cache
 from django.db import connection
-from django.test import TestCase
+from django.test import TestCase, override_settings
 from django.test.utils import CaptureQueriesContext
 
 from rbx.models import Address, FungibleToken, FungibleTokenTx, Nft, Transaction
@@ -38,6 +38,8 @@ def per_token_balances(tokens, address):
     return {token.pk: token.get_address_balance(address) for token in tokens}
 
 
+# Counts the view's own queries: no height header lookup.
+@override_settings(INDEXED_HEIGHT_HEADER_ENABLED=False)
 class AddressTokenBalancesTests(TestCase):
     URL = f"/api/addresses/{HOLDER}/tokens/"
 

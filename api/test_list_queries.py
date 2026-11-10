@@ -10,7 +10,7 @@ from unittest.mock import patch
 from django.core.cache import cache
 from django.db import connection
 from django.db.models import Q
-from django.test import TestCase
+from django.test import TestCase, override_settings
 from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
 
@@ -94,6 +94,8 @@ def per_row_queries():
         yield
 
 
+# Counts the view's own queries: no height header lookup.
+@override_settings(INDEXED_HEIGHT_HEADER_ENABLED=False)
 class ListFixture(TestCase):
     def setUp(self):
         cache.clear()
@@ -225,6 +227,8 @@ def old_vbtc_v2_list(vfx_address, serializer_class=VbtcV2TokenSerializer):
     return {"results": serializer_class(tokens, many=True).data}
 
 
+# Counts the view's own queries: no height header lookup.
+@override_settings(INDEXED_HEIGHT_HEADER_ENABLED=False)
 class VbtcV2ByAddressQueriesTests(TestCase):
     def setUp(self):
         cache.clear()

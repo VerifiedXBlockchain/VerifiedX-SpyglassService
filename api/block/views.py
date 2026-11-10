@@ -9,7 +9,7 @@ from django.db.models import Q
 
 from django_filters.rest_framework import DjangoFilterBackend
 from api.decorators import cache_request
-from api.block.serializers import BlockSerializer
+from api.block.serializers import BlockSerializer, LatestBlockSerializer
 from api.block.querysets import ALL_BLOCKS_QUERYSET
 from api.filters import PrefixSearchFilter
 from rbx.models import Block, MasterNode
@@ -87,3 +87,14 @@ class BlockAddressView(ListModelMixin, GenericAPIView):
 
     def get(self, request, *args, **kwargs):
         return self.list(request, *args, **kwargs)
+
+
+class BlockLatestView(GenericAPIView):
+    """The latest indexed block's height, hash and time, without its
+    transactions: GET /blocks/latest/. 404 before any block is indexed."""
+
+    def get(self, request, *args, **kwargs):
+        block = Block.objects.order_by("-height").values("height", "hash", "date_crafted").first()
+        if block is None:
+            return Response({"detail": "No block indexed"}, status=status.HTTP_404_NOT_FOUND)
+        return Response(LatestBlockSerializer(block).data)
