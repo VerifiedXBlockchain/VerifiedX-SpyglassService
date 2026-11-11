@@ -147,18 +147,48 @@ class AddressBalanceCacheTests(TestCase):
         self.assertEqual(Decimal(str(self.client.get("/api/addresses/RFUNDED/").json()["balance"])), Decimal("6.75"))
 
     def test_sync_block_marks_the_block_invalidated_after_invalidating(self):
+        from django.core.cache import cache as django_cache
+
         self.assertIsNone(balance_cache.invalidated_through())
-        with patch("rbx.tasks.balance_cache.invalidate", side_effect=RuntimeError("redis down")):
-            sync_block(2, data=block_data(2, T0 + timedelta(minutes=1)), notify=False)
-        # A failed invalidation records nothing.
+        # The cache refuses the new tokens: invalidate() reports it and the
+        # block is not marked.
+        with patch.object(django_cache, "set_many", side_effect=ConnectionError("redis down")):
+            sync_block(2, data=block_data(2, T0 + timedelta(minutes=1), [tx_data("b2", "RGENESIS", "RFUNDED", "1")]),
+                       notify=False)
         self.assertIsNone(balance_cache.invalidated_through())
         sync_block(3, data=block_data(3, T0 + timedelta(minutes=2)), notify=False)
         self.assertEqual(balance_cache.invalidated_through(), 3)
+        sync_block(4, data=block_data(4, T0 + timedelta(minutes=3)), notify=False)
+        self.assertEqual(balance_cache.invalidated_through(), 4)
         # Never lowered by an older block synced again.
         balance_cache.mark_invalidated_through(2)
+        self.assertEqual(balance_cache.invalidated_through(), 4)
+
+    def test_a_missed_block_drops_every_cached_balance_before_the_marker_moves(self):
+        from django.core.cache import cache as django_cache
+
+        django_cache.set(balance_cache.INVALIDATED_THROUGH_KEY, 1, None)
+        before = self.get("RFUNDED")
+        # Block 2's invalidation fails: RFUNDED's entry survives it.
+        with patch.object(django_cache, "set_many", side_effect=ConnectionError("redis down")):
+            sync_block(2, data=block_data(2, T0 + timedelta(minutes=1), [tx_data("b2", "RGENESIS", "RFUNDED", "1.25")]),
+                       notify=False)
+        self.assertEqual(balance_cache.invalidated_through(), 1)
+        self.assertEqual(self.assert_cached("RFUNDED"), before)
+        # Block 3 touches someone else; moving the marker past block 2
+        # first drops every entry, RFUNDED's included.
+        sync_block(3, data=block_data(3, T0 + timedelta(minutes=2), [tx_data("b3", "RGENESIS", "RTINY", "1")]),
+                   notify=False)
         self.assertEqual(balance_cache.invalidated_through(), 3)
+        after = self.get("RFUNDED")
+        self.assertNotEqual(after, before)
+        self.assertEqual(after, self.cold("RFUNDED"))
 
     def test_a_block_that_does_not_touch_the_address_keeps_its_entry(self):
+        from django.core.cache import cache as django_cache
+
+        # Block 1's invalidation completed, so block 2 follows on from it.
+        django_cache.set(balance_cache.INVALIDATED_THROUGH_KEY, 1, None)
         before = self.get("RTINY")
         sync_block(
             2,
