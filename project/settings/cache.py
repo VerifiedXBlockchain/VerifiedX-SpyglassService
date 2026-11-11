@@ -31,3 +31,16 @@ CACHES = {
     }
     for (index, cache) in enumerate(["default", "session"])
 }
+
+# Address.get_balance() for /addresses/<a>/, cached per address and replaced
+# when a block touches it or a lock unlocks (rbx.balance_cache). The age is
+# a backstop only.
+ADDRESS_BALANCE_CACHE_ENABLED = ENV.bool("ADDRESS_BALANCE_CACHE_ENABLED", default=CACHE_ENABLED)
+ADDRESS_BALANCE_CACHE_MAX_AGE = ENV.int("ADDRESS_BALANCE_CACHE_MAX_AGE", default=300)
+
+# X-Indexed-Height on API reads: the latest indexed height, cached this long.
+INDEXED_HEIGHT_HEADER_ENABLED = ENV.bool("INDEXED_HEIGHT_HEADER_ENABLED", default=True)
+INDEXED_HEIGHT_CACHE_SECONDS = ENV.int("INDEXED_HEIGHT_CACHE_SECONDS", default=1)
+
+# Cache-Control max-age of a found /transaction/<hash>/ that nests no NFT.
+TRANSACTION_DETAIL_MAX_AGE = ENV.int("TRANSACTION_DETAIL_MAX_AGE", default=86400)

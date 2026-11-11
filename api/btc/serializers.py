@@ -34,11 +34,13 @@ class VbtcTokenSerializer(serializers.ModelSerializer):
 
 
 class VbtcV2WithdrawalRequestSerializer(serializers.ModelSerializer):
+    # The foreign key columns hold the hashes (Transaction's primary key), so
+    # neither transaction row is read.
     request_transaction_hash = serializers.CharField(
-        source="request_transaction.hash", read_only=True
+        source="request_transaction_id", read_only=True
     )
     completion_transaction_hash = serializers.CharField(
-        source="completion_transaction.hash", read_only=True, default=None
+        source="completion_transaction_id", read_only=True, default=None
     )
     # An open request on a watched vault, as the node last described it
     # (stored by the indexer; see VbtcV2WithdrawalRequest.pin_state). Null

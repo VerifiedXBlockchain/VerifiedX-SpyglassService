@@ -13,6 +13,7 @@ from django_filters.rest_framework import DjangoFilterBackend
 from rbx.models import Transaction
 from django.conf import settings
 from django.db.models import Q
+from django.utils.cache import patch_cache_control
 from django.utils.decorators import method_decorator
 from api.decorators import cache_request
 
@@ -55,10 +56,44 @@ class TransactionBlockListView(ListModelMixin, TransactionView):
 
 # @method_decorator(cache_request(settings.CACHE_TIMEOUT_LONG), name="get")
 class TransactionDetailView(RetrieveModelMixin, TransactionView):
+    """A found transaction whose body cannot change after indexing may be
+    cached by clients for TRANSACTION_DETAIL_MAX_AGE; every other body gets
+    no lifetime (ETag revalidation still applies), and a 404 (not indexed
+    yet, or never) is never cached. See _immutable for the rule."""
+
     lookup_field = "hash"
 
     def get(self, request, *args, **kwargs):
         return self.retrieve(request, *args, **kwargs)
+
+    def finalize_response(self, request, response, *args, **kwargs):
+        response = super().finalize_response(request, response, *args, **kwargs)
+        if request.method not in ("GET", "HEAD"):
+            return response
+        if response.status_code == status.HTTP_404_NOT_FOUND:
+            patch_cache_control(response, no_store=True)
+        elif response.status_code == status.HTTP_200_OK and self._immutable(response.data):
+            patch_cache_control(response, public=True, max_age=settings.TRANSACTION_DETAIL_MAX_AGE)
+        return response
+
+    @staticmethod
+    def _immutable(data):
+        """Only a plain VFX transfer (type TX) with no unlock time, not to or
+        from a reserve (xRBX) address, nesting nothing. Every later writer of
+        a serialized field skips it: an NFT is attached only to mint types,
+        and later too (retry_unindexed_mints); unlock times are moved only on
+        reserve sends (redirect_reserve_transfer); callback and recovery
+        details exist only on RESERVE rows; the voided and refused flags are
+        not serialized."""
+        return (
+            data.get("type") == Transaction.Type.TX
+            and data.get("unlock_time") is None
+            and data.get("nft") is None
+            and data.get("callback_details") is None
+            and data.get("recovery_details") is None
+            and not str(data.get("to_address") or "").startswith("xRBX")
+            and not str(data.get("from_address") or "").startswith("xRBX")
+        )
 
 
 @method_decorator(cache_request(settings.CACHE_TIMEOUT_SHORT), name="get")

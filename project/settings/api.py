@@ -34,6 +34,8 @@ REST_FRAMEWORK = {
     },
     "URL_FORMAT_OVERRIDE": None,
     "COERCE_DECIMAL_TO_STRING": False,
+    # A JSON 500 for an unhandled error instead of Django's HTML page.
+    "EXCEPTION_HANDLER": "api.exceptions.exception_handler",
 }
 
 

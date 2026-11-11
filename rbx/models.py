@@ -265,6 +265,9 @@ class Transaction(models.Model):
             return None
 
         original_tx_hash = parsed["Hash"]
+        # Loaded for a whole page by api.prefetch.prefetch_transaction_details.
+        if hasattr(self, "_prefetched_callback_details"):
+            return self._prefetched_callback_details
         return Transaction.objects.filter(hash=original_tx_hash).first()
 
     @property
@@ -277,6 +280,8 @@ class Transaction(models.Model):
         if func != "Recover()":
             return None
 
+        if hasattr(self, "_prefetched_recovery_details"):
+            return self._prefetched_recovery_details
         return Recovery.objects.filter(transaction=self).first()
 
     def __str__(self):
@@ -486,10 +491,14 @@ class Nft(models.Model):
 
     @property
     def is_burned(self):
-        return bool(self.burn_transaction is not None)
+        # The foreign key column, not the row: same answer without a query.
+        return self.burn_transaction_id is not None
 
     @property
     def is_listed(self):
+        # Loaded for a whole page by api.prefetch.prefetch_nft_listings.
+        if hasattr(self, "_prefetched_is_listed"):
+            return self._prefetched_is_listed
         return Listing.objects.filter(nft=self, is_deleted=False).exists()
 
     class Meta:
@@ -543,7 +552,8 @@ class Address(models.Model):
 
     def get_fungible_token_balances(self, serialize_token=False):
 
-        tokens = self.get_fungible_tokens()
+        tokens = list(self.get_fungible_tokens())
+        balances = FungibleToken.address_balances(tokens, self.address)
 
         token_balances = []
         for token in tokens:
@@ -551,7 +561,7 @@ class Address(models.Model):
             token_balances.append(
                 {
                     "token": token,
-                    "balance": token.get_address_balance(self.address),
+                    "balance": balances[token.pk],
                 }
             )
 
@@ -992,6 +1002,44 @@ class FungibleToken(models.Model):
 
     nsfw = models.BooleanField(default=False)
 
+    @staticmethod
+    def address_balances(tokens, address):
+        """get_address_balance(address) of each token, keyed by token pk,
+        from one grouped query instead of four per token. The same sums,
+        added in the same order."""
+        sums = {
+            row["token_id"]: row
+            for row in FungibleTokenTx.objects.filter(token__in=[token.pk for token in tokens])
+            .filter(Q(receiving_address=address) | Q(sending_address=address))
+            .values("token_id")
+            .annotate(
+                minted=Sum("amount", filter=Q(type=FungibleTokenTx.Type.MINT, receiving_address=address)),
+                burned=Sum("amount", filter=Q(type=FungibleTokenTx.Type.BURN, receiving_address=address)),
+                transferred_to=Sum(
+                    "amount", filter=Q(type=FungibleTokenTx.Type.TRANSFER, receiving_address=address)
+                ),
+                transferred_from=Sum(
+                    "amount", filter=Q(type=FungibleTokenTx.Type.TRANSFER, sending_address=address)
+                ),
+            )
+            .order_by()
+        } if tokens else {}
+
+        balances = {}
+        for token in tokens:
+            row = sums.get(token.pk, {})
+            initial_supply_owned = Decimal(0)
+            if token.initial_supply > Decimal(0) and address == token.original_owner_address:
+                initial_supply_owned = token.initial_supply
+            balances[token.pk] = (
+                initial_supply_owned
+                + (row.get("minted") or Decimal(0))
+                + (row.get("transferred_to") or Decimal(0))
+                - (row.get("burned") or Decimal(0))
+                - (row.get("transferred_from") or Decimal(0))
+            )
+        return balances
+
     def get_address_balance(self, address):
 
         initial_supply_owned = Decimal(0)
@@ -1043,6 +1091,9 @@ class FungibleToken(models.Model):
 
     @property
     def description(self):
+        # Loaded for a whole list by api.prefetch.prefetch_fungible_tokens.
+        if hasattr(self, "_prefetched_description"):
+            return self._prefetched_description
         try:
             sc = Nft.objects.get(identifier=self.sc_identifier)
         except Nft.DoesNotExist:
@@ -1054,6 +1105,9 @@ class FungibleToken(models.Model):
     def circulating_supply(self):
         if not self.can_mint and not self.can_burn:
             return self.initial_supply
+
+        if hasattr(self, "_prefetched_circulating_supply"):
+            return self._prefetched_circulating_supply
 
         total_minted = FungibleTokenTx.objects.filter(
             token=self, type=FungibleTokenTx.Type.MINT

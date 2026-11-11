@@ -1,5 +1,7 @@
+from django.db import models
 from rest_framework import serializers
 
+from api.prefetch import prefetch_transaction_details
 from rbx.models import Transaction, Nft
 from api.nft.serializers import NftSerializer
 from api.callback.serializers import CallbackSerializer
@@ -28,6 +30,16 @@ class SubTransactionSerializer(serializers.ModelSerializer):
         ]
 
 
+class TransactionListSerializer(serializers.ListSerializer):
+    """Loads the nested rows of the whole page first (api.prefetch); the
+    rows serialize as before."""
+
+    def to_representation(self, data):
+        rows = list(data.all() if isinstance(data, models.manager.BaseManager) else data)
+        prefetch_transaction_details(rows)
+        return super().to_representation(rows)
+
+
 class TransactionSerializer(serializers.ModelSerializer):
     nft = NftSerializer(many=False)
     callback_details = SubTransactionSerializer(many=False)
@@ -52,6 +64,7 @@ class TransactionSerializer(serializers.ModelSerializer):
             "callback_details",
             "recovery_details",
         ]
+        list_serializer_class = TransactionListSerializer
 
 
 class NftTransactionSerializer(serializers.ModelSerializer):
