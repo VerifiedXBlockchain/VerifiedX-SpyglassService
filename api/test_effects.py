@@ -326,3 +326,42 @@ class LegacyTokenTransferTests(TestCase):
         self.assertEqual(hashes, [])
         hashes, _ = self.hashes_and_rows(f"/api/transaction/activity/?addresses={self.DAVE}")
         self.assertEqual(hashes, [])
+
+
+class RedirectedVbtcSendTests(TestCase):
+    """A recovery redirects a pending reserve vBTC send: its transfer row
+    names the recovery address, the transaction still names the recipient."""
+
+    @classmethod
+    def setUpTestData(cls):
+        from rbx.models import VbtcV2TokenTransfer
+
+        chain = f.build_chain()
+        send = chain.tx(5, "t-vbtc-redirected", f.RECOVERED_VAULT, f.BOB, "0",
+                        tx_type=Transaction.Type.VBTC_V2_TRANSFER,
+                        data={"Function": "TransferVBTC()", "ContractUID": f.VAULT_SC, "Amount": 0.01},
+                        unlock_in=-timedelta(days=6))
+        VbtcV2TokenTransfer.objects.create(
+            token=VbtcV2Token.objects.get(sc_identifier=f.VAULT_SC), transaction=send,
+            from_address=f.RECOVERED_VAULT, to_address=f.RECOVERY, amount=Decimal("0.01"),
+            created_at=send.date_crafted,
+        )
+
+    def setUp(self):
+        cache.clear()
+
+    def test_the_recovery_address_sees_the_redirected_send_with_its_credit(self):
+        credit = {"address": f.RECOVERY, "asset": f"vbtc:{f.VAULT_SC}", "delta": "0.01", "locked": False}
+        for url in (
+            f"/api/transaction/address/{f.RECOVERY}/?include=effects",
+            f"/api/transaction/addresses/{f.RECOVERY},{f.CAROL}/?include=effects",
+            f"/api/transaction/activity/?addresses={f.RECOVERY}&include=effects",
+        ):
+            with self.subTest(url=url):
+                rows = {row["hash"]: row for row in self.client.get(url).json()["results"]}
+                self.assertIn("t-vbtc-redirected", rows)
+                self.assertIn(credit, rows["t-vbtc-redirected"]["effects"])
+
+    def test_without_effects_the_list_is_unchanged(self):
+        rows = self.client.get(f"/api/transaction/address/{f.RECOVERY}/").json()["results"]
+        self.assertNotIn("t-vbtc-redirected", [row["hash"] for row in rows])

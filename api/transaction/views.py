@@ -11,7 +11,7 @@ from api.transaction.filters import TransactionFilter
 from api.filters import PrefixSearchFilter, ReversibleOrderingFilter
 from django_filters.rest_framework import DjangoFilterBackend
 from api.effects import wants_effects
-from rbx.models import FungibleTokenTx, Recovery, Transaction
+from rbx.models import FungibleTokenTx, Recovery, Transaction, VbtcV2TokenTransfer
 from django.conf import settings
 from django.db.models import Q
 from django.utils.cache import patch_cache_control
@@ -22,15 +22,25 @@ from api.decorators import cache_request
 def _changed_without_naming(addresses):
     """With ?include=effects a list also holds the transactions that change
     one of the addresses' balances without naming it as sender or
-    recipient: a Recover() crediting it as the recovery address, and a
-    token movement whose stored sender or recipient it is (an old-style
+    recipient: a Recover() crediting it as the recovery address; a token
+    movement whose stored sender or recipient it is (an old-style
     TokenTransfer() is sent to Token_Base and names the recipient only in
-    its data)."""
-    return Q(hash__in=Recovery.objects.filter(new_address__in=addresses).values("transaction_id")) | Q(
-        hash__in=FungibleTokenTx.objects.filter(
-            Q(receiving_address__in=addresses) | Q(sending_address__in=addresses),
-            transaction__isnull=False,
-        ).values("transaction_id")
+    its data); and a vBTC V2 transfer row naming it (a recovery redirects a
+    pending reserve send's row to the recovery address and leaves the
+    transaction's own addresses as they were)."""
+    return (
+        Q(hash__in=Recovery.objects.filter(new_address__in=addresses).values("transaction_id"))
+        | Q(
+            hash__in=FungibleTokenTx.objects.filter(
+                Q(receiving_address__in=addresses) | Q(sending_address__in=addresses),
+                transaction__isnull=False,
+            ).values("transaction_id")
+        )
+        | Q(
+            hash__in=VbtcV2TokenTransfer.objects.filter(
+                Q(to_address__in=addresses) | Q(from_address__in=addresses)
+            ).values("transaction_id")
+        )
     )
 
 
