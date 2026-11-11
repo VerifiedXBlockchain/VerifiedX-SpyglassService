@@ -248,3 +248,75 @@ class ReconciledWithdrawalsTests(TestCase):
 
         events = [json.loads(call.args[0]) for call in notify.call_args_list]
         self.assertIn("xREQ", [e for e in events if e["type"] == "block_addresses"][0]["data"]["affected_addresses"])
+
+
+class EarlierSendsChangedByTheBlockTests(TestCase):
+    """A CallBack() or Recover() changes sends of earlier blocks; their
+    parties are listed with the block that changed them."""
+
+    def setUp(self):
+        self.earlier = make_block(height=1)
+        self.block = make_block(height=2)
+
+    def reserve(self, tx_hash, sender, data):
+        return make_tx(self.block, tx_hash, Transaction.Type.RESERVE, from_address=sender, data=data)
+
+    def recover(self, outstanding):
+        tx = self.reserve("recover", "xVAULT", {"Function": "Recover()", "RecoveryAddress": "xRECOVERY"})
+        recovery = Recovery.objects.create(original_address="xVAULT", new_address="xRECOVERY", transaction=tx)
+        recovery.outstanding_transactions.set(outstanding)
+        return tx
+
+    def test_a_recovery_lists_the_recipient_of_a_vfx_send_it_voids(self):
+        send = make_tx(self.earlier, "send", Transaction.Type.TX, from_address="xVAULT", to_address="xPAYEE")
+        # The indexer writes the recovery's callback on the send itself.
+        Callback.objects.create(to_address="xPAYEE", from_address="xRECOVERY", amount=1, transaction=send,
+                                original_transaction=send, from_recovery=True)
+        self.recover([send])
+        self.assertEqual(affected_addresses(2), ["xPAYEE", "xRECOVERY", "xVAULT"])
+
+    def test_a_recovery_lists_the_recipient_of_a_vbtc_send_it_redirects(self):
+        token = make_token(owner="xOWNER", sc_identifier="sc:1")
+        send = make_tx(self.earlier, "send", Transaction.Type.VBTC_V2_TRANSFER, from_address="xVAULT",
+                       to_address="xVBTC_PAYEE")
+        # Redirected: the row now names the recovery address.
+        add_transfer(token, send, "xVAULT", "xRECOVERY", "0.1")
+        self.recover([send])
+        self.assertEqual(affected_addresses(2), ["xRECOVERY", "xVAULT", "xVBTC_PAYEE"])
+
+    def test_a_recovery_lists_the_recipient_of_an_nft_send_it_takes_back(self):
+        send = make_tx(self.earlier, "send", Transaction.Type.NFT_TX, from_address="xVAULT", to_address="xNFT_PAYEE")
+        self.recover([send])
+        self.assertEqual(affected_addresses(2), ["xNFT_PAYEE", "xRECOVERY", "xVAULT"])
+
+    def test_a_callback_lists_the_recipient_of_a_vbtc_or_nft_send_it_voids(self):
+        # These callbacks write no Callback row.
+        token = make_token(owner="xOWNER", sc_identifier="sc:1")
+        vbtc_send = make_tx(self.earlier, "vbtc-send", Transaction.Type.VBTC_V2_TRANSFER, from_address="xVAULT",
+                            to_address="xVBTC_PAYEE")
+        add_transfer(token, vbtc_send, "xVAULT", "xVBTC_LEDGER_PAYEE", "0.1")
+        nft_send = make_tx(self.earlier, "nft-send", Transaction.Type.NFT_TX, from_address="xVAULT",
+                           to_address="xNFT_PAYEE")
+        self.reserve("cb1", "xVAULT", {"Function": "CallBack()", "Hash": vbtc_send.hash})
+        self.reserve("cb2", "xVAULT", {"Function": "CallBack()", "Hash": nft_send.hash})
+        self.assertEqual(affected_addresses(2), ["xNFT_PAYEE", "xVAULT", "xVBTC_LEDGER_PAYEE", "xVBTC_PAYEE"])
+
+    def test_other_reserve_transactions_and_unknown_hashes_add_nothing(self):
+        make_tx(self.earlier, "unrelated", Transaction.Type.TX, from_address="xOTHER", to_address="xOTHER2")
+        self.reserve("register", "xVAULT", {"Function": "Register()", "RecoveryAddress": "xRECOVERY"})
+        self.reserve("cb", "xVAULT", {"Function": "CallBack()", "Hash": "not-indexed"})
+        self.reserve("bad", "xVAULT", None)
+        self.assertEqual(affected_addresses(2), ["xVAULT"])
+
+    def test_an_ordinary_block_lists_what_it_did_in_as_many_queries(self):
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        make_tx(self.block, "t1", Transaction.Type.TX, from_address="xA", to_address="xB")
+        make_tx(self.block, "t2", Transaction.Type.TX, from_address="xB", to_address="xC")
+        make_tx(self.earlier, "t0", Transaction.Type.TX, from_address="xOLD", to_address="xA")
+        with CaptureQueriesContext(connection) as queries:
+            listed = affected_addresses(2)
+        self.assertEqual(listed, ["xA", "xB", "xC"])
+        # The transactions, then the seven derived tables, as before.
+        self.assertEqual(len(queries), 8)

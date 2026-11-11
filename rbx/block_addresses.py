@@ -6,6 +6,13 @@ parties of the rows the indexer derived from the block that do not show in
 to/from: vBTC V2 ledger moves and withdrawal requests, bridge locks and
 exits, VFX20 transfers, reserve callbacks and recoveries.
 
+A CallBack() or Recover() in the block also changes earlier sends: a
+callback voids the send it names, a recovery voids or redirects every send
+still pending from the vault (Recovery.outstanding_transactions). Those
+sends' senders and recipients, and the parties of their vBTC ledger rows
+(a redirected row names the recovery address), are listed with the block
+that changed them.
+
 A Bitcoin report or rewind changes withdrawals that no transaction of the
 block links to (a refund, a reopen); sync_block diffs the withdrawal rows
 around that reconcile and passes the requestors it changed as `extra`.
@@ -28,6 +35,7 @@ from rbx.models import (
     VbtcV2TokenTransfer,
     VbtcV2WithdrawalRequest,
 )
+from rbx.vbtc_gates import parse_envelope
 
 
 def affected_addresses(height: int, extra=()) -> list:
@@ -40,9 +48,11 @@ def affected_addresses(height: int, extra=()) -> list:
     # Through the block foreign key (Block's primary key is its height), which
     # is indexed; Transaction.height is not. The related rows are then read
     # through their indexed transaction foreign keys.
-    rows = list(Transaction.objects.filter(block_id=height).values_list("hash", "from_address", "to_address"))
-    hashes = [tx_hash for tx_hash, _, _ in rows]
-    add((from_address, to_address) for _, from_address, to_address in rows)
+    rows = list(
+        Transaction.objects.filter(block_id=height).values_list("hash", "from_address", "to_address", "type")
+    )
+    hashes = [tx_hash for tx_hash, _, _, _ in rows]
+    add((from_address, to_address) for _, from_address, to_address, _ in rows)
     if not hashes:
         return sorted(addresses - {None, ""})
 
@@ -66,9 +76,41 @@ def affected_addresses(height: int, extra=()) -> list:
         )
     )
     add(Callback.objects.filter(transaction_id__in=hashes).values_list("from_address", "to_address"))
-    add(Recovery.objects.filter(transaction_id__in=hashes).values_list("original_address", "new_address"))
+    recoveries = list(
+        Recovery.objects.filter(transaction_id__in=hashes).values_list("pk", "original_address", "new_address")
+    )
+    add((original, new) for _, original, new in recoveries)
+
+    earlier = _sends_changed_by(hashes, rows, [pk for pk, _, _ in recoveries])
+    if earlier:
+        add(Transaction.objects.filter(hash__in=earlier).values_list("from_address", "to_address"))
+        add(VbtcV2TokenTransfer.objects.filter(transaction_id__in=earlier).values_list("from_address", "to_address"))
 
     return sorted(addresses - {None, ""})
+
+
+def _sends_changed_by(hashes, rows, recovery_ids):
+    """The earlier transactions a CallBack() or Recover() of the block voids
+    or redirects: the Hash each CallBack() names, and the outstanding sends
+    of each recovery. Reads nothing for a block with no reserve
+    transaction."""
+    earlier = set()
+    if any(tx_type == Transaction.Type.RESERVE for _, _, _, tx_type in rows):
+        for raw in Transaction.objects.filter(
+            hash__in=hashes, type=Transaction.Type.RESERVE
+        ).values_list("data", flat=True):
+            payload, _ = parse_envelope(raw)
+            if isinstance(payload, dict) and payload.get("Function") == "CallBack()":
+                called_back = payload.get("Hash")
+                if isinstance(called_back, str) and called_back:
+                    earlier.add(called_back)
+    if recovery_ids:
+        earlier.update(
+            Recovery.outstanding_transactions.through.objects.filter(recovery_id__in=recovery_ids).values_list(
+                "transaction_id", flat=True
+            )
+        )
+    return earlier - set(hashes)
 
 
 def withdrawal_states(after_rewind: bool = False, include=()) -> dict:
