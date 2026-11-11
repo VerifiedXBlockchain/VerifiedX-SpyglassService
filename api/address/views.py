@@ -1,6 +1,8 @@
 import json
 import logging
 
+from django.db.models import DecimalField, ExpressionWrapper, F, Sum
+
 from rest_framework import status, filters
 from rest_framework.generics import GenericAPIView
 from rest_framework.mixins import RetrieveModelMixin, ListModelMixin
@@ -41,19 +43,64 @@ class AddressListView(ListModelMixin, AddressView):
         return self.list(request, *args, **kwargs)
 
 
-@method_decorator(cache_request(settings.CACHE_TIMEOUT_MEDIUM), name="get")
+@method_decorator(cache_request(settings.CACHE_TIMEOUT_LONG), name="get")
 class AddressTopHoldersListView(GenericAPIView):
     """The 100 addresses with the largest indexed balance (Address.balance,
-    the balance the address list serves), read through its index."""
+    the balance the address list serves), read through its index, without
+    system names such as Adnr_Base.
+
+    Each row keeps the fields this route has always served: address,
+    balance, received (every amount sent to the address) and sent (every
+    amount and fee it sent), plus adnr. The two totals are summed for these
+    100 addresses only, in one grouped query each, through the address
+    indexes. `?view=balances` leaves them out: the address list's rows
+    (address, balance, adnr), without the sums."""
 
     def get(self, request, *args, **kwargs):
-        holders = (
+        holders = list(
             Address.objects.select_related("adnr")
-            # System names such as Adnr_Base are not addresses.
             .exclude(address__contains="_")
             .order_by("-balance")[:100]
         )
-        return Response(AddressSerializer(holders, many=True).data, status=200)
+        rows = AddressSerializer(holders, many=True).data
+        if request.query_params.get("view") == "balances":
+            return Response(rows, status=200)
+
+        addresses = [holder.address for holder in holders]
+        received = dict(
+            Transaction.objects.filter(to_address__in=addresses)
+            .values("to_address")
+            .annotate(total=Sum("total_amount"))
+            .order_by()
+            .values_list("to_address", "total")
+        )
+        sent = dict(
+            Transaction.objects.filter(from_address__in=addresses)
+            .values("from_address")
+            .annotate(
+                total=Sum(
+                    ExpressionWrapper(
+                        F("total_amount") + F("total_fee"),
+                        output_field=DecimalField(decimal_places=16, max_digits=32),
+                    )
+                )
+            )
+            .order_by()
+            .values_list("from_address", "total")
+        )
+        return Response(
+            [
+                {
+                    "address": row["address"],
+                    "balance": row["balance"],
+                    "received": received.get(row["address"]) or Decimal(0),
+                    "sent": sent.get(row["address"]) or Decimal(0),
+                    "adnr": row["adnr"],
+                }
+                for row in rows
+            ],
+            status=200,
+        )
 
 
 class AddressDetailView(AddressView):

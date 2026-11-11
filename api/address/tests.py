@@ -51,8 +51,34 @@ class TopHoldersTests(TestCase):
         self.assertEqual(len(rows), 100)
         self.assertEqual(rows[0]["address"], "R00000104")
         self.assertEqual(float(rows[0]["balance"]), 104)
-        self.assertEqual(set(rows[0]), {"address", "balance", "adnr"})
+        self.assertEqual(list(rows[0]), ["address", "balance", "received", "sent", "adnr"])
         self.assertNotIn("Reserve_Base", [row["address"] for row in rows])
+
+    def test_rows_keep_the_received_and_sent_totals(self):
+        block = make_block(1)
+        Address.objects.create(address="RHOLDER1", balance=Decimal("5"))
+        Address.objects.create(address="RHOLDER2", balance=Decimal("1"))
+        for tx_hash, sender, recipient, amount, fee, tx_type in (
+            ("a", "RFUND", "RHOLDER1", "10", "0", Transaction.Type.TX),
+            ("b", "RHOLDER1", "RHOLDER2", "4", "0.5", Transaction.Type.TX),
+            # Every type counts, as this route always summed them.
+            ("c", "RHOLDER1", "Adnr_Base", "0.5", "0", Transaction.Type.ADDRESS),
+        ):
+            Transaction.objects.create(hash=tx_hash, block=block, height=1, type=tx_type, from_address=sender,
+                                       to_address=recipient, total_amount=Decimal(amount), total_fee=Decimal(fee),
+                                       date_crafted=block.date_crafted)
+
+        rows = self.client.get("/api/addresses/top-holders/").json()
+
+        self.assertEqual(
+            [(r["address"], r["balance"], r["received"], r["sent"], r["adnr"]) for r in rows],
+            [("RHOLDER1", 5.0, 10.0, 5.0, None), ("RHOLDER2", 1.0, 4.0, 0, None)],
+        )
+
+    def test_the_balances_view_leaves_the_totals_out(self):
+        Address.objects.create(address="RHOLDER1", balance=Decimal("5"))
+        rows = self.client.get("/api/addresses/top-holders/?view=balances").json()
+        self.assertEqual(rows, [{"address": "RHOLDER1", "balance": 5.0, "adnr": None}])
 
 
 class AddressActivityTests(TestCase):
