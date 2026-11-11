@@ -269,11 +269,11 @@ class EffectsQueryTests(TestCase):
         plain_small, _ = self.count(3, include="")
         plain_large, _ = self.count(40, include="")
         self.assertGreater(large_rows, small_rows)
-        # Eleven fixed reads, and four more only when the page holds a
-        # recovery, a recovered send or a reserve NFT transfer or callback:
-        # never one per row.
-        self.assertLessEqual(large - plain_large, 15)
-        self.assertLessEqual(small - plain_small, 15)
+        # Eleven fixed reads, and up to six more only when the page holds a
+        # recovery, a recovered send, a reserve NFT transfer or callback, a
+        # mint or a contract Transfer(): never one per row.
+        self.assertLessEqual(large - plain_large, 17)
+        self.assertLessEqual(small - plain_small, 17)
 
 
 class LegacyTokenTransferTests(TestCase):
@@ -326,3 +326,125 @@ class LegacyTokenTransferTests(TestCase):
         self.assertEqual(hashes, [])
         hashes, _ = self.hashes_and_rows(f"/api/transaction/activity/?addresses={self.DAVE}")
         self.assertEqual(hashes, [])
+
+
+class RedirectedVbtcSendTests(TestCase):
+    """A recovery redirects a pending reserve vBTC send: its transfer row
+    names the recovery address, the transaction still names the recipient."""
+
+    @classmethod
+    def setUpTestData(cls):
+        from rbx.models import VbtcV2TokenTransfer
+
+        chain = f.build_chain()
+        send = chain.tx(5, "t-vbtc-redirected", f.RECOVERED_VAULT, f.BOB, "0",
+                        tx_type=Transaction.Type.VBTC_V2_TRANSFER,
+                        data={"Function": "TransferVBTC()", "ContractUID": f.VAULT_SC, "Amount": 0.01},
+                        unlock_in=-timedelta(days=6))
+        VbtcV2TokenTransfer.objects.create(
+            token=VbtcV2Token.objects.get(sc_identifier=f.VAULT_SC), transaction=send,
+            from_address=f.RECOVERED_VAULT, to_address=f.RECOVERY, amount=Decimal("0.01"),
+            created_at=send.date_crafted,
+        )
+
+    def setUp(self):
+        cache.clear()
+
+    def test_the_recovery_address_sees_the_redirected_send_with_its_credit(self):
+        credit = {"address": f.RECOVERY, "asset": f"vbtc:{f.VAULT_SC}", "delta": "0.01", "locked": False}
+        for url in (
+            f"/api/transaction/address/{f.RECOVERY}/?include=effects",
+            f"/api/transaction/addresses/{f.RECOVERY},{f.CAROL}/?include=effects",
+            f"/api/transaction/activity/?addresses={f.RECOVERY}&include=effects",
+        ):
+            with self.subTest(url=url):
+                rows = {row["hash"]: row for row in self.client.get(url).json()["results"]}
+                self.assertIn("t-vbtc-redirected", rows)
+                self.assertIn(credit, rows["t-vbtc-redirected"]["effects"])
+
+    def test_without_effects_the_list_is_unchanged(self):
+        rows = self.client.get(f"/api/transaction/address/{f.RECOVERY}/").json()["results"]
+        self.assertNotIn("t-vbtc-redirected", [row["hash"] for row in rows])
+
+
+class KindTests(TestCase):
+    """`kind` follows how the indexer applies each type and function."""
+
+    @classmethod
+    def setUpTestData(cls):
+        from rbx.models import VbtcToken
+
+        chain = f.build_chain()
+        cls.chain = chain
+        chain.block(9, timedelta(minutes=5))
+
+        def tx(tx_hash, tx_type, data, from_address=f.ALICE, to_address=f.BOB):
+            chain.tx(9, tx_hash, from_address, to_address, "0", tx_type=tx_type, data=data)
+
+        transfer = lambda uid: [{"Function": "Transfer()", "ContractUID": uid}]
+        # A type 26 transaction moves a balance, whatever its function says.
+        tx("k-26-transfer", Transaction.Type.VBTC_V2_TRANSFER, {"Function": "Transfer()", "ContractUID": f.VAULT_SC})
+        tx("k-26-plain", Transaction.Type.VBTC_V2_TRANSFER,
+           {"Function": "TransferVBTC()", "ContractUID": f.VAULT_SC, "Amount": 0.1})
+        # A vault handover through each type the indexer applies it under.
+        tx("k-handover-nft-tx", Transaction.Type.NFT_TX, transfer(f.VAULT_SC))
+        tx("k-handover-tknz-tx", Transaction.Type.TKNZ_TX, transfer(f.VAULT_SC))
+        tx("k-handover-sc-tx", Transaction.Type.SC_TX, {"Function": "Transfer()", "ContractUID": f.VAULT_SC})
+        # A smart-contract and an NFT transfer of something that is no vault.
+        tx("k-sc-transfer", Transaction.Type.SC_TX, {"Function": "Transfer()", "ContractUID": "sc:plain"})
+        tx("k-nft-transfer", Transaction.Type.NFT_TX, transfer("nft:sent"))
+        # A legacy vault's handover.
+        legacy_nft = chain.nft("vbtc1:legacy", f.ALICE, chain.tx(9, "k-legacy-mint", f.ALICE, f.ALICE, "0",
+                                                                 tx_type=Transaction.Type.TKNZ_MINT,
+                                                                 data=[{"Function": "Mint()"}]), is_vbtc=True)
+        VbtcToken.objects.create(sc_identifier="vbtc1:legacy", nft=legacy_nft, owner_address=f.ALICE,
+                                 image_base64="default", deposit_address="legacy-deposit",
+                                 created_at=legacy_nft.minted_at)
+        tx("k-legacy-handover", Transaction.Type.TKNZ_TX, transfer("vbtc1:legacy"))
+        # A vault minted under the NFT mint type.
+        from rbx.models import VbtcV2Token
+
+        mint = chain.tx(9, "k-vault-mint-type-2", f.ALICE, f.ALICE, "0", tx_type=Transaction.Type.NFT_MINT,
+                        data=[{"Function": "Mint()", "ContractUID": "vbtc:second"}])
+        second = chain.nft("vbtc:second", f.ALICE, mint, is_vbtc=True)
+        VbtcV2Token.objects.create(sc_identifier="vbtc:second", nft=second, owner_address=f.ALICE,
+                                   image_base64="default", deposit_address="tb1qsecond",
+                                   created_at=mint.date_crafted)
+        # Functions outside the types that run them.
+        tx("k-token-fn-on-tx", Transaction.Type.TX, [{"Function": "TokenTransfer()", "ContractUID": f.TOKEN_SC}])
+        tx("k-callback-fn-on-tx", Transaction.Type.TX, {"Function": "CallBack()", "Hash": "t-alice-bob"})
+        tx("k-token-fn-on-sc-tx", Transaction.Type.SC_TX, {"Function": "TokenTransfer()", "ContractUID": f.TOKEN_SC})
+
+    def setUp(self):
+        cache.clear()
+
+    def kinds(self):
+        rows = self.client.get("/api/transaction/?include=effects&limit=500").json()["results"]
+        return {row["hash"]: row["kind"] for row in rows}
+
+    def test_kinds(self):
+        kinds = self.kinds()
+        expected = {
+            "k-26-transfer": "vbtc_transfer",
+            "k-26-plain": "vbtc_transfer",
+            "k-handover-nft-tx": "vbtc_vault_transfer",
+            "k-handover-tknz-tx": "vbtc_vault_transfer",
+            "k-handover-sc-tx": "vbtc_vault_transfer",
+            "k-sc-transfer": "sc_transfer",
+            "k-nft-transfer": "nft_transfer",
+            "k-legacy-handover": "tokenization_vault_transfer",
+            "k-legacy-mint": "tokenization_mint",
+            "k-vault-mint-type-2": "vbtc_mint",
+            "t-vbtc-mint": "vbtc_mint",
+            "t-nft-mint": "nft_mint",
+            "t-token-deploy": "token_deploy",
+            "k-token-fn-on-tx": "vfx_transfer",
+            "k-callback-fn-on-tx": "vfx_transfer",
+            "k-token-fn-on-sc-tx": "token_transfer",
+        }
+        self.assertEqual({tx_hash: kinds[tx_hash] for tx_hash in expected}, expected)
+
+    def test_the_detail_reads_the_same_kind(self):
+        for tx_hash, kind in (("k-handover-sc-tx", "vbtc_vault_transfer"), ("k-26-transfer", "vbtc_transfer")):
+            body = self.client.get(f"/api/transaction/{tx_hash}/?include=effects").json()
+            self.assertEqual(body["kind"], kind)
