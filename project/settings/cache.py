@@ -48,3 +48,7 @@ TRANSACTION_DETAIL_MAX_AGE = ENV.int("TRANSACTION_DETAIL_MAX_AGE", default=86400
 # /prices/<coin>/history/: cached per URL this long (the sweep records a
 # price every 5 minutes).
 PRICE_HISTORY_CACHE_SECONDS = ENV.int("PRICE_HISTORY_CACHE_SECONDS", default=180)
+
+# /wallet/summary/: a body is cached under the block it describes, this long
+# at most (the vBTC backing sweep can change it between blocks).
+WALLET_SUMMARY_CACHE_SECONDS = ENV.int("WALLET_SUMMARY_CACHE_SECONDS", default=30)

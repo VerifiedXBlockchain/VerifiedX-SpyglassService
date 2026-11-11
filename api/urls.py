@@ -24,6 +24,7 @@ urlpatterns = [
     path("btc/", include("api.btc.urls")),
     path("cmc-price/", include("api.cmc_price.urls")),
     path("prices/", include("api.prices.urls")),
+    path("wallet/", include("api.wallet.urls")),
     path("fungible-tokens/", include("api.fungible_token.urls")),
     path("circulation/", circulation),
     path("circulation/lifetime/", lifetime_balance),
