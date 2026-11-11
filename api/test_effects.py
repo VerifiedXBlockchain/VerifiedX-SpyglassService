@@ -1,6 +1,7 @@
 """?include=effects on the transaction lists (api.effects)."""
 
 from collections import defaultdict
+from datetime import timedelta
 from decimal import Decimal
 
 from django.core.cache import cache
@@ -9,7 +10,7 @@ from django.test import TestCase, override_settings
 from django.test.utils import CaptureQueriesContext
 
 from api.wallet import fixture_data as f
-from rbx.models import Address, Nft, VbtcV2Token
+from rbx.models import Address, Nft, Transaction, VbtcV2Token
 
 CENT = Decimal(1).scaleb(-16)
 OLD_KEYS = [
@@ -273,3 +274,55 @@ class EffectsQueryTests(TestCase):
         # never one per row.
         self.assertLessEqual(large - plain_large, 15)
         self.assertLessEqual(small - plain_small, 15)
+
+
+class LegacyTokenTransferTests(TestCase):
+    """An old-style TokenTransfer() is sent to Token_Base; only its
+    FungibleTokenTx row names the recipient."""
+
+    DAVE = "RDAVE"
+
+    @classmethod
+    def setUpTestData(cls):
+        from rbx.models import FungibleToken, FungibleTokenTx
+
+        chain = f.build_chain()
+        chain.block(9, timedelta(minutes=5))
+        legacy = chain.tx(9, "t-token-legacy", f.ALICE, "Token_Base", "0", tx_type=Transaction.Type.FTKN_TX,
+                          data=[{"Function": "TokenTransfer()", "ContractUID": f.TOKEN_SC, "Amount": 7,
+                                 "FromAddress": f.ALICE, "ToAddress": cls.DAVE, "TokenTicker": "ALT"}])
+        Address.objects.get_or_create(address=cls.DAVE)
+        FungibleTokenTx.objects.create(
+            type=FungibleTokenTx.Type.TRANSFER, sc_identifier=f.TOKEN_SC,
+            token=FungibleToken.objects.get(sc_identifier=f.TOKEN_SC), sending_address=f.ALICE,
+            receiving_address=cls.DAVE, amount=Decimal("7"), transaction=legacy,
+        )
+
+    def setUp(self):
+        cache.clear()
+
+    def hashes_and_rows(self, url):
+        rows = self.client.get(url).json()["results"]
+        return [row["hash"] for row in rows], rows
+
+    def test_the_recipient_sees_it_and_its_token_deltas_add_up(self):
+        served = {
+            t["token"]["sc_identifier"]: Decimal(str(t["balance"]))
+            for t in self.client.get(f"/api/addresses/{self.DAVE}/tokens/").json()["tokens"]
+        }
+        self.assertEqual(served[f.TOKEN_SC], Decimal("7"))
+        for url in (
+            f"/api/transaction/address/{self.DAVE}/?include=effects",
+            f"/api/transaction/addresses/{self.DAVE},{f.CAROL}/?include=effects",
+            f"/api/transaction/activity/?addresses={self.DAVE}&include=effects",
+        ):
+            with self.subTest(url=url):
+                hashes, rows = self.hashes_and_rows(url)
+                self.assertIn("t-token-legacy", hashes)
+                self.assertEqual(sums(rows, "token")[(self.DAVE, f"token:{f.TOKEN_SC}")], served[f.TOKEN_SC])
+
+    def test_without_effects_the_list_is_unchanged(self):
+        hashes, _ = self.hashes_and_rows(f"/api/transaction/address/{self.DAVE}/")
+        self.assertEqual(hashes, [])
+        hashes, _ = self.hashes_and_rows(f"/api/transaction/activity/?addresses={self.DAVE}")
+        self.assertEqual(hashes, [])
