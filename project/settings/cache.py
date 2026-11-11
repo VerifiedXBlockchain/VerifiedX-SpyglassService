@@ -44,3 +44,7 @@ INDEXED_HEIGHT_CACHE_SECONDS = ENV.int("INDEXED_HEIGHT_CACHE_SECONDS", default=1
 
 # Cache-Control max-age of a found /transaction/<hash>/ that nests no NFT.
 TRANSACTION_DETAIL_MAX_AGE = ENV.int("TRANSACTION_DETAIL_MAX_AGE", default=86400)
+
+# /prices/<coin>/history/: cached per URL this long (the sweep records a
+# price every 5 minutes).
+PRICE_HISTORY_CACHE_SECONDS = ENV.int("PRICE_HISTORY_CACHE_SECONDS", default=180)
