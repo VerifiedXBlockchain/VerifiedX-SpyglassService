@@ -20,7 +20,8 @@ MIDDLEWARE = [
     # it weak), and below CORS and the height header, which the 304 it
     # builds would otherwise lose. A client that sends no If-None-Match sees
     # no difference.
-    "django.middleware.http.ConditionalGetMiddleware",
+    # Django's ConditionalGetMiddleware, keeping the height header on a 304.
+    "api.indexed_height.HeightKeepingConditionalGetMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
     "django.middleware.locale.LocaleMiddleware",
     "django.contrib.auth.middleware.AuthenticationMiddleware",

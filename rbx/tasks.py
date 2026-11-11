@@ -295,9 +295,14 @@ def sync_block(height: int, data: Optional[dict] = None, notify: bool = True) ->
     # touched (the saves above queued theirs too; this also covers rows the
     # indexer derived without a signal). Best effort, the block stands.
     try:
-        balance_cache.invalidate(affected_addresses(height))
+        invalidated = balance_cache.invalidate(affected_addresses(height))
     except Exception:
         logging.exception(f"Invalidating the cached balances of block {height} failed")
+        invalidated = False
+    # Only after the invalidation succeeded: the wallet summary trusts
+    # cached balances for a block once this marker reaches it.
+    if invalidated:
+        balance_cache.mark_invalidated_through(height)
 
     # A Bitcoin report, rewind or rekey: the watched vaults' withdrawals and
     # exits take their outcome from the node, once, after the block is

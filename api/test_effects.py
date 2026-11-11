@@ -76,7 +76,11 @@ class EffectsTests(TestCase):
                     {key: value for key, value in row.items() if key not in ("kind", "effects")}
                     for row in with_effects["results"]
                 ]
-                self.assertEqual(stripped, plain_rows)
+                # Rows of one block share date_crafted, and the numbered lists
+                # order by it alone, so their order among ties is open.
+                by_hash = lambda rows: {row["hash"]: row for row in rows}
+                self.assertEqual(by_hash(stripped), by_hash(plain_rows))
+                self.assertEqual(len(stripped), len(plain_rows))
                 self.assertEqual(list(with_effects["results"][0])[:5], ["hash", "height", "type", "type_label", "kind"])
                 self.assertEqual(list(with_effects["results"][0])[-1], "effects")
 

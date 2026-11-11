@@ -38,6 +38,7 @@ from django.utils import timezone
 
 PREFIX = "addrbal:v1"
 EPOCH_KEY = f"{PREFIX}:epoch"
+INVALIDATED_THROUGH_KEY = f"{PREFIX}:invalidated_through"
 
 
 def _max_age():
@@ -144,21 +145,64 @@ def balance(address_row, now=None):
 
 def invalidate(addresses):
     """Make the cached balances of these addresses miss. Call after the
-    writes are committed (queue_invalidation does that)."""
+    writes are committed (queue_invalidation does that). True when the new
+    tokens were written (or there was nothing to replace), False when the
+    cache refused them."""
     addresses = {a for a in addresses if a}
     if not addresses:
-        return
+        return True
     try:
         cache.set_many({_gen_key(a): _new_token() for a in addresses}, _token_age())
     except Exception:
         logging.exception(f"Address balance cache invalidation failed for {len(addresses)} addresses")
+        return False
+    return True
+
+
+def mark_invalidated_through(height):
+    """Record that no cached balance predates block `height`: sync_block
+    calls it after the block is committed and invalidate() replaced its
+    addresses' tokens. A cache hit read once the marker reaches a height
+    was computed after that block committed (a reader takes the tokens
+    first, and those tokens did not exist before the replacement).
+
+    The marker moves only from height - 1 to height. When it is missing or
+    further behind (a block whose invalidation failed, a flushed cache, the
+    first block after a deploy), the block before may have left entries
+    that no token replacement reached, so every cached balance is dropped
+    first (a new epoch); if that fails the marker stays. A block at or
+    below the marker (synced again) leaves it as it is. True when the
+    marker reaches `height`."""
+    try:
+        current = cache.get(INVALIDATED_THROUGH_KEY)
+        if current is not None and height <= current:
+            return True
+        if current != height - 1 and not invalidate_all():
+            return False
+        cache.set(INVALIDATED_THROUGH_KEY, height, None)
+    except Exception:
+        logging.exception(f"Recording the balance invalidation of block {height} failed")
+        return False
+    return True
+
+
+def invalidated_through():
+    """The height mark_invalidated_through() last recorded, or None."""
+    try:
+        return cache.get(INVALIDATED_THROUGH_KEY)
+    except Exception:
+        logging.exception("Reading the balance invalidation marker failed")
+        return None
 
 
 def invalidate_all():
+    """Drop every cached balance (a new epoch). True when it was written."""
     try:
         cache.set(EPOCH_KEY, _new_token(), None)
     except Exception:
         logging.exception("Address balance cache invalidation (all) failed")
+        return False
+    return True
 
 
 _pending = threading.local()
