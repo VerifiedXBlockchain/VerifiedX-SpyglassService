@@ -1680,7 +1680,7 @@ class VbtcV2Token(models.Model):
 
         return {addr: bal for addr, bal in entries.items() if bal > 0}
 
-    def available_balances(self, current_height=None):
+    def available_balances(self, current_height=None, held=None):
         """`addresses` minus each address's open legacy withdrawal requests
         and each reserve address's sends still waiting to unlock.
 
@@ -1702,8 +1702,11 @@ class VbtcV2Token(models.Model):
 
         Entries floor at zero rather than disappearing so a fully reserved
         holding still shows as held.
+
+        `held` is `addresses` already read by the caller, so it is not built
+        twice; it is not changed.
         """
-        balances = self.addresses
+        balances = dict(held) if held is not None else self.addresses
         if current_height is None:
             current_height = Block.objects.aggregate(v=Max("height"))["v"] or 0
 
