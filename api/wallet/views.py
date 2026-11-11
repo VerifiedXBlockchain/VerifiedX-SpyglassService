@@ -25,9 +25,14 @@ GET /wallet/summary/?addresses=a,b,...   (1 to MAX_ADDRESSES)
 Every figure is read the way the single-address endpoints read it, and the
 tests compare the two. The body is built between two reads of the latest
 block and rebuilt when a block landed in between, so it describes one
-block; it is then cached under that block for WALLET_SUMMARY_CACHE_SECONDS,
-and ConditionalGetMiddleware answers a repeated If-None-Match with 304 until
-a new block (or the vBTC backing sweep, within that time) changes the body.
+block. Cached balances are used, and the body is cached under that block
+for WALLET_SUMMARY_CACHE_SECONDS, only once sync_block has recorded that
+the block's balance invalidation completed
+(balance_cache.mark_invalidated_through); before that every balance is
+computed and nothing is stored, so no body names a block with a balance
+from before it. ConditionalGetMiddleware answers a repeated If-None-Match
+with 304 until a new block (or the vBTC backing sweep, within that time)
+changes the body.
 """
 
 import hashlib
@@ -275,7 +280,7 @@ def _latest_transactions(addresses):
     }
 
 
-def build_summary(addresses, head):
+def build_summary(addresses, head, use_balance_cache=True):
     height = head[0] if head else None
     now = chain_time()
     rows = {row.address: row for row in Address.objects.filter(address__in=addresses).select_related("adnr")}
@@ -289,7 +294,10 @@ def build_summary(addresses, head):
     for address in addresses:
         row = rows.get(address)
         if row is not None:
-            available, locked, total = balance_cache.balance(row, now=now)
+            if use_balance_cache:
+                available, locked, total = balance_cache.balance(row, now=now)
+            else:
+                available, locked, total = row.get_balance()
         else:
             available = locked = total = Decimal(0)
         activated, deactivated = reserve.get(address, (False, False))
@@ -346,9 +354,14 @@ class WalletSummaryView(GenericAPIView):
                     cached = None
                 if cached is not None:
                     return Response(cached)
-            body = build_summary(addresses, head)
+            # Cached balances are trusted, and the body stored, only once
+            # the balance invalidation of this block has completed: between
+            # the block's commit and that, a cached balance can still be
+            # the previous block's. Until then every balance is computed.
+            settled = head is not None and (balance_cache.invalidated_through() or -1) >= head[0]
+            body = build_summary(addresses, head, use_balance_cache=settled)
             if _head() == head:
-                if key is not None:
+                if key is not None and settled:
                     try:
                         cache.set(key, body, settings.WALLET_SUMMARY_CACHE_SECONDS)
                     except Exception:

@@ -38,6 +38,7 @@ from django.utils import timezone
 
 PREFIX = "addrbal:v1"
 EPOCH_KEY = f"{PREFIX}:epoch"
+INVALIDATED_THROUGH_KEY = f"{PREFIX}:invalidated_through"
 
 
 def _max_age():
@@ -152,6 +153,30 @@ def invalidate(addresses):
         cache.set_many({_gen_key(a): _new_token() for a in addresses}, _token_age())
     except Exception:
         logging.exception(f"Address balance cache invalidation failed for {len(addresses)} addresses")
+
+
+def mark_invalidated_through(height):
+    """Record that every balance change of the blocks up to `height` has
+    been invalidated: sync_block calls it once the block is committed and
+    its addresses' tokens are replaced. A cache hit read after this marker
+    reaches a height was computed after that block committed (a reader
+    takes the tokens first, and those tokens did not exist before the
+    replacement). Only ever raised; a lost marker means "not yet"."""
+    try:
+        current = cache.get(INVALIDATED_THROUGH_KEY)
+        if current is None or height > current:
+            cache.set(INVALIDATED_THROUGH_KEY, height, None)
+    except Exception:
+        logging.exception(f"Recording the balance invalidation of block {height} failed")
+
+
+def invalidated_through():
+    """The height mark_invalidated_through() last recorded, or None."""
+    try:
+        return cache.get(INVALIDATED_THROUGH_KEY)
+    except Exception:
+        logging.exception("Reading the balance invalidation marker failed")
+        return None
 
 
 def invalidate_all():

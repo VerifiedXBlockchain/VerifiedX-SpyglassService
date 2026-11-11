@@ -146,6 +146,18 @@ class AddressBalanceCacheTests(TestCase):
         self.assertEqual(after, self.cold("RFUNDED"))
         self.assertEqual(Decimal(str(self.client.get("/api/addresses/RFUNDED/").json()["balance"])), Decimal("6.75"))
 
+    def test_sync_block_marks_the_block_invalidated_after_invalidating(self):
+        self.assertIsNone(balance_cache.invalidated_through())
+        with patch("rbx.tasks.balance_cache.invalidate", side_effect=RuntimeError("redis down")):
+            sync_block(2, data=block_data(2, T0 + timedelta(minutes=1)), notify=False)
+        # A failed invalidation records nothing.
+        self.assertIsNone(balance_cache.invalidated_through())
+        sync_block(3, data=block_data(3, T0 + timedelta(minutes=2)), notify=False)
+        self.assertEqual(balance_cache.invalidated_through(), 3)
+        # Never lowered by an older block synced again.
+        balance_cache.mark_invalidated_through(2)
+        self.assertEqual(balance_cache.invalidated_through(), 3)
+
     def test_a_block_that_does_not_touch_the_address_keeps_its_entry(self):
         before = self.get("RTINY")
         sync_block(

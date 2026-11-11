@@ -298,6 +298,10 @@ def sync_block(height: int, data: Optional[dict] = None, notify: bool = True) ->
         balance_cache.invalidate(affected_addresses(height))
     except Exception:
         logging.exception(f"Invalidating the cached balances of block {height} failed")
+    else:
+        # Only after the invalidation succeeded: the wallet summary trusts
+        # cached balances for a block once this marker reaches it.
+        balance_cache.mark_invalidated_through(height)
 
     # A Bitcoin report, rewind or rekey: the watched vaults' withdrawals and
     # exits take their outcome from the node, once, after the block is

@@ -7,7 +7,8 @@ from django.test import TestCase, override_settings
 from django.test.utils import CaptureQueriesContext
 
 from api.wallet import fixture_data as f
-from rbx.models import Block, Transaction
+from rbx import balance_cache
+from rbx.models import Address, Block, Transaction
 
 URL = "/api/wallet/summary/"
 
@@ -129,17 +130,46 @@ class WalletSummaryTests(TestCase):
         self.assertEqual(after.json()["indexed_height"], 9)
         self.assertEqual(after.json()["results"][0]["latest_transaction"]["hash"], "t-new")
 
+    def test_a_block_whose_balances_are_not_invalidated_yet_is_read_uncached(self):
+        balance_cache.mark_invalidated_through(8)
+        warm = self.summary([f.ALICE]).json()["results"][0]
+        self.assertTrue(cache.keys("walletsummary:*"))
+        cache.delete_many(list(cache.keys("walletsummary:*")))
+
+        # Block 9 is committed and visible, but its balance invalidation
+        # has not run (a TestCase never runs on_commit callbacks): Alice's
+        # cached balance is still block 8's.
+        blk = self.chain.block(9, timedelta(minutes=1))
+        Transaction.objects.create(hash="t-gap", block=blk, height=9, type=Transaction.Type.TX,
+                                   from_address=f.BOB, to_address=f.ALICE, total_amount=Decimal("2"),
+                                   date_crafted=blk.date_crafted)
+        stale = balance_cache.balance(Address.objects.get(address=f.ALICE))[2]
+        self.assertEqual(stale.quantize(Decimal("1e-16")), Decimal(warm["balance_total_string"]))
+
+        body = self.summary([f.ALICE]).json()
+        self.assertEqual(body["indexed_height"], 9)
+        self.assertEqual(Decimal(body["results"][0]["balance_total_string"]),
+                         Decimal(warm["balance_total_string"]) + 2)
+        self.assertEqual(cache.keys("walletsummary:*"), [])
+
+        # Once the block's invalidation has completed the body is stored.
+        balance_cache.invalidate([f.ALICE, f.BOB])
+        balance_cache.mark_invalidated_through(9)
+        again = self.summary([f.ALICE]).json()
+        self.assertEqual(again["results"][0]["balance_total_string"], body["results"][0]["balance_total_string"])
+        self.assertTrue(cache.keys("walletsummary:*"))
+
     def test_a_block_landing_mid_build_is_rebuilt(self):
         from api.wallet import views
 
         real_build = views.build_summary
         calls = []
 
-        def build_while_a_block_lands(addresses, head):
+        def build_while_a_block_lands(addresses, head, **options):
             calls.append(head)
             if len(calls) == 1:
                 self.chain.block(9, timedelta(minutes=1))
-            return real_build(addresses, head)
+            return real_build(addresses, head, **options)
 
         views.build_summary = build_while_a_block_lands
         try:
@@ -163,6 +193,8 @@ class WalletSummaryQueryTests(TestCase):
         else:
             # Only the summary bodies: balances stay cached.
             cache.delete_many(list(cache.keys("walletsummary:*")))
+        # Block 8's balance invalidation has completed.
+        balance_cache.mark_invalidated_through(8)
         with CaptureQueriesContext(connection) as queries:
             response = self.client.get(summary_url(addresses))
         self.assertEqual(response.status_code, 200)
