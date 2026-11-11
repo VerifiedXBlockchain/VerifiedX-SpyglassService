@@ -187,6 +187,20 @@ class WalletSummaryQueryTests(TestCase):
         alone = self.count([f.ALICE], clear_balances=False)
         both = self.count([f.ALICE, f.BOB], clear_balances=False)
         self.assertEqual(alone, both)
+        # 11 without a vault; its ledger is built once (37 when
+        # available_balances() rebuilt it).
+        self.assertLessEqual(alone, 32)
+
+    def test_a_vault_ledger_is_built_once(self):
+        from unittest.mock import patch
+
+        from rbx.models import VbtcV2Token
+
+        cache.clear()
+        real = VbtcV2Token.ledger_entries
+        with patch.object(VbtcV2Token, "ledger_entries", autospec=True, side_effect=real) as built:
+            self.client.get(summary_url([f.ALICE, f.BOB]))
+        self.assertEqual(built.call_count, 1)
 
     def test_a_cached_body_costs_one_query(self):
         self.count([f.ALICE, f.BOB], clear_balances=True)

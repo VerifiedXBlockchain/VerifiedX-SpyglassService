@@ -229,7 +229,7 @@ def _vbtc_holdings(addresses, current_height):
         .order_by("-created_at", "sc_identifier")
     ):
         held = token.addresses
-        available = token.available_balances(current_height=current_height)
+        available = token.available_balances(current_height=current_height, held=held)
         for address in addresses:
             amount = held.get(address, Decimal(0))
             if amount <= 0:
