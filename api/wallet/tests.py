@@ -170,6 +170,16 @@ class WalletSummaryTests(TestCase):
         self.assertEqual(again.status_code, 304)
         self.assertEqual(again[HEADER], "8")
 
+    def test_the_height_header_switch_covers_the_summary(self):
+        from api.indexed_height import HEADER
+
+        with override_settings(INDEXED_HEIGHT_HEADER_ENABLED=False):
+            first = self.summary([f.ALICE])
+            again = self.client.get(summary_url([f.ALICE]), HTTP_IF_NONE_MATCH=first["ETag"])
+        self.assertFalse(first.has_header(HEADER))
+        self.assertEqual(again.status_code, 304)
+        self.assertFalse(again.has_header(HEADER))
+
     def test_a_block_landing_mid_build_is_rebuilt(self):
         from api.wallet import views
 
@@ -205,7 +215,7 @@ class WalletSummaryQueryTests(TestCase):
             # Only the summary bodies: balances stay cached.
             cache.delete_many(list(cache.keys("walletsummary:*")))
         # Block 8's balance invalidation has completed.
-        balance_cache.mark_invalidated_through(8)
+        cache.set(balance_cache.INVALIDATED_THROUGH_KEY, 8, None)
         with CaptureQueriesContext(connection) as queries:
             response = self.client.get(summary_url(addresses))
         self.assertEqual(response.status_code, 200)

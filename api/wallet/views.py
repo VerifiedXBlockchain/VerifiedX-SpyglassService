@@ -50,6 +50,7 @@ from rest_framework.response import Response
 
 from api.amounts import decimal_string
 from api.indexed_height import HEADER as INDEXED_HEIGHT_HEADER
+from api.indexed_height import enabled as indexed_height_enabled
 from api.nft.querysets import ALL_NFTS_QUERYSET
 from rbx import balance_cache
 from rbx.models import (
@@ -341,6 +342,8 @@ class WalletSummaryView(GenericAPIView):
         # read when the request came in; a 304 keeps it
         # (HeightKeepingConditionalGetMiddleware).
         response = super().finalize_response(request, response, *args, **kwargs)
+        if not indexed_height_enabled():
+            return response
         height = response.data.get("indexed_height") if isinstance(response.data, dict) else None
         if height is not None:
             response[INDEXED_HEIGHT_HEADER] = str(height)
