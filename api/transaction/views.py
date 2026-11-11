@@ -88,8 +88,8 @@ class TransactionDetailView(RetrieveModelMixin, TransactionView):
     def _immutable(data):
         """Only a plain VFX transfer (type TX) with no unlock time, not to or
         from a reserve (xRBX) address, nesting nothing. Every later writer of
-        a serialized field skips it: an NFT is attached only to mint types,
-        and later too (retry_unindexed_mints); unlock times are moved only on
+        a serialized field skips it: an NFT is attached only to mint and burn
+        types, and later too (retry_unindexed_mints); unlock times are moved only on
         reserve sends (redirect_reserve_transfer); callback and recovery
         details exist only on RESERVE rows; the voided and refused flags are
         not serialized."""
