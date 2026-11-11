@@ -42,6 +42,7 @@ from collections import OrderedDict
 from decimal import Decimal, InvalidOperation
 
 from api.amounts import decimal_string
+from rbx.vbtc_dispatch import OWNERSHIP_TRANSFER_TYPES, SC_ENVELOPE_TYPES
 from rbx.vbtc_gates import parse_envelope
 
 ATTRIBUTE = "_prefetched_effects"
@@ -50,37 +51,44 @@ KIND_ATTRIBUTE = "_prefetched_kind"
 VFX = "vfx"
 PSEUDO_HOLDERS = ("-", "+")
 
+# A function names the kind only where the indexer applies it
+# (rbx/tasks.py process_transaction, rbx/vbtc_dispatch.py route_envelope):
+# {function: (types it runs under, kind)}. Anywhere else the type decides.
+_ENVELOPE = SC_ENVELOPE_TYPES
+_MINTS = frozenset({2, 17, 25})
 KIND_BY_FUNCTION = {
-    "TokenDeploy()": "token_deploy",
-    "TokenMint()": "token_mint",
-    "TokenBurn()": "token_burn",
-    "TokenTransfer()": "token_transfer",
-    "TokenPause()": "token_pause",
-    "TokenBanAddress()": "token_ban_address",
-    "TokenContractOwnerChange()": "token_owner_change",
-    "TokenVoteTopicCreate()": "token_vote_topic_create",
-    "TokenVoteTopicCast()": "token_vote_cast",
-    "AdnrCreate()": "domain_create",
-    "AdnrDelete()": "domain_delete",
-    "AdnrTransfer()": "domain_transfer",
-    "BTCAdnrCreate()": "btc_domain_create",
-    "BTCAdnrDelete()": "btc_domain_delete",
-    "BTCAdnrTransfer()": "btc_domain_transfer",
-    "CallBack()": "vault_callback",
-    "Recover()": "vault_recover",
-    "Register()": "vault_activate",
-    "Sale_Start()": "nft_sale_start",
-    "Sale_Complete()": "nft_sale_complete",
-    "Evolve()": "nft_evolve",
-    "Devolve()": "nft_evolve",
-    "ChangeEvolveStateSpecific()": "nft_evolve",
-    "DecShopCreate()": "shop_create",
-    "DecShopUpdate()": "shop_update",
-    "DecShopDelete()": "shop_delete",
-    "TransferVBTCV2()": "vbtc_transfer",
-    "TransferVBTCMultiV2()": "vbtc_transfer",
-    "VBTCWithdrawalRequestMultiV2()": "vbtc_withdrawal_request",
+    "TransferVBTCV2()": (_ENVELOPE, "vbtc_transfer"),
+    "TokenMint()": (_ENVELOPE, "token_mint"),
+    "TokenBurn()": (_ENVELOPE, "token_burn"),
+    "TokenTransfer()": (_ENVELOPE, "token_transfer"),
+    "TokenPause()": (_ENVELOPE, "token_pause"),
+    "TokenBanAddress()": (_ENVELOPE, "token_ban_address"),
+    "TokenContractOwnerChange()": (_ENVELOPE, "token_owner_change"),
+    "TokenVoteTopicCreate()": (_ENVELOPE, "token_vote_topic_create"),
+    "TokenVoteTopicCast()": (_ENVELOPE, "token_vote_cast"),
+    "TokenDeploy()": (_MINTS, "token_deploy"),
+    "AdnrCreate()": ({6}, "domain_create"),
+    "AdnrDelete()": ({6}, "domain_delete"),
+    "AdnrTransfer()": ({6}, "domain_transfer"),
+    "BTCAdnrCreate()": ({6}, "btc_domain_create"),
+    "BTCAdnrDelete()": ({6}, "btc_domain_delete"),
+    "BTCAdnrTransfer()": ({6}, "btc_domain_transfer"),
+    "DecShopCreate()": ({7}, "shop_create"),
+    "DecShopUpdate()": ({7}, "shop_update"),
+    "DecShopDelete()": ({7}, "shop_delete"),
+    "CallBack()": ({10}, "vault_callback"),
+    "Recover()": ({10}, "vault_recover"),
+    "Register()": ({10}, "vault_activate"),
+    "Sale_Start()": ({5}, "nft_sale_start"),
+    "Sale_Complete()": ({5}, "nft_sale_complete"),
+    "Evolve()": ({3}, "nft_evolve"),
+    "Devolve()": ({3}, "nft_evolve"),
+    "ChangeEvolveStateSpecific()": ({3}, "nft_evolve"),
 }
+
+# The types whose Transfer() hands a vBTC V2 vault to a new owner: NFT_TX,
+# TKNZ_TX, SC_TX.
+_HANDOVER_TYPES = OWNERSHIP_TRANSFER_TYPES
 
 KIND_BY_TYPE = {
     0: "vfx_transfer",
@@ -151,19 +159,68 @@ def _function(tx):
     return payload, function if isinstance(function, str) else None
 
 
-def kind_of(tx, transferred_vault=False):
-    """A slug for what the transaction is: by its contract function where it
-    has one, else by its type. A contract Transfer() of a vBTC vault is
-    vbtc_vault_transfer; a type TX from a reserve (xRBX) address is
-    vfx_vault_transfer. Stable: a slug is never renamed."""
+def contract_uid(tx):
+    payload, _ = _function(tx)
+    uid = payload.get("ContractUID") if isinstance(payload, dict) else None
+    return uid.strip() if isinstance(uid, str) else None
+
+
+def kind_of(tx, v2_vaults=frozenset(), v1_vaults=frozenset(), v2_vault_mints=frozenset()):
+    """A slug for what the transaction is, as the indexer applies it.
+
+    - vbtc_vault_transfer: a Transfer() under NFT_TX, TKNZ_TX or SC_TX
+      whose ContractUID is a vBTC V2 vault (the owner changes,
+      vbtc_dispatch.apply_ownership_transfer). tokenization_vault_transfer:
+      the same under TKNZ_TX for a legacy vault. A type 26 transaction moves
+      a vBTC balance whatever its function: vbtc_transfer.
+    - vbtc_mint: a mint (types 2, 17, 25) that created a vBTC V2 vault.
+    - A contract function names the kind under the types the indexer runs
+      it for (KIND_BY_FUNCTION); otherwise the type does. A type TX from a
+      reserve (xRBX) address is vfx_vault_transfer.
+
+    `v2_vaults` and `v1_vaults` are the vault contract ids, and
+    `v2_vault_mints` the mint hashes, among the page's transactions
+    (prefetch_effects reads them). Stable: a slug is never renamed."""
     _, function = _function(tx)
-    if function == "Transfer()" and (transferred_vault or tx.type in (18, 26)):
-        return "vbtc_vault_transfer"
-    if function in KIND_BY_FUNCTION:
-        return KIND_BY_FUNCTION[function]
+    if function == "Transfer()" and tx.type in _HANDOVER_TYPES:
+        uid = contract_uid(tx)
+        if uid in v2_vaults:
+            return "vbtc_vault_transfer"
+        if tx.type == 18 and uid in v1_vaults:
+            return "tokenization_vault_transfer"
+    if tx.type in _MINTS and tx.hash in v2_vault_mints:
+        return "vbtc_mint"
+    types, kind = KIND_BY_FUNCTION.get(function, ((), None))
+    if tx.type in types:
+        return kind
     if tx.type == 0 and tx.from_address.startswith("xRBX"):
         return "vfx_vault_transfer"
     return KIND_BY_TYPE.get(tx.type, f"type_{tx.type}")
+
+
+def vault_contracts(transactions):
+    """(v2_vaults, v1_vaults, v2_vault_mints) for kind_of, in at most two
+    queries, none when no transaction of the page needs them."""
+    from django.db.models import Q
+
+    from rbx.models import VbtcToken, VbtcV2Token
+
+    uids = {
+        contract_uid(tx) for tx in transactions if tx.type in _HANDOVER_TYPES and _function(tx)[1] == "Transfer()"
+    } - {None}
+    mints = [tx.hash for tx in transactions if tx.type in _MINTS]
+    v2_vaults, v2_vault_mints, v1_vaults = set(), set(), set()
+    if uids or mints:
+        for sc, mint_hash in VbtcV2Token.objects.filter(
+            Q(sc_identifier__in=uids) | Q(nft__mint_transaction_id__in=mints)
+        ).values_list("sc_identifier", "nft__mint_transaction_id"):
+            if sc in uids:
+                v2_vaults.add(sc)
+            if mint_hash in mints:
+                v2_vault_mints.add(mint_hash)
+    if any(tx.type == 18 and contract_uid(tx) in uids - v2_vaults for tx in transactions):
+        v1_vaults = set(VbtcToken.objects.filter(sc_identifier__in=uids - v2_vaults).values_list("sc_identifier", flat=True))
+    return v2_vaults, v1_vaults, v2_vault_mints
 
 
 class _Ledger:
@@ -368,13 +425,10 @@ def prefetch_effects(transactions):
     ).values_list("identifier", "mint_transaction_id"):
         tx = by_hash[mint_hash]
         ledgers[mint_hash].add(tx.from_address, f"nft:{nft_id}", Decimal(1))
-    vault_transfers = set()
     nft_transfers = {}
     for nft_id, tx_hash, is_vbtc, is_token in Nft.transfer_transactions.through.objects.filter(
         transaction_id__in=hashes
     ).values_list("nft_id", "transaction_id", "nft__is_vbtc", "nft__is_fungible_token"):
-        if is_vbtc:
-            vault_transfers.add(tx_hash)
         if is_vbtc or is_token:
             continue
         tx = by_hash[tx_hash]
@@ -428,9 +482,10 @@ def prefetch_effects(transactions):
                 original = by_hash[called_back]
                 ledgers[called_back].add(original.to_address, f"nft:{reserve_transfers[called_back]}", Decimal(-1))
 
+    v2_vaults, v1_vaults, v2_vault_mints = vault_contracts(transactions)
     for tx in transactions:
         setattr(tx, ATTRIBUTE, ledgers[tx.hash].serialized())
-        setattr(tx, KIND_ATTRIBUTE, kind_of(tx, transferred_vault=tx.hash in vault_transfers))
+        setattr(tx, KIND_ATTRIBUTE, kind_of(tx, v2_vaults, v1_vaults, v2_vault_mints))
 
 
 def effects_of(tx):
