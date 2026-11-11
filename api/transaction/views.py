@@ -10,12 +10,20 @@ from api.transaction.querysets import ALL_TRANSACTIONS_QUERYSET
 from api.transaction.filters import TransactionFilter
 from api.filters import PrefixSearchFilter, ReversibleOrderingFilter
 from django_filters.rest_framework import DjangoFilterBackend
-from rbx.models import Transaction
+from api.effects import wants_effects
+from rbx.models import Recovery, Transaction
 from django.conf import settings
 from django.db.models import Q
 from django.utils.cache import patch_cache_control
 from django.utils.decorators import method_decorator
 from api.decorators import cache_request
+
+
+def _recovered_to(addresses):
+    """With ?include=effects a list also holds the Recover() transactions
+    that credit one of the addresses as the recovery address: they change
+    its balance without naming it as sender or recipient."""
+    return Q(hash__in=Recovery.objects.filter(new_address__in=addresses).values("transaction_id"))
 
 
 class TransactionView(GenericAPIView):
@@ -103,9 +111,10 @@ class TransactionQueryListView(ListModelMixin, TransactionView):
         if not address:
             return []
 
-        return Transaction.objects.filter(
-            Q(to_address=address) | Q(from_address=address)
-        )
+        involved = Q(to_address=address) | Q(from_address=address)
+        if wants_effects(self.request):
+            involved |= _recovered_to([address])
+        return Transaction.objects.filter(involved)
 
     def get(self, request, *args, **kwargs):
         return self.list(request, *args, **kwargs)
@@ -120,9 +129,10 @@ class TransactionMultiAddressListView(ListModelMixin, TransactionView):
 
         address_list = addresses.split(",")
 
-        return Transaction.objects.filter(
-            Q(to_address__in=address_list) | Q(from_address__in=address_list)
-        )
+        involved = Q(to_address__in=address_list) | Q(from_address__in=address_list)
+        if wants_effects(self.request):
+            involved |= _recovered_to(address_list)
+        return Transaction.objects.filter(involved)
 
     def get(self, request, *args, **kwargs):
         return self.list(request, *args, **kwargs)
@@ -132,6 +142,7 @@ class TransactionActivityView(GenericAPIView):
     """Activity of one or more addresses, newest first, by cursor.
 
     GET /transaction/activity/?addresses=a,b&before=<height>:<hash>&limit=n
+        [&include=effects]
 
     Ordered by (-height, -hash), so rows of one block keep a fixed order
     between pages and a new block does not shift the next page. No COUNT.
@@ -188,6 +199,12 @@ class TransactionActivityView(GenericAPIView):
             for address in addresses
             for field in ("to_address", "from_address")
         ]
+        if wants_effects(request):
+            sides.append(
+                Transaction.objects.filter(cursor, _recovered_to(addresses))
+                .order_by(*order)
+                .values_list("hash", flat=True)[: limit + 1]
+            )
         hashes = list(sides[0].union(*sides[1:]))
         rows = list(Transaction.objects.filter(hash__in=hashes).order_by(*order)[: limit + 1])
 
