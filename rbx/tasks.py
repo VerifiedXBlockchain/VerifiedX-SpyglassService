@@ -1062,6 +1062,10 @@ def process_transaction(tx: Transaction):
         nft.burn_transaction = tx
         nft.save()
 
+        # The burn row carries its NFT, as a mint row does.
+        tx.nft = nft
+        tx.save(update_fields=["nft"])
+
     elif tx.type == Transaction.Type.ADDRESS:
         process_adnr(tx)
 

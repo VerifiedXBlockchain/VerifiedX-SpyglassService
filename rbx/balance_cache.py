@@ -89,8 +89,10 @@ def next_unlock_after(address, now):
     )
 
 
-def balance(address_row):
-    """get_balance() of an Address row, from the cache when still exact."""
+def balance(address_row, now=None):
+    """get_balance() of an Address row, from the cache when still exact.
+    `now` is chain_time(), for a caller that reads several addresses; it is
+    read here when not given."""
     from rbx.models import chain_time
 
     if not _enabled():
@@ -105,7 +107,8 @@ def balance(address_row):
         logging.exception("Address balance cache read failed; computing uncached")
         return address_row.get_balance()
 
-    now = chain_time()
+    if now is None:
+        now = chain_time()
     entry = found.get(_entry_key(address))
     if (
         entry is not None

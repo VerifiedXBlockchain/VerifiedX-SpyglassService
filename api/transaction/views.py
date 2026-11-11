@@ -10,12 +10,28 @@ from api.transaction.querysets import ALL_TRANSACTIONS_QUERYSET
 from api.transaction.filters import TransactionFilter
 from api.filters import PrefixSearchFilter, ReversibleOrderingFilter
 from django_filters.rest_framework import DjangoFilterBackend
-from rbx.models import Transaction
+from api.effects import wants_effects
+from rbx.models import FungibleTokenTx, Recovery, Transaction
 from django.conf import settings
 from django.db.models import Q
 from django.utils.cache import patch_cache_control
 from django.utils.decorators import method_decorator
 from api.decorators import cache_request
+
+
+def _changed_without_naming(addresses):
+    """With ?include=effects a list also holds the transactions that change
+    one of the addresses' balances without naming it as sender or
+    recipient: a Recover() crediting it as the recovery address, and a
+    token movement whose stored sender or recipient it is (an old-style
+    TokenTransfer() is sent to Token_Base and names the recipient only in
+    its data)."""
+    return Q(hash__in=Recovery.objects.filter(new_address__in=addresses).values("transaction_id")) | Q(
+        hash__in=FungibleTokenTx.objects.filter(
+            Q(receiving_address__in=addresses) | Q(sending_address__in=addresses),
+            transaction__isnull=False,
+        ).values("transaction_id")
+    )
 
 
 class TransactionView(GenericAPIView):
@@ -80,8 +96,8 @@ class TransactionDetailView(RetrieveModelMixin, TransactionView):
     def _immutable(data):
         """Only a plain VFX transfer (type TX) with no unlock time, not to or
         from a reserve (xRBX) address, nesting nothing. Every later writer of
-        a serialized field skips it: an NFT is attached only to mint types,
-        and later too (retry_unindexed_mints); unlock times are moved only on
+        a serialized field skips it: an NFT is attached only to mint and burn
+        types, and later too (retry_unindexed_mints); unlock times are moved only on
         reserve sends (redirect_reserve_transfer); callback and recovery
         details exist only on RESERVE rows; the voided and refused flags are
         not serialized."""
@@ -103,9 +119,10 @@ class TransactionQueryListView(ListModelMixin, TransactionView):
         if not address:
             return []
 
-        return Transaction.objects.filter(
-            Q(to_address=address) | Q(from_address=address)
-        )
+        involved = Q(to_address=address) | Q(from_address=address)
+        if wants_effects(self.request):
+            involved |= _changed_without_naming([address])
+        return Transaction.objects.filter(involved)
 
     def get(self, request, *args, **kwargs):
         return self.list(request, *args, **kwargs)
@@ -120,9 +137,10 @@ class TransactionMultiAddressListView(ListModelMixin, TransactionView):
 
         address_list = addresses.split(",")
 
-        return Transaction.objects.filter(
-            Q(to_address__in=address_list) | Q(from_address__in=address_list)
-        )
+        involved = Q(to_address__in=address_list) | Q(from_address__in=address_list)
+        if wants_effects(self.request):
+            involved |= _changed_without_naming(address_list)
+        return Transaction.objects.filter(involved)
 
     def get(self, request, *args, **kwargs):
         return self.list(request, *args, **kwargs)
@@ -132,6 +150,7 @@ class TransactionActivityView(GenericAPIView):
     """Activity of one or more addresses, newest first, by cursor.
 
     GET /transaction/activity/?addresses=a,b&before=<height>:<hash>&limit=n
+        [&include=effects]
 
     Ordered by (-height, -hash), so rows of one block keep a fixed order
     between pages and a new block does not shift the next page. No COUNT.
@@ -188,6 +207,12 @@ class TransactionActivityView(GenericAPIView):
             for address in addresses
             for field in ("to_address", "from_address")
         ]
+        if wants_effects(request):
+            sides.append(
+                Transaction.objects.filter(cursor, _changed_without_naming(addresses))
+                .order_by(*order)
+                .values_list("hash", flat=True)[: limit + 1]
+            )
         hashes = list(sides[0].union(*sides[1:]))
         rows = list(Transaction.objects.filter(hash__in=hashes).order_by(*order)[: limit + 1])
 
