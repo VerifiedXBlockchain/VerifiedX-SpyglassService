@@ -1,3 +1,8 @@
+import json
+import logging
+
+from django.db.models import DecimalField, ExpressionWrapper, F, Sum
+
 from rest_framework import status, filters
 from rest_framework.generics import GenericAPIView
 from rest_framework.mixins import RetrieveModelMixin, ListModelMixin
@@ -6,11 +11,17 @@ from rest_framework.response import Response
 
 from api import exceptions
 from api.fungible_token.serializers import FungibleTokenSerializer
+from api.prefetch import prefetch_fungible_tokens
+from rbx import balance_cache
 from rbx.models import Address, Transaction
 from api.address.serializers import AddressSerializer
 from api.address.querysets import ALL_ADDRESSES_QUERYSET
 from decimal import Decimal
 from django_filters.rest_framework import DjangoFilterBackend
+from django.conf import settings
+from django.utils.decorators import method_decorator
+from api.decorators import cache_request
+from api.filters import PrefixSearchFilter
 
 
 class AddressView(GenericAPIView):
@@ -19,10 +30,12 @@ class AddressView(GenericAPIView):
     filter_backends = [
         DjangoFilterBackend,
         filters.OrderingFilter,
-        filters.SearchFilter,
+        PrefixSearchFilter,
     ]
 
-    order_fields = ["balance"]
+    ordering_fields = ["balance", "address"]
+    # Prefix match, 4 characters or more (PrefixSearchFilter).
+    search_fields = ["address"]
 
 
 class AddressListView(ListModelMixin, AddressView):
@@ -30,57 +43,64 @@ class AddressListView(ListModelMixin, AddressView):
         return self.list(request, *args, **kwargs)
 
 
+@method_decorator(cache_request(settings.CACHE_TIMEOUT_LONG), name="get")
 class AddressTopHoldersListView(GenericAPIView):
-    # This view returns a custom list, so it doesn't need filter backends
+    """The 100 addresses with the largest indexed balance (Address.balance,
+    the balance the address list serves), read through its index, without
+    system names such as Adnr_Base.
+
+    Each row keeps the fields this route has always served: address,
+    balance, received (every amount sent to the address) and sent (every
+    amount and fee it sent), plus adnr. The two totals are summed for these
+    100 addresses only, in one grouped query each, through the address
+    indexes. `?view=balances` leaves them out: the address list's rows
+    (address, balance, adnr), without the sums."""
 
     def get(self, request, *args, **kwargs):
-        from django.db.models import Sum, F, Value
-        from django.db.models.functions import Coalesce
-        from django.db.models import Subquery, OuterRef, ExpressionWrapper, DecimalField
-
-        sent_subquery = (
-            Transaction.objects.filter(from_address=OuterRef("to_address"))
-            .values("from_address")
-            .annotate(
-                total_sent_with_fees=Coalesce(
-                    Sum(
-                        ExpressionWrapper(
-                            F("total_amount") + F("total_fee"),
-                            output_field=DecimalField(decimal_places=16, max_digits=32),
-                        )
-                    ),
-                    Value(Decimal(0)),
-                )
-            )
-            .values("total_sent_with_fees")
-        )
-
-        received_qs = (
-            Transaction.objects.values("to_address")
-            .annotate(
-                total_received=Coalesce(Sum("total_amount"), Value(Decimal(0))),
-                total_sent=Coalesce(Subquery(sent_subquery), Value(Decimal(0))),
-            )
-            .annotate(
-                balance=ExpressionWrapper(
-                    F("total_received") - F("total_sent"),
-                    output_field=DecimalField(decimal_places=16, max_digits=32),
-                )
-            )
+        holders = list(
+            Address.objects.select_related("adnr")
+            .exclude(address__contains="_")
             .order_by("-balance")[:100]
         )
+        rows = AddressSerializer(holders, many=True).data
+        if request.query_params.get("view") == "balances":
+            return Response(rows, status=200)
 
-        top_balances = [
-            {
-                "address": row["to_address"],
-                "balance": row["balance"],
-                "received": row["total_received"],
-                "sent": row["total_sent"],
-            }
-            for row in received_qs
-        ]
-
-        return Response(top_balances, status=200)
+        addresses = [holder.address for holder in holders]
+        received = dict(
+            Transaction.objects.filter(to_address__in=addresses)
+            .values("to_address")
+            .annotate(total=Sum("total_amount"))
+            .order_by()
+            .values_list("to_address", "total")
+        )
+        sent = dict(
+            Transaction.objects.filter(from_address__in=addresses)
+            .values("from_address")
+            .annotate(
+                total=Sum(
+                    ExpressionWrapper(
+                        F("total_amount") + F("total_fee"),
+                        output_field=DecimalField(decimal_places=16, max_digits=32),
+                    )
+                )
+            )
+            .order_by()
+            .values_list("from_address", "total")
+        )
+        return Response(
+            [
+                {
+                    "address": row["address"],
+                    "balance": row["balance"],
+                    "received": received.get(row["address"]) or Decimal(0),
+                    "sent": sent.get(row["address"]) or Decimal(0),
+                    "adnr": row["adnr"],
+                }
+                for row in rows
+            ],
+            status=200,
+        )
 
 
 class AddressDetailView(AddressView):
@@ -98,7 +118,7 @@ class AddressDetailView(AddressView):
             balance_available,
             balance_locked,
             balance_total,
-        ) = address.get_balance()
+        ) = balance_cache.balance(address)
 
         if "e" in str(balance_available).lower():
             balance_available_value = "{:.16f}".format(balance_available)
@@ -163,6 +183,10 @@ class AddressTokensDetailView(AddressView):
             )
 
         results = address.get_fungible_token_balances(serialize_token=True)
+        # Optional: leave out the tokens the address holds none of.
+        if request.query_params.get("nonzero") in ("1", "true"):
+            results = [result for result in results if result["balance"] != 0]
+        prefetch_fungible_tokens([result["token"] for result in results])
 
         token_balances = [
             {
@@ -189,7 +213,7 @@ class AddressAdnrDetailView(RetrieveModelMixin, AddressView):
                 balance_available,
                 balance_locked,
                 balance_total,
-            ) = address.get_balance()
+            ) = balance_cache.balance(address)
 
             if "e" in str(balance_available).lower():
                 balance_available_value = "{:.16f}".format(balance_available)
@@ -217,3 +241,69 @@ class AddressAdnrDetailView(RetrieveModelMixin, AddressView):
             return Response(data, status=200)
         except Address.DoesNotExist:
             return Response({}, status=404)
+
+
+class AddressActivityView(GenericAPIView):
+    """Whether addresses were ever used, without a balance recompute.
+
+    GET /addresses/activity/?addresses=a,b
+
+    Answers {"results": [...]} with one row per address, in the order asked:
+    - has_transactions: a transaction to or from it is indexed;
+    - has_balance: its indexed balance (Address.balance, what the address
+      list serves) is above zero;
+    - vault_activated: it sent a Register() reserve transaction, as
+      `activated` on /addresses/<address>/ reads it;
+    - register_recovery_addresses: the RecoveryAddress of each Register() it
+      sent to Reserve_Base, oldest first.
+    An address the explorer has never seen answers all false. Any failure
+    is an error status, never "no activity".
+    """
+
+    MAX_ADDRESSES = 20
+    RESERVE_BASE_ADDRESS = "Reserve_Base"
+
+    def get(self, request, *args, **kwargs):
+        addresses = list(dict.fromkeys(a for a in request.query_params.get("addresses", "").split(",") if a))
+        if not addresses:
+            return Response({"error": "addresses is required"}, status=status.HTTP_400_BAD_REQUEST)
+        if len(addresses) > self.MAX_ADDRESSES:
+            return Response(
+                {"error": f"at most {self.MAX_ADDRESSES} addresses"}, status=status.HTTP_400_BAD_REQUEST
+            )
+
+        funded = set(
+            Address.objects.filter(address__in=addresses, balance__gt=0).values_list("address", flat=True)
+        )
+        return Response({"results": [self._activity(address, address in funded) for address in addresses]})
+
+    def _activity(self, address, has_balance):
+        has_transactions = (
+            Transaction.objects.filter(to_address=address).exists()
+            or Transaction.objects.filter(from_address=address).exists()
+        )
+
+        vault_activated = False
+        recovery_addresses = []
+        registers = Transaction.objects.filter(from_address=address, type=Transaction.Type.RESERVE).order_by(
+            "height", "hash"
+        )
+        for tx_hash, to_address, raw in registers.values_list("hash", "to_address", "data"):
+            try:
+                data = json.loads(raw) if isinstance(raw, str) else raw
+            except ValueError:
+                logging.warning(f"Reserve transaction {tx_hash} has data that is not JSON")
+                continue
+            if not isinstance(data, dict) or data.get("Function") != "Register()":
+                continue
+            vault_activated = True
+            if to_address == self.RESERVE_BASE_ADDRESS and data.get("RecoveryAddress"):
+                recovery_addresses.append(data["RecoveryAddress"])
+
+        return {
+            "address": address,
+            "has_transactions": has_transactions,
+            "has_balance": has_balance,
+            "vault_activated": vault_activated,
+            "register_recovery_addresses": recovery_addresses,
+        }

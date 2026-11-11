@@ -8,7 +8,7 @@ from django_filters.rest_framework import DjangoFilterBackend
 from api import exceptions
 from api.nft.serializers import NftSerializer, VerifyOwnershipSerializer
 from api.transaction.serializers import NftTransactionSerializer
-from api.nft.querysets import ALL_NFTS_QUERYSET
+from api.nft.querysets import ALL_NFTS_QUERYSET, NFTS_INCLUDING_BURNED_QUERYSET
 from rbx.models import Nft
 
 from api.nft.filters import NftFilter
@@ -28,6 +28,16 @@ class NftView(GenericAPIView):
 
     search_fields = ["name", "identifier"]
 
+    def base_queryset(self):
+        """Without burned NFTs, unless the request asks for them with
+        ?include_burned=1 (or true)."""
+        if self.request.query_params.get("include_burned") in ("1", "true"):
+            return NFTS_INCLUDING_BURNED_QUERYSET.all()
+        return ALL_NFTS_QUERYSET.all()
+
+    def get_queryset(self):
+        return self.base_queryset()
+
 
 class NftListView(ListModelMixin, NftView):
     def get(self, request, *args, **kwargs):
@@ -43,7 +53,7 @@ class NftMultipleAddressesListView(ListModelMixin, NftView):
 
         address_list = addresses.split(",")
 
-        return ALL_NFTS_QUERYSET.filter(owner_address__in=address_list)
+        return self.base_queryset().filter(owner_address__in=address_list)
 
     def get(self, request, *args, **kwargs):
         return self.list(request, *args, **kwargs)
@@ -79,7 +89,9 @@ class NftHistoryView(GenericAPIView):
         except Nft.DoesNotExist:
             return Response(status=status.HTTP_404_NOT_FOUND)
 
-        transactions = [nft.mint_transaction]
+        # An NFT indexed without its mint transaction (mint_transaction is
+        # null) lists the rest of its history.
+        transactions = [nft.mint_transaction] if nft.mint_transaction else []
         for tx in nft.transfer_transactions.all():
             transactions.append(tx)
 

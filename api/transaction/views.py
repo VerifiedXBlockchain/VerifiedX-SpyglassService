@@ -7,19 +7,57 @@ from rest_framework.response import Response
 from api import exceptions
 from api.transaction.serializers import TransactionSerializer
 from api.transaction.querysets import ALL_TRANSACTIONS_QUERYSET
-from rbx.models import Transaction
+from api.transaction.filters import TransactionFilter
+from api.filters import PrefixSearchFilter, ReversibleOrderingFilter
+from django_filters.rest_framework import DjangoFilterBackend
+from api.effects import wants_effects
+from rbx.models import FungibleTokenTx, Recovery, Transaction, VbtcV2TokenTransfer
 from django.conf import settings
 from django.db.models import Q
+from django.utils.cache import patch_cache_control
 from django.utils.decorators import method_decorator
 from api.decorators import cache_request
+
+
+def _changed_without_naming(addresses):
+    """With ?include=effects a list also holds the transactions that change
+    one of the addresses' balances without naming it as sender or
+    recipient: a Recover() crediting it as the recovery address; a token
+    movement whose stored sender or recipient it is (an old-style
+    TokenTransfer() is sent to Token_Base and names the recipient only in
+    its data); and a vBTC V2 transfer row naming it (a recovery redirects a
+    pending reserve send's row to the recovery address and leaves the
+    transaction's own addresses as they were)."""
+    return (
+        Q(hash__in=Recovery.objects.filter(new_address__in=addresses).values("transaction_id"))
+        | Q(
+            hash__in=FungibleTokenTx.objects.filter(
+                Q(receiving_address__in=addresses) | Q(sending_address__in=addresses),
+                transaction__isnull=False,
+            ).values("transaction_id")
+        )
+        | Q(
+            hash__in=VbtcV2TokenTransfer.objects.filter(
+                Q(to_address__in=addresses) | Q(from_address__in=addresses)
+            ).values("transaction_id")
+        )
+    )
 
 
 class TransactionView(GenericAPIView):
     serializer_class = TransactionSerializer
     queryset = ALL_TRANSACTIONS_QUERYSET
 
+    filter_backends = [
+        DjangoFilterBackend,
+        ReversibleOrderingFilter,
+        PrefixSearchFilter,
+    ]
+    filterset_class = TransactionFilter
+
     ordering_fields = ["date_crafted"]
     ordering = ["-date_crafted"]
+    # Prefix match, 4 characters or more (PrefixSearchFilter).
     search_fields = ["hash", "to_address", "from_address"]
 
 
@@ -44,10 +82,44 @@ class TransactionBlockListView(ListModelMixin, TransactionView):
 
 # @method_decorator(cache_request(settings.CACHE_TIMEOUT_LONG), name="get")
 class TransactionDetailView(RetrieveModelMixin, TransactionView):
+    """A found transaction whose body cannot change after indexing may be
+    cached by clients for TRANSACTION_DETAIL_MAX_AGE; every other body gets
+    no lifetime (ETag revalidation still applies), and a 404 (not indexed
+    yet, or never) is never cached. See _immutable for the rule."""
+
     lookup_field = "hash"
 
     def get(self, request, *args, **kwargs):
         return self.retrieve(request, *args, **kwargs)
+
+    def finalize_response(self, request, response, *args, **kwargs):
+        response = super().finalize_response(request, response, *args, **kwargs)
+        if request.method not in ("GET", "HEAD"):
+            return response
+        if response.status_code == status.HTTP_404_NOT_FOUND:
+            patch_cache_control(response, no_store=True)
+        elif response.status_code == status.HTTP_200_OK and self._immutable(response.data):
+            patch_cache_control(response, public=True, max_age=settings.TRANSACTION_DETAIL_MAX_AGE)
+        return response
+
+    @staticmethod
+    def _immutable(data):
+        """Only a plain VFX transfer (type TX) with no unlock time, not to or
+        from a reserve (xRBX) address, nesting nothing. Every later writer of
+        a serialized field skips it: an NFT is attached only to mint and burn
+        types, and later too (retry_unindexed_mints); unlock times are moved only on
+        reserve sends (redirect_reserve_transfer); callback and recovery
+        details exist only on RESERVE rows; the voided and refused flags are
+        not serialized."""
+        return (
+            data.get("type") == Transaction.Type.TX
+            and data.get("unlock_time") is None
+            and data.get("nft") is None
+            and data.get("callback_details") is None
+            and data.get("recovery_details") is None
+            and not str(data.get("to_address") or "").startswith("xRBX")
+            and not str(data.get("from_address") or "").startswith("xRBX")
+        )
 
 
 @method_decorator(cache_request(settings.CACHE_TIMEOUT_SHORT), name="get")
@@ -57,9 +129,10 @@ class TransactionQueryListView(ListModelMixin, TransactionView):
         if not address:
             return []
 
-        return Transaction.objects.filter(
-            Q(to_address=address) | Q(from_address=address)
-        )
+        involved = Q(to_address=address) | Q(from_address=address)
+        if wants_effects(self.request):
+            involved |= _changed_without_naming([address])
+        return Transaction.objects.filter(involved)
 
     def get(self, request, *args, **kwargs):
         return self.list(request, *args, **kwargs)
@@ -74,12 +147,93 @@ class TransactionMultiAddressListView(ListModelMixin, TransactionView):
 
         address_list = addresses.split(",")
 
-        return Transaction.objects.filter(
-            Q(to_address__in=address_list) | Q(from_address__in=address_list)
-        )
+        involved = Q(to_address__in=address_list) | Q(from_address__in=address_list)
+        if wants_effects(self.request):
+            involved |= _changed_without_naming(address_list)
+        return Transaction.objects.filter(involved)
 
     def get(self, request, *args, **kwargs):
         return self.list(request, *args, **kwargs)
+
+
+class TransactionActivityView(GenericAPIView):
+    """Activity of one or more addresses, newest first, by cursor.
+
+    GET /transaction/activity/?addresses=a,b&before=<height>:<hash>&limit=n
+        [&include=effects]
+
+    Ordered by (-height, -hash), so rows of one block keep a fixed order
+    between pages and a new block does not shift the next page. No COUNT.
+    Answers {"results": [TransactionSerializer rows], "next_cursor"}: pass
+    next_cursor back as `before`; null on the last page.
+    """
+
+    serializer_class = TransactionSerializer
+    pagination_class = None
+    DEFAULT_LIMIT = 30
+    MAX_LIMIT = 100
+    MAX_ADDRESSES = 20
+
+    def get(self, request, *args, **kwargs):
+        addresses = list(dict.fromkeys(a for a in request.query_params.get("addresses", "").split(",") if a))
+        if not addresses:
+            return Response({"error": "addresses is required"}, status=status.HTTP_400_BAD_REQUEST)
+        if len(addresses) > self.MAX_ADDRESSES:
+            return Response(
+                {"error": f"at most {self.MAX_ADDRESSES} addresses"}, status=status.HTTP_400_BAD_REQUEST
+            )
+
+        try:
+            limit = int(request.query_params.get("limit", self.DEFAULT_LIMIT))
+        except ValueError:
+            return Response({"error": "limit must be a number"}, status=status.HTTP_400_BAD_REQUEST)
+        limit = max(1, min(limit, self.MAX_LIMIT))
+
+        before = request.query_params.get("before")
+        cursor = Q()
+        if before:
+            height, _, tx_hash = before.partition(":")
+            try:
+                height = int(height)
+            except ValueError:
+                return Response(
+                    {"error": "before must be <height>:<hash>"}, status=status.HTTP_400_BAD_REQUEST
+                )
+            if not tx_hash:
+                return Response(
+                    {"error": "before must be <height>:<hash>"}, status=status.HTTP_400_BAD_REQUEST
+                )
+            cursor = Q(height__lte=height) & (Q(height__lt=height) | Q(height=height, hash__lt=tx_hash))
+
+        # One side per address and direction, each a range of the
+        # (address, height, hash) index that stops after limit + 1 rows; the
+        # union drops a row that is on two sides (a send between two of the
+        # addresses, or to oneself).
+        order = ("-height", "-hash")
+        sides = [
+            Transaction.objects.filter(cursor, **{field: address})
+            .order_by(*order)
+            .values_list("hash", flat=True)[: limit + 1]
+            for address in addresses
+            for field in ("to_address", "from_address")
+        ]
+        if wants_effects(request):
+            sides.append(
+                Transaction.objects.filter(cursor, _changed_without_naming(addresses))
+                .order_by(*order)
+                .values_list("hash", flat=True)[: limit + 1]
+            )
+        hashes = list(sides[0].union(*sides[1:]))
+        rows = list(Transaction.objects.filter(hash__in=hashes).order_by(*order)[: limit + 1])
+
+        next_cursor = None
+        if len(rows) > limit:
+            rows = rows[:limit]
+            next_cursor = f"{rows[-1].height}:{rows[-1].hash}"
+
+        return Response(
+            {"results": self.get_serializer(rows, many=True).data, "next_cursor": next_cursor}
+        )
 
 
 # @method_decorator(cache_request(settings.CACHE_TIMEOUT_SHORT), name="get")

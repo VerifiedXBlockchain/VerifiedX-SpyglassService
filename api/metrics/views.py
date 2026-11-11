@@ -35,19 +35,19 @@ class NetworkMetricsView(GenericAPIView):
 
         # burned fees
         query = Transaction.objects.all().aggregate(Sum("total_fee"))
-        fees = Decimal(query["total_fee__sum"])
+        fees = Decimal(query["total_fee__sum"] or 0)
 
         # adnr
         query = Transaction.objects.filter(type=Transaction.Type.ADDRESS).aggregate(
             Sum("total_amount")
         )
-        adnr_burned_sum = Decimal(query["total_amount__sum"])
+        adnr_burned_sum = Decimal(query["total_amount__sum"] or 0)
 
         # decshop
         query = Transaction.objects.filter(
             type=Transaction.Type.DST_REGISTRATION
         ).aggregate(Sum("total_amount"))
-        dst_burned_sum = Decimal(query["total_amount__sum"])
+        dst_burned_sum = Decimal(query["total_amount__sum"] or 0)
 
         # vault activations
         vault_burned_sum = Transaction.objects.filter(

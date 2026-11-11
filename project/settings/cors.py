@@ -13,3 +13,7 @@ CORS_ALLOWED_ORIGIN_REGEXES = ENV.list(
     "CORS_ALLOWED_ORIGIN_REGEXES", default=[], cast=str
 )
 CORS_URLS_REGEX = ENV.str("CORS_URLS_REGEX", default=r"^.*$")
+
+# Response headers a browser page may read across origins (X-Indexed-Height
+# from api.indexed_height, ETag for conditional reads).
+CORS_EXPOSE_HEADERS = ENV.list("CORS_EXPOSE_HEADERS", default=["X-Indexed-Height", "ETag"], cast=str)

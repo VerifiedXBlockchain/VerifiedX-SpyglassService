@@ -8,7 +8,6 @@ from api.raw.views import (
     SendTransactionView,
     ValidateSignatureView,
     # MintSmartContractView,
-    RetrieveSmartContractView,
     SmartContractDataView,
     NftTransferDataView,
     NftEvolveDataView,
@@ -30,7 +29,6 @@ urlpatterns = [
     ),
     path("verify/", VerifyTransactionView.as_view()),
     path("send/", SendTransactionView.as_view()),
-    path("retrieve-smart-contract/", RetrieveSmartContractView.as_view()),
     path("smart-contract-data/", SmartContractDataView.as_view()),
     path(
         "nft-transfer-data/<str:id>/<str:address>/<str:locator>/",

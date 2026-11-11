@@ -19,6 +19,8 @@ from django.utils import timezone
 from api.block.serializers import BlockSerializer
 from project.celery import app
 from project.utils.encoders import DecimalEncoder
+from rbx.block_addresses import affected_addresses, changed_requestors, withdrawal_states
+from rbx import balance_cache
 from rbx.chain_contract import smart_contract_from_chain
 from rbx.client import get_master_nodes, get_block, get_nft, get_topics
 from shop.media import scp_down_folder, upload_to_s3
@@ -289,16 +291,49 @@ def sync_block(height: int, data: Optional[dict] = None, notify: bool = True) ->
                 block_count=F("block_count") + 1
             )
 
+    # The block is committed: drop the cached balances of every address it
+    # touched (the saves above queued theirs too; this also covers rows the
+    # indexer derived without a signal). Best effort, the block stands.
+    try:
+        invalidated = balance_cache.invalidate(affected_addresses(height))
+    except Exception:
+        logging.exception(f"Invalidating the cached balances of block {height} failed")
+        invalidated = False
+    # Only after the invalidation succeeded: the wallet summary trusts
+    # cached balances for a block once this marker reaches it.
+    if invalidated:
+        balance_cache.mark_invalidated_through(height)
+
     # A Bitcoin report, rewind or rekey: the watched vaults' withdrawals and
     # exits take their outcome from the node, once, after the block is
     # committed. A failure here is logged; the block and its transactions
     # stand, and the next pass (or the ten-minute sweep) reads them again.
+    # Requestors whose withdrawals the reconcile below changes, for the
+    # block_addresses event: a refund or reopen links to no transaction.
+    reconciled_requestors = set()
     if any(t.get("TransactionType") in ATTESTATION_TYPES for t in data["Transactions"]):
         rewound = any(t.get("TransactionType") == Transaction.Type.VBTC_V2_BTC_REORG for t in data["Transactions"])
+        before = None
+        snapshot_rewind = rewound
+        if block_created and notify:
+            try:
+                # Completed requests too while an earlier rewind is still
+                # being read, as the reconcile includes them then.
+                snapshot_rewind = rewound or vbtc_dispatch.rewind_pending()
+                before = withdrawal_states(after_rewind=snapshot_rewind)
+            except Exception:
+                logging.exception(f"Reading withdrawals before block {height}'s reconcile failed")
         try:
             vbtc_dispatch.reconcile_all_watched_vaults(after_rewind=rewound)
         except Exception:
             logging.exception(f"Reading the watched vaults' outcomes after block {height} failed")
+        if before is not None:
+            try:
+                reconciled_requestors = changed_requestors(
+                    before, withdrawal_states(after_rewind=snapshot_rewind, include=before.keys())
+                )
+            except Exception:
+                logging.exception(f"Reading withdrawals after block {height}'s reconcile failed")
         try:
             vbtc_dispatch.refresh_all_watched_backings()
         except Exception:
@@ -336,6 +371,27 @@ def sync_block(height: int, data: Optional[dict] = None, notify: bool = True) ->
                 # Best effort: a socket-service hiccup must not fail (or
                 # celery-retry) a block that already committed.
                 logging.exception(f"Failed to send new_block event for {height}")
+
+            # A separate event, sent after new_block, which stays as it was.
+            # The relay forwards only type, data and message, so the list
+            # rides in data of its own event type; listeners that check for
+            # new_block ignore it.
+            try:
+                addresses_payload = json.dumps(
+                    {
+                        "type": "block_addresses",
+                        "data": {
+                            "height": b.height,
+                            "hash": b.hash,
+                            "affected_addresses": affected_addresses(b.height, reconciled_requestors),
+                        },
+                        "message": f"block {b.height} addresses",
+                        "api_key": settings.SOCKET_TOKEN,
+                    }
+                )
+                notify_socket_service(addresses_payload)
+            except Exception:
+                logging.exception(f"Failed to send block_addresses event for {height}")
 
     end = time.time()
     logging.info(f"Synchronized Block {height} [elapsed: {end - start}]")
@@ -1011,6 +1067,10 @@ def process_transaction(tx: Transaction):
         nft.burn_transaction = tx
         nft.save()
 
+        # The burn row carries its NFT, as a mint row does.
+        tx.nft = nft
+        tx.save(update_fields=["nft"])
+
     elif tx.type == Transaction.Type.ADDRESS:
         process_adnr(tx)
 
@@ -1445,30 +1505,29 @@ def sync_circulation():
 
     # Block zero balance
     query = Transaction.objects.filter(height=0).aggregate(Sum("total_amount"))
-    amount = query["total_amount__sum"]
-    total = amount
+    total = query["total_amount__sum"] or Decimal(0)
 
     rewards = Transaction.objects.filter(from_address="Coinbase_BlkRwd").aggregate(
         Sum("total_amount")
     )
 
-    total = total + Decimal(rewards["total_amount__sum"])
+    total = total + (rewards["total_amount__sum"] or Decimal(0))
 
     # burn fees
     query = Transaction.objects.all().aggregate(Sum("total_fee"))
-    fees = query["total_fee__sum"]
+    fees = query["total_fee__sum"] or Decimal(0)
 
     # adnr
     query = Transaction.objects.filter(type=Transaction.Type.ADDRESS).aggregate(
         Sum("total_amount")
     )
-    adnr_burned_sum = Decimal(query["total_amount__sum"])
+    adnr_burned_sum = query["total_amount__sum"] or Decimal(0)
 
     # decshop
     query = Transaction.objects.filter(
         type=Transaction.Type.DST_REGISTRATION
     ).aggregate(Sum("total_amount"))
-    dst_burned_sum = Decimal(query["total_amount__sum"])
+    dst_burned_sum = query["total_amount__sum"] or Decimal(0)
 
     # vault activations
     vault_burned_sum = Transaction.objects.filter(

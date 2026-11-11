@@ -389,3 +389,18 @@ class VfxNodeBalanceTests(SimpleTestCase):
                 "balance": Decimal("0.000002"),
                 "tx_count": 2,
             }, failure)
+
+
+class BtcGetAddressCommandTests(SimpleTestCase):
+    def test_prints_the_address_answer(self):
+        from io import StringIO
+
+        from django.core.management import call_command
+
+        answer = {"balance": "0.001", "transactions": {"total": 0, "results": []}, "utxos": {"total": 0, "results": []}}
+        out = StringIO()
+        with patch("btc.client.BtcExplorerClient.get_address", return_value=answer) as get_address:
+            call_command("btc_get_address", "--address", "tb1qaddr", stdout=out)
+
+        get_address.assert_called_once_with("tb1qaddr", 0)
+        self.assertIn('"balance": "0.001"', out.getvalue())

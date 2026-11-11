@@ -79,6 +79,13 @@ CLI_TIMEOUT = (5, 30)
 # The reads block sync and the sweep make for each watched vault: a hung
 # node must not hold a block for vaults x 30s.
 NODE_READ_TIMEOUT = (5, 5)
+# The /raw/* proxies for wallets: gunicorn runs sync workers, so a node that
+# holds these open takes the API down with it. A timeout raises
+# requests.Timeout, a RequestException like the ConnectionError of a dead
+# node, and fails through the same 500. Verify and send get a longer read
+# so a healthy but slow node is not cut off while it accepts a transaction.
+RAW_TX_TIMEOUT = (3, 5)
+RAW_TX_SEND_TIMEOUT = (3, 15)
 
 
 def _get_session() -> requests.Session:
@@ -127,6 +134,22 @@ def get_status() -> str:
     return response.text
 
 
+def get_cli_version() -> Optional[str]:
+    """The node's CLI version string, or None when the node does not answer."""
+    url = join_url(BASE_URL, "api/V1/GetCLIVersion")
+    try:
+        response = _http.get(url, timeout=NODE_READ_TIMEOUT)
+    except requests.RequestException as e:
+        logging.getLogger(__name__).warning(f"GetCLIVersion failed: {e}")
+        return None
+
+    if response.status_code != 200:
+        logging.getLogger(__name__).warning(f"GetCLIVersion answered {response.status_code}")
+        return None
+
+    return response.text.strip().strip('"') or None
+
+
 def get_info() -> Optional[dict]:
     url = join_url(BASE_URL, "api/V1/GetWalletInfo")
     response = _get_session().get(url, timeout=CLI_TIMEOUT)
@@ -169,7 +192,7 @@ def get_block(height: int) -> Optional[dict]:
 def tx_get_fee(transaction: dict, *args) -> Tuple[dict, int]:
     url = join_url(BASE_URL, "txapi/txV1/GetRawTxFee")
 
-    response = _http.post(url, json=transaction)
+    response = _http.post(url, json=transaction, timeout=RAW_TX_TIMEOUT)
     if response.status_code != 200:
         raise RBXException
 
@@ -183,7 +206,7 @@ def tx_get_hash(transaction: dict) -> Tuple[dict, int]:
     url = join_url(BASE_URL, "txapi/txV1/GetTxHash")
     data = _fix_decimals(transaction)
 
-    response = _http.post(url, json=data)
+    response = _http.post(url, json=data, timeout=RAW_TX_TIMEOUT)
     if response.status_code != 200:
         raise RBXException
 
@@ -198,7 +221,7 @@ def tx_verify(transaction: dict) -> Tuple[dict, int]:
 
     data = _fix_decimals(transaction)
 
-    response = _http.post(url, json=data)
+    response = _http.post(url, json=data, timeout=RAW_TX_SEND_TIMEOUT)
     if response.status_code != 200:
         raise RBXException
 
@@ -213,7 +236,7 @@ def tx_send(transaction: dict) -> Tuple[dict, int]:
 
     data = _fix_decimals(transaction)
 
-    response = _http.post(url, json=data)
+    response = _http.post(url, json=data, timeout=RAW_TX_SEND_TIMEOUT)
 
     if response.status_code != 200:
         raise RBXException
@@ -439,7 +462,12 @@ def get_locators(id: str, *args) -> Tuple[dict, int]:
 
 def get_beacon_assets(
     id: str, locators: str, address: str, signature: str, *args
-) -> bool:
+) -> Tuple[bool, str]:
+    """Ask the shop node to pull an NFT's assets from its beacon.
+
+    Returns whether the node answered "Success", and the node's answer (its
+    reason when it is anything else).
+    """
     logger = logging.getLogger(__name__)
     url = join_url(
         SHOP_BASE_URL,
@@ -454,7 +482,9 @@ def get_beacon_assets(
     if response.status_code != 200:
         raise RBXException
 
-    return response.text == "Success"
+    if response.text != "Success":
+        logger.warning(f"Beacon assets for {id} refused by the node: {response.text[:500]}")
+    return response.text == "Success", response.text
 
 
 def beacon_upload_request(
@@ -493,7 +523,7 @@ def beacon_upload_request(
 
 def get_timestamp() -> Optional[int]:
     url = join_url(BASE_URL, "/txapi/txV1/GetTimestamp")
-    response = _http.get(url)
+    response = _http.get(url, timeout=RAW_TX_TIMEOUT)
 
     if response.status_code != 200:
         raise RBXException
@@ -508,7 +538,7 @@ def get_timestamp() -> Optional[int]:
 def get_address_nonce(address: str) -> Optional[Decimal]:
     logger = logging.getLogger(__name__)
     url = join_url(BASE_URL, f"/txapi/txV1/GetAddressNonce/{address}")
-    response = _http.get(url)
+    response = _http.get(url, timeout=RAW_TX_TIMEOUT)
 
     logger.debug(f"Address nonce response: {response.json()}")
 

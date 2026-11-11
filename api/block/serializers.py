@@ -30,3 +30,9 @@ class BlockSerializer(serializers.ModelSerializer):
             "transactions",
             # "number_of_transactions",
         ]
+
+
+class LatestBlockSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Block
+        fields = ["height", "hash", "date_crafted"]

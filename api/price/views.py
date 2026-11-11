@@ -32,7 +32,9 @@ class LatestPriceView(GenericAPIView):
     schema = None
 
     def get(self, request, *args, **kwargs):
-        p = Price.objects.all().order_by("-created_at")[0]
+        p = Price.objects.all().order_by("-created_at").first()
+        if p is None:
+            return Response({"message": "No price recorded"}, status=404)
         data = {
             "price": p.price,
             "created_at": p.created_at,
@@ -51,13 +53,18 @@ class PriceListView(GenericAPIView):
         s = round(timezone.now().timestamp()) - 3600
         e = round(timezone.now().timestamp())
 
-        if "start" in request.query_params:
-            s = int(request.query_params["start"])
-        if "end" in request.query_params:
-            e = int(request.query_params["end"])
+        try:
+            if "start" in request.query_params:
+                s = int(request.query_params["start"])
+            if "end" in request.query_params:
+                e = int(request.query_params["end"])
 
-        start = datetime.fromtimestamp(s)
-        end = datetime.fromtimestamp(e)
+            start = datetime.fromtimestamp(s)
+            end = datetime.fromtimestamp(e)
+        except (ValueError, OverflowError, OSError):
+            return Response(
+                {"error": "start and end must be Unix timestamps in seconds"}, status=400
+            )
 
         prices = Price.objects.filter(
             created_at__gte=start,

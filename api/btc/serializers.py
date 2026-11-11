@@ -34,11 +34,13 @@ class VbtcTokenSerializer(serializers.ModelSerializer):
 
 
 class VbtcV2WithdrawalRequestSerializer(serializers.ModelSerializer):
+    # The foreign key columns hold the hashes (Transaction's primary key), so
+    # neither transaction row is read.
     request_transaction_hash = serializers.CharField(
-        source="request_transaction.hash", read_only=True
+        source="request_transaction_id", read_only=True
     )
     completion_transaction_hash = serializers.CharField(
-        source="completion_transaction.hash", read_only=True, default=None
+        source="completion_transaction_id", read_only=True, default=None
     )
     # An open request on a watched vault, as the node last described it
     # (stored by the indexer; see VbtcV2WithdrawalRequest.pin_state). Null
@@ -189,3 +191,22 @@ class VbtcV2TokenSerializer(serializers.ModelSerializer):
             "withdrawal_requests",
             "created_at",
         )
+
+
+class VbtcV2WalletNftSerializer(NftSerializer):
+    class Meta(NftSerializer.Meta):
+        fields = ["identifier", "name", "minted_at", "mint_transaction"]
+
+
+class VbtcV2WalletTokenSerializer(VbtcV2TokenSerializer):
+    """The `?view=wallet` shape: every field of VbtcV2TokenSerializer, with
+    `nft` cut to the four fields a wallet reads. The full NFT carries the
+    contract source and the base64 asset, about 87 KB per vault on mainnet."""
+
+    nft = VbtcV2WalletNftSerializer()
+
+
+def vbtc_v2_token_serializer_class(request):
+    if request.query_params.get("view") == "wallet":
+        return VbtcV2WalletTokenSerializer
+    return VbtcV2TokenSerializer

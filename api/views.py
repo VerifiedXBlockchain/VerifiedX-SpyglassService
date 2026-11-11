@@ -8,15 +8,33 @@ from rbx.models import Circulation, NetworkMetrics
 from rbx.tasks import sync_circulation, sync_network_metrics
 from rbx.vbtc_dispatch import rewind_hold
 from django.conf import settings
+from django.core.cache import cache
+from rbx.client import get_cli_version
+
+# Served when the node does not answer GetCLIVersion.
+FALLBACK_CLI_VERSION = "5.0.1.xxx-beta"
+CLI_VERSION_CACHE_KEY = "node-cli-version"
+
+
+def cli_version() -> str:
+    """The node's CLI version, cached 10 minutes (1 minute after a failure)."""
+    version = cache.get(CLI_VERSION_CACHE_KEY)
+    if version:
+        return version
+    version = get_cli_version()
+    if version:
+        cache.set(CLI_VERSION_CACHE_KEY, version, 600)
+        return version
+    cache.set(CLI_VERSION_CACHE_KEY, FALLBACK_CLI_VERSION, 60)
+    return FALLBACK_CLI_VERSION
 
 
 @api_view(("GET",))
 def circulation(request):
     circulation = Circulation.load()
-    if not circulation:
+    if circulation.updated_at < timezone.now() - datetime.timedelta(seconds=30):
         sync_circulation()
-    elif circulation.updated_at < timezone.now() - datetime.timedelta(seconds=30):
-        sync_circulation()
+        circulation.refresh_from_db()
 
     data = {
         "balance": circulation.balance,
@@ -28,7 +46,7 @@ def circulation(request):
         "total_master_nodes": circulation.total_master_nodes,
         "total_addresses": circulation.total_addresses,
         "total_transactions": circulation.total_transactions,
-        "cli_version": "5.0.1.xxx-beta",
+        "cli_version": cli_version(),
     }
     return Response(data, status=status.HTTP_200_OK)
 
@@ -59,6 +77,7 @@ def circulation_balance(request):
 
     if circulation.updated_at < timezone.now() - datetime.timedelta(seconds=30):
         sync_circulation()
+        circulation.refresh_from_db()
 
     return Response(
         circulation.balance, status=status.HTTP_200_OK, content_type="text/plain"
@@ -71,6 +90,7 @@ def lifetime_balance(request):
 
     if circulation.updated_at < timezone.now() - datetime.timedelta(seconds=30):
         sync_circulation()
+        circulation.refresh_from_db()
 
     return Response(
         circulation.lifetime_supply,

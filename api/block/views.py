@@ -9,9 +9,13 @@ from django.db.models import Q
 
 from django_filters.rest_framework import DjangoFilterBackend
 from api.decorators import cache_request
-from api.block.serializers import BlockSerializer
+from api.block.serializers import BlockSerializer, LatestBlockSerializer
 from api.block.querysets import ALL_BLOCKS_QUERYSET
-from rbx.models import Block
+from api.filters import PrefixSearchFilter
+from rbx.models import Block, MasterNode
+
+# Block.height is a Postgres integer.
+MAX_HEIGHT = 2**31 - 1
 
 
 class BlockView(GenericAPIView):
@@ -20,10 +24,26 @@ class BlockView(GenericAPIView):
     filter_backends = [
         DjangoFilterBackend,
         filters.OrderingFilter,
-        filters.SearchFilter,
+        PrefixSearchFilter,
     ]
 
-    search_fields = ["hash", "height", "validator_address", "master_node__name"]
+    search_fields = ["hash", "validator_address", "master_node__name"]
+
+    def search_q(self, term):
+        """An all-digit term is an exact height; any other term is a prefix
+        of the hash, the validator address or the validator name."""
+        if term.isascii() and term.isdigit():
+            if int(term) > MAX_HEIGHT:
+                return None
+            return Q(height=int(term))
+        if len(term) < 3:
+            return None
+        named = MasterNode.objects.filter(name__istartswith=term).values("address")
+        return (
+            Q(hash__startswith=term)
+            | Q(validator_address__startswith=term)
+            | Q(master_node__in=named)
+        )
 
     ordering_fields = ["height"]
     ordering = ["-height"]
@@ -67,3 +87,14 @@ class BlockAddressView(ListModelMixin, GenericAPIView):
 
     def get(self, request, *args, **kwargs):
         return self.list(request, *args, **kwargs)
+
+
+class BlockLatestView(GenericAPIView):
+    """The latest indexed block's height, hash and time, without its
+    transactions: GET /blocks/latest/. 404 before any block is indexed."""
+
+    def get(self, request, *args, **kwargs):
+        block = Block.objects.order_by("-height").values("height", "hash", "date_crafted").first()
+        if block is None:
+            return Response({"detail": "No block indexed"}, status=status.HTTP_404_NOT_FOUND)
+        return Response(LatestBlockSerializer(block).data)

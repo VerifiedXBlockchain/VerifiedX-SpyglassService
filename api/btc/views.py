@@ -6,7 +6,7 @@ from decimal import Decimal
 from datetime import datetime
 from django.utils import timezone
 from django.core.cache import cache
-from django.db import close_old_connections
+from django.db import connection
 from django.db.models import Case, F, Max, Q, Value, When
 from rest_framework.response import Response
 from rest_framework.generics import GenericAPIView, RetrieveAPIView
@@ -16,8 +16,12 @@ from api.btc.serializers import (
     VbtcTokenSerializer,
     VbtcV2TokenSerializer,
     VbtcV2TokenTransferSerializer,
+    VbtcV2WalletTokenSerializer,
     VbtcV2WithdrawalRequestSerializer,
+    vbtc_v2_token_serializer_class,
 )
+from api.pagination import StandardPagination
+from api.prefetch import prefetch_nft_listings
 from rbx.client import (
     get_default_vbtc_base64_image_data,
     get_vbtc_compile_data,
@@ -51,7 +55,12 @@ from rbx.models import (
 )
 from rbx.vbtc_gates import bitcoin_attestation_height, bitcoin_attestation_record_height, served_height
 from btc.btc_client import BtcClient
-from btc.client import BtcExplorerClient
+from btc.client import (
+    BtcAddressNotFound,
+    BtcExplorerClient,
+    BtcOffsetUnsupported,
+    BtcProviderUnavailable,
+)
 from api.decorators import cache_request
 from django.utils.decorators import method_decorator
 from django.conf import settings
@@ -68,25 +77,22 @@ class BtcAddressView(GenericAPIView):
         if not address:
             return Response({"message": "address required"}, status=400)
 
-        client = BtcExplorerClient()
+        try:
+            offset = int(offset)
+        except (TypeError, ValueError):
+            return Response({"message": "offset must be an integer"}, status=400)
 
-        balance = client.get_balance(address)
-        transactions, total_transactions = client.get_confirmed_transactions(
-            address, offset
-        )
-        utxos, total_utxos = client.get_utxos(address, offset)
-
-        data = {
-            "balance": balance,
-            "transactions": {
-                "total": total_transactions,
-                "results": [t.serialize() for t in transactions],
-            },
-            "utxos": {
-                "total": total_utxos,
-                "results": [u.serialize() for u in utxos],
-            },
-        }
+        try:
+            data = BtcExplorerClient().get_address(address, offset)
+        except BtcOffsetUnsupported as e:
+            return Response({"message": str(e)}, status=400)
+        except BtcAddressNotFound:
+            return Response({"message": "Invalid Bitcoin address for this network"}, status=400)
+        except BtcProviderUnavailable:
+            return Response(
+                {"message": "Bitcoin address data is unavailable, try again later"},
+                status=503,
+            )
 
         return Response(data, status=200)
 
@@ -199,7 +205,19 @@ class VbtcV2ListAllView(GenericAPIView):
 
     def get(self, request, *args, **kwargs):
         tokens = VbtcV2Token.objects.select_related("nft__mint_transaction").order_by("-created_at")
-        results = VbtcV2TokenSerializer(tokens, many=True).data
+        serializer_class = vbtc_v2_token_serializer_class(request)
+        # Unpaginated unless the caller opts in with `view=wallet` and sends
+        # `page` or `limit`; then the standard page envelope (count, page,
+        # num_pages, results). The explorer app already sends `page` without
+        # `view` and reads every vault from the one response.
+        wants_page = "page" in request.query_params or "limit" in request.query_params
+        if serializer_class is VbtcV2WalletTokenSerializer and wants_page:
+            # Vaults minted in one block share created_at: a unique
+            # tie-break keeps each vault on one page between requests.
+            paginator = StandardPagination()
+            page = paginator.paginate_queryset(tokens.order_by("-created_at", "-sc_identifier"), request, view=self)
+            return paginator.get_paginated_response(serializer_class(page, many=True).data)
+        results = serializer_class(tokens, many=True).data
         return Response({"results": results}, status=200)
 
 
@@ -208,26 +226,29 @@ class VbtcV2ListView(GenericAPIView):
     def get(self, request, *args, **kwargs):
         vfx_address = self.kwargs["vfx_address"]
 
-        sc_identifiers = set()
-
-        transfers = VbtcV2TokenTransfer.objects.filter(
-            to_address=vfx_address
-        ) | VbtcV2TokenTransfer.objects.filter(from_address=vfx_address)
-        for transfer in transfers:
-            sc_identifiers.add(transfer.token.sc_identifier)
+        # The contracts of every transfer to or from the address, read in
+        # one query instead of one per transfer.
+        sc_identifiers = set(
+            VbtcV2TokenTransfer.objects.filter(
+                Q(to_address=vfx_address) | Q(from_address=vfx_address)
+            ).values_list("token__sc_identifier", flat=True)
+        )
 
         owned = VbtcV2Token.objects.filter(
             Q(owner_address=vfx_address) | Q(pending_owner_address=vfx_address)
-        )
+        ).select_related("pending_owner_transaction")
         for token in owned:
             if token.current_owner() == vfx_address:
                 sc_identifiers.add(token.sc_identifier)
 
-        tokens = VbtcV2Token.objects.filter(
-            sc_identifier__in=sc_identifiers
-        ).select_related("nft__mint_transaction").order_by("-created_at")
+        tokens = list(
+            VbtcV2Token.objects.filter(sc_identifier__in=sc_identifiers)
+            .select_related("nft__mint_transaction", "pending_owner_transaction")
+            .order_by("-created_at")
+        )
+        prefetch_nft_listings([token.nft for token in tokens])
 
-        results = VbtcV2TokenSerializer(tokens, many=True).data
+        results = vbtc_v2_token_serializer_class(request)(tokens, many=True).data
         return Response({"results": results}, status=200)
 
 
@@ -251,6 +272,9 @@ class VbtcV2DetailView(RetrieveAPIView):
             refresh_watched_backing(token)
             token.refresh_from_db()
         return Response(self.get_serializer(token).data)
+
+    def get_serializer_class(self):
+        return vbtc_v2_token_serializer_class(self.request)
 
 
 class VbtcV2HeightsView(GenericAPIView):
@@ -291,6 +315,15 @@ class VbtcV2WithdrawalsView(GenericAPIView):
         return Response({"results": results}, status=200)
 
 
+def _node_message(result):
+    """The reason the node gave for refusing, or None when it did not answer
+    (a timeout, a refused connection, a body that is not JSON), so a wallet
+    can show the node's own words and tell a refusal from an outage."""
+    if result.get("Unreachable"):
+        return None
+    return result.get("Message") or None
+
+
 def _vbtc_v2_proxy(cli_func, payload, error_msg="Operation failed"):
     """Shared proxy helper — calls CLI, normalizes response."""
     result = cli_func(payload) if payload is not None else cli_func()
@@ -298,7 +331,12 @@ def _vbtc_v2_proxy(cli_func, payload, error_msg="Operation failed"):
     if success:
         return Response({"success": True, **{k: v for k, v in result.items() if k != "Success"}})
     return Response(
-        {"success": False, "message": result.get("Message", error_msg), "raw": result},
+        {
+            "success": False,
+            "message": result.get("Message", error_msg),
+            "raw": result,
+            "node_message": _node_message(result),
+        },
         status=500,
     )
 
@@ -340,7 +378,11 @@ class VbtcV2CeremonyPrepareView(GenericAPIView):
             })
 
         return Response(
-            {"success": False, "message": result.get("Message", "Ceremony preparation failed")},
+            {
+                "success": False,
+                "message": result.get("Message", "Ceremony preparation failed"),
+                "node_message": _node_message(result),
+            },
             status=500,
         )
 
@@ -384,9 +426,17 @@ class VbtcV2CeremonyStatusView(GenericAPIView):
                 "raw": result,
             })
 
+        message = result.get("Message") or "Could not get ceremony status"
+        if result.get("Unreachable"):
+            status_code = 503
+        elif message.startswith("Ceremony not found"):
+            status_code = 404
+        else:
+            status_code = 500
+
         return Response(
-            {"success": False, "message": result.get("Message", "Could not get ceremony status"), "raw": result},
-            status=500,
+            {"success": False, "message": message, "raw": result},
+            status=status_code,
         )
 
 
@@ -778,8 +828,9 @@ class VbtcV2WithdrawCompleteExecuteView(GenericAPIView):
                 )
             finally:
                 # This thread opens its own connection when the withdrawal is
-                # marked; nothing else will ever close it.
-                close_old_connections()
+                # marked; nothing else will ever close it. Closed outright:
+                # close_old_connections() keeps one younger than CONN_MAX_AGE.
+                connection.close()
 
         threading.Thread(target=_run_frost, daemon=True).start()
 
