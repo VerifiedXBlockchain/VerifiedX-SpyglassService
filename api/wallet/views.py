@@ -49,6 +49,7 @@ from rest_framework.generics import GenericAPIView
 from rest_framework.response import Response
 
 from api.amounts import decimal_string
+from api.indexed_height import HEADER as INDEXED_HEIGHT_HEADER
 from api.nft.querysets import ALL_NFTS_QUERYSET
 from rbx import balance_cache
 from rbx.models import (
@@ -334,6 +335,16 @@ def _cache_key(addresses, head):
 
 class WalletSummaryView(GenericAPIView):
     MAX_ADDRESSES = 20
+
+    def finalize_response(self, request, response, *args, **kwargs):
+        # X-Indexed-Height is the block the body describes, not the height
+        # read when the request came in; a 304 keeps it
+        # (HeightKeepingConditionalGetMiddleware).
+        response = super().finalize_response(request, response, *args, **kwargs)
+        height = response.data.get("indexed_height") if isinstance(response.data, dict) else None
+        if height is not None:
+            response[INDEXED_HEIGHT_HEADER] = str(height)
+        return response
 
     def get(self, request, *args, **kwargs):
         addresses = list(dict.fromkeys(a.strip() for a in request.query_params.get("addresses", "").split(",") if a.strip()))

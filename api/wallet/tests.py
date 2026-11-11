@@ -159,6 +159,17 @@ class WalletSummaryTests(TestCase):
         self.assertEqual(again["results"][0]["balance_total_string"], body["results"][0]["balance_total_string"])
         self.assertTrue(cache.keys("walletsummary:*"))
 
+    def test_the_height_header_is_the_block_the_body_describes(self):
+        from api.indexed_height import CACHE_KEY, HEADER
+
+        first = self.summary([f.ALICE])
+        self.assertEqual(first[HEADER], "8")
+        # The header cache still says 7: the summary names its own block.
+        cache.set(CACHE_KEY, 7, 60)
+        again = self.client.get(summary_url([f.ALICE]), HTTP_IF_NONE_MATCH=first["ETag"])
+        self.assertEqual(again.status_code, 304)
+        self.assertEqual(again[HEADER], "8")
+
     def test_a_block_landing_mid_build_is_rebuilt(self):
         from api.wallet import views
 

@@ -78,3 +78,36 @@ class IndexedHeightHeaderTests(TestCase):
         response = self.client.get("/api/addresses/RSOMEONE/", HTTP_ORIGIN="https://wallet.example")
         exposed = [h.strip().lower() for h in response["Access-Control-Expose-Headers"].split(",")]
         self.assertIn(HEADER.lower(), exposed)
+
+
+class NotModifiedKeepsTheHeightTests(TestCase):
+    """A 304 carries the X-Indexed-Height of the response it stands for."""
+
+    def setUp(self):
+        cache.clear()
+
+    def test_a_cached_page_keeps_the_height_it_was_built_at(self):
+        from rbx.tests import make_tx
+
+        block = make_block(5)
+        make_tx(block, "t1", 0, from_address="RA", to_address="RB")
+        first = self.client.get("/api/transaction/")
+        self.assertEqual(first[HEADER], "5")
+
+        make_block(6)
+        cache.delete(CACHE_KEY)
+        # Still the page cached at block 5, so still height 5.
+        again = self.client.get("/api/transaction/")
+        self.assertEqual(again.content, first.content)
+        self.assertEqual(again[HEADER], "5")
+        not_modified = self.client.get("/api/transaction/", HTTP_IF_NONE_MATCH=first["ETag"])
+        self.assertEqual(not_modified.status_code, 304)
+        self.assertEqual(not_modified[HEADER], "5")
+
+    def test_an_uncached_view_stamps_the_height_read_before_it_on_a_304(self):
+        make_block(5)
+        Address.objects.create(address="RSOMEONE")
+        first = self.client.get("/api/addresses/RSOMEONE/")
+        not_modified = self.client.get("/api/addresses/RSOMEONE/", HTTP_IF_NONE_MATCH=first["ETag"])
+        self.assertEqual(not_modified.status_code, 304)
+        self.assertEqual(not_modified[HEADER], "5")

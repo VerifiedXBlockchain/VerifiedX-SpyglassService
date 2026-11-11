@@ -10,6 +10,7 @@ from functools import wraps
 
 from django.conf import settings
 from django.core.cache import cache
+from django.middleware.http import ConditionalGetMiddleware
 
 HEADER = "X-Indexed-Height"
 CACHE_KEY = "indexed_height:v1"
@@ -69,3 +70,16 @@ class IndexedHeightMiddleware:
         if height is not None and not response.has_header(HEADER):
             response[HEADER] = str(height)
         return response
+
+
+class HeightKeepingConditionalGetMiddleware(ConditionalGetMiddleware):
+    """ConditionalGetMiddleware whose 304 keeps the X-Indexed-Height of the
+    response it stands for. Django's 304 copies only the standard caching
+    headers, so the height of a page served from cache_page was dropped and
+    IndexedHeightMiddleware then stamped the current height on it."""
+
+    def process_response(self, request, response):
+        conditional = super().process_response(request, response)
+        if conditional is not response and response.has_header(HEADER):
+            conditional[HEADER] = response[HEADER]
+        return conditional
