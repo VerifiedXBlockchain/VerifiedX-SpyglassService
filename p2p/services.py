@@ -22,7 +22,8 @@ import time
 from datetime import timedelta
 
 from django.db import IntegrityError, transaction
-from django.db.models import F, Q
+from django.db.models import Case, CharField, F, Func, IntegerField, OuterRef, Q, Subquery, Value, When
+from django.db.models.functions import Coalesce
 from django.utils import timezone
 
 from p2p import rules
@@ -439,7 +440,7 @@ def cancel_listing(listing, *, actor, now=None):
 
 
 def high_bid(listing):
-    return listing.bids.order_by("-amount", "created_at", "id").first()
+    return listing.bids.order_by("-amount", "created_at", "id").defer("signature").first()
 
 
 def reserve_met(listing, high):
@@ -704,16 +705,81 @@ def end_listing(listing, reason, at):
 # region Reads
 
 
+def with_effective_state(listings, now=None):
+    """`listings` annotated with effective_state: the state each listing is
+    in once what is due is applied (_apply_due, in SQL), so filters and
+    counts are right before the closer or a read has written it. Keep the
+    two in step: test_reads checks them against each other."""
+    now = now or timezone.now()
+    top_amount = Bid.objects.filter(listing=OuterRef("pk")).order_by("-amount").values("amount")[:1]
+    listings = listings.annotate(_top_amount=Subquery(top_amount))
+    open_ = Q(state__in=[State.LIVE, State.AWAITING_SALE_START])
+    nft_gone = Q(nft__burn_transaction__isnull=False) | (Q(nft__isnull=False) & ~Q(nft__owner_address=F("seller_address")))
+    ended = Q(state=State.LIVE, ends_at__lte=now)
+    won = Q(floor_price__isnull=False, _top_amount__isnull=False) & (
+        Q(reserve_price__isnull=True) | Q(_top_amount__gte=F("reserve_price"))
+    )
+    return listings.annotate(
+        effective_state=Case(
+            When(open_ & nft_gone, then=Value(State.ENDED)),
+            When(ended & won & Q(ends_at__gt=now - SALE_START_WINDOW), then=Value(State.AWAITING_SALE_START)),
+            When(ended & won, then=Value(State.UNFULFILLED)),
+            When(ended, then=Value(State.EXPIRED)),
+            When(Q(state=State.AWAITING_SALE_START, sale_start_deadline__lte=now), then=Value(State.UNFULFILLED)),
+            default=F("state"),
+            output_field=CharField(),
+        )
+    )
+
+
+def count_of(listings):
+    """A correlated count of `listings` (already filtered on OuterRef)."""
+    # COUNT as a plain function, not an aggregate: no GROUP BY, one row.
+    counted = listings.order_by().annotate(n=Func(F("pk"), function="COUNT")).values("n")
+    return Coalesce(Subquery(counted, output_field=IntegerField()), 0)
+
+
+def with_bid_summary(listings):
+    """bid_total and high_bid_pk per listing, without loading any bid."""
+    bids = Bid.objects.filter(listing=OuterRef("pk"))
+    return listings.annotate(
+        bid_total=count_of(bids),
+        high_bid_pk=Subquery(bids.order_by("-amount", "created_at", "id").values("pk")[:1]),
+    )
+
+
+def refreshed(rows, now=None):
+    """The rows of a page, each moved on if it is due (bounded by the page):
+    returns the pks whose stored state changed."""
+    now = now or timezone.now()
+    changed = []
+    for row in rows:
+        if getattr(row, "effective_state", row.state) != row.state or _is_due(row, now):
+            refresh_listing(row, now)
+            changed.append(row.pk)
+    return changed
+
+
 def visible_listings(shop, *, owner_view=False, now=None):
     """What a shop page shows: the active listings and the ones sold in the
-    last week, in live collections; the owner sees everything."""
+    last week, in live collections; the owner sees everything. Filter on
+    effective_state, not state."""
     now = now or timezone.now()
-    listings = shop.listings.filter(collection__is_deleted=False)
+    listings = with_effective_state(shop.listings.filter(collection__is_deleted=False), now)
     if owner_view:
         return listings
     return listings.filter(collection__is_live=True).filter(
-        Q(state__in=Listing.PUBLIC_STATES) | Q(state=State.SOLD, closed_at__gte=now - RECENTLY_CLOSED)
+        Q(effective_state__in=Listing.PUBLIC_STATES) | Q(effective_state=State.SOLD, closed_at__gte=now - RECENTLY_CLOSED)
     )
+
+
+def effective_count(listing_filter, states, *, live_collections=True, now=None):
+    """A correlated count of the listings matching `listing_filter` whose
+    effective state is in `states`, by default in live collections only."""
+    listings = Listing.objects.filter(listing_filter, collection__is_deleted=False)
+    if live_collections:
+        listings = listings.filter(collection__is_live=True)
+    return count_of(with_effective_state(listings, now).filter(effective_state__in=states))
 
 
 # endregion

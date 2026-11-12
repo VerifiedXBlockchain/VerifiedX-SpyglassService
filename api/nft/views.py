@@ -64,14 +64,12 @@ class ListedNftIdentifiersListView(GenericAPIView):
 
     def get(self, request, *args, **kwargs):
         from p2p.models import Listing
+        from p2p.services import with_effective_state
 
         address = kwargs["owner_address"]
         identifiers = list(
-            Listing.objects.filter(
-                seller_address=address,
-                state__in=Listing.ACTIVE_STATES,
-                nft__owner_address=address,
-            )
+            with_effective_state(Listing.objects.filter(seller_address=address, nft__owner_address=address))
+            .filter(effective_state__in=Listing.ACTIVE_STATES)
             .order_by("created_at", "id")
             .values_list("smart_contract_uid", flat=True)
         )

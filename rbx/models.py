@@ -501,12 +501,11 @@ class Nft(models.Model):
         if hasattr(self, "_prefetched_is_listed"):
             return self._prefetched_is_listed
         from p2p.models import Listing
+        from p2p.services import with_effective_state
 
-        return Listing.objects.filter(
-            smart_contract_uid=self.identifier,
-            seller_address=self.owner_address,
-            state__in=Listing.ACTIVE_STATES,
-        ).exists()
+        return with_effective_state(
+            Listing.objects.filter(smart_contract_uid=self.identifier, seller_address=self.owner_address)
+        ).filter(effective_state__in=Listing.ACTIVE_STATES).exists()
 
     class Meta:
         verbose_name = _("NFT")

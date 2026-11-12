@@ -39,7 +39,7 @@ JSON, snake_case, amounts as decimal strings with up to 8 places and at most 999
 | `DELETE /p2p/collections/{id}/` | shop owner | 204; refused for the default collection and while it has active listings |
 | `GET /p2p/shops/{url}/listings/?collection=&state=&page=` | anyone | `Listing[]`: active, and sold in the last 7 days, in live collections; the owner sees all |
 | `POST /p2p/collections/{id}/listings/` | shop owner, who owns the NFT | `Listing` (201) |
-| `GET /p2p/listings/{id}/` | anyone | `Listing` with `bids` (newest first) |
+| `GET /p2p/listings/{id}/` | anyone | `Listing` with its newest 100 `bids` |
 | `PATCH /p2p/listings/{id}/` | seller, while `live` with no bids | `Listing` |
 | `DELETE /p2p/listings/{id}/` | seller, before `sale_pending` | the cancelled `Listing` |
 | `GET /p2p/listings/{id}/bids/` | anyone | `BidSummary[]` |
@@ -58,7 +58,9 @@ JSON, snake_case, amounts as decimal strings with up to 8 places and at most 999
 
 A bid is checked as Core checks it at `Sale_Start`: the bidder's signature over `{purchase_key}_{amount × 1e8}_{address}`, verified here. Then: the listing is live and inside its dates, its shop live and its collection neither deleted nor hidden (`listing_unavailable`), the bidder is not the seller or a vault (xRBX) address, the indexed balance covers the amount, and the amount is the buy-now price exactly (`is_buy_now`) or at least `next_min_bid` and below any buy-now price. Bid statuses: `winning` (the high bid, reserve met), `accepted` (the high bid, reserve not met), `outbid`, then `won` or `lost`.
 
-Time and NFT ownership move listings on in two places: the `close_p2p_listings` command (Celery beat, every minute) and every P2P read, so a listing is right without the beat.
+Time and NFT ownership move listings on without anyone writing first. Reads filter and count on the state each listing is in once what is due is applied, computed in SQL (`p2p.services.with_effective_state`, kept in step with the closer by a test), and write that state to the rows they return, one page at a time. The `close_p2p_listings` command (Celery beat, every minute) writes the rest. So a listing is right on every read, with or without the beat, and `is_listed` and `/nft/listed/` leave out a listing that is due to close.
+
+Reads do bounded work: a page of listings gets each one's bid count and high bid from subqueries and loads no bid history; a listing's detail shows its newest 100 bids (`bid_count` is the total; `/listings/{id}/bids/` pages through them all). Bid signatures are never loaded for a public read.
 
 ## Dry-run mode
 

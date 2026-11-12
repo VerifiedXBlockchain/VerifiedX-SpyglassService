@@ -9,7 +9,7 @@ from urllib.parse import urlparse
 from rest_framework import serializers
 
 from p2p import rules, services
-from p2p.models import Listing
+from p2p.models import Bid, Listing
 
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".avif", ".svg")
 
@@ -30,9 +30,9 @@ def shop_json(shop, *, collection_count=None, live_listing_count=None):
     if collection_count is None:
         collection_count = shop.collections.filter(is_deleted=False, is_live=True).count()
     if live_listing_count is None:
-        live_listing_count = shop.listings.filter(
-            state=Listing.State.LIVE, collection__is_deleted=False, collection__is_live=True
-        ).count()
+        live_listing_count = services.with_effective_state(
+            shop.listings.filter(collection__is_deleted=False, collection__is_live=True)
+        ).filter(effective_state=Listing.State.LIVE).count()
     return {
         "id": shop.pk,
         "unique_id": shop.unique_id,
@@ -51,7 +51,9 @@ def shop_json(shop, *, collection_count=None, live_listing_count=None):
 
 def collection_json(collection, *, listing_count=None):
     if listing_count is None:
-        listing_count = collection.listings.filter(state__in=Listing.PUBLIC_STATES).count()
+        listing_count = services.with_effective_state(collection.listings.all()).filter(
+            effective_state__in=Listing.PUBLIC_STATES
+        ).count()
     return {
         "id": collection.pk,
         "shop_url": collection.shop.url,
@@ -140,9 +142,12 @@ def public_step(description):
     return {**description, "data": {**description["data"], "BidSignature": None}}
 
 
-def listing_json(listing, *, with_bids=False):
-    bids = list(listing.bids.all())
-    high = max(bids, key=lambda b: (b.amount, -b.created_at.timestamp(), -b.pk), default=None)
+DETAIL_BIDS = 100
+
+
+def listing_json(listing, *, high=None, bid_count=0, bids=None):
+    """A Listing. `high` and `bid_count` come from the caller (one query per
+    page, p2p.services.with_bid_summary); `bids`, when given, are shown."""
     body = {
         "id": listing.pk,
         "shop_url": listing.shop.url,
@@ -159,7 +164,7 @@ def listing_json(listing, *, with_bids=False):
         "ends_at": iso(listing.ends_at),
         "purchase_key": listing.purchase_key,
         "high_bid": {"amount": money(high.amount), "address": high.address, "at": iso(high.created_at)} if high else None,
-        "bid_count": len(bids),
+        "bid_count": bid_count,
         "next_min_bid": money(services.next_min_bid(listing, high)),
         "winner_address": listing.winner_address or None,
         "sale_start_deadline": iso(listing.sale_start_deadline),
@@ -169,9 +174,29 @@ def listing_json(listing, *, with_bids=False):
         "royalty_enforced": listing.royalty_enforced,
         "end_reason": listing.end_reason or None,
     }
-    if with_bids:
+    if bids is not None:
         body["bids"] = [bid_json(bid, listing, high) for bid in bids]
     return body
+
+
+def listing_detail_json(listing):
+    """A Listing with its newest DETAIL_BIDS bids (all of them are at
+    /listings/{id}/bids/); signatures are never loaded."""
+    bids = list(listing.bids.defer("signature")[:DETAIL_BIDS])
+    return listing_json(listing, high=services.high_bid(listing), bid_count=listing.bids.count(), bids=bids)
+
+
+def high_bids_of(rows, *extra_pks):
+    """The high bids of a page of rows annotated with high_bid_pk, and any
+    other bids named, in one query, by pk."""
+    pks = {row.high_bid_pk for row in rows if row.high_bid_pk} | {pk for pk in extra_pks if pk}
+    return {bid.pk: bid for bid in Bid.objects.filter(pk__in=pks).defer("signature")} if pks else {}
+
+
+def listing_rows_json(rows):
+    """Listings for a page of rows from p2p.services.with_bid_summary."""
+    highs = high_bids_of(rows)
+    return [listing_json(row, high=highs.get(row.high_bid_pk), bid_count=row.bid_total) for row in rows]
 
 
 # endregion
