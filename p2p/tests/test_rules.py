@@ -46,6 +46,11 @@ class AmountTests(SimpleTestCase):
             with self.subTest(value=value):
                 self.assertIsNone(rules.parse_amount(value))
 
+    def test_storable_amounts(self):
+        self.assertEqual(rules.storable(Decimal("9999999999999999.99999999")), Decimal("9999999999999999.99999999"))
+        self.assertIsNone(rules.storable(Decimal("10000000000000000")))
+        self.assertIsNone(rules.storable(None))
+
     def test_formats_without_trailing_zeros_or_exponent(self):
         self.assertEqual(rules.format_amount(Decimal("10.50000000")), "10.5")
         self.assertEqual(rules.format_amount(Decimal("10")), "10")

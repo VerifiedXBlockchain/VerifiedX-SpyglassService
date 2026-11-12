@@ -180,14 +180,20 @@ def listing_json(listing, *, with_bids=False):
 
 
 class AmountField(serializers.Field):
-    """A decimal amount above 0 with up to 8 places, from a string or number."""
+    """A decimal amount above 0 with up to 8 places, from a string or number,
+    no larger than the registry stores."""
 
-    default_error_messages = {"invalid": "A decimal amount above 0 with up to 8 places."}
+    default_error_messages = {
+        "invalid": "A decimal amount above 0 with up to 8 places.",
+        "too_large": f"At most {rules.format_amount(rules.MAX_AMOUNT)}.",
+    }
 
     def to_internal_value(self, data):
         amount = rules.parse_amount(data)
         if amount is None or amount <= 0:
             self.fail("invalid")
+        if rules.storable(amount) is None:
+            self.fail("too_large")
         return amount
 
     def to_representation(self, value):

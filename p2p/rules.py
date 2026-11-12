@@ -41,6 +41,9 @@ SALE_PAYMENT_TOLERANCE = Decimal("1.0")
 BID_UNITS = Decimal("100000000")
 AMOUNT_PLACES = 8
 AMOUNT_QUANTUM = Decimal("0.00000001")
+# The largest amount the registry stores (p2p.models.MONEY: 24 digits, 8 of
+# them after the point).
+MAX_AMOUNT = Decimal("9999999999999999.99999999")
 
 # Smart contract features (Models/SmartContracts/SmartContractFeatures.cs).
 FEATURE_ROYALTY = 1
@@ -97,6 +100,11 @@ def parse_amount(value):
     except InvalidOperation:  # more digits than the context holds
         return None
     return quantized if quantized == amount else None
+
+
+def storable(amount):
+    """`amount` when the registry can store it, else None."""
+    return amount if amount is not None and abs(amount) <= MAX_AMOUNT else None
 
 
 def format_amount(amount):

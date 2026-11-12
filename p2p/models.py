@@ -11,6 +11,7 @@ and the block indexer all call.
 from django.db import models
 from django.db.models import F, Q
 
+# p2p.rules.MAX_AMOUNT is the largest value this holds.
 MONEY = dict(max_digits=24, decimal_places=8)
 LISTING_STATES = [
     "live", "awaiting_sale_start", "sale_pending", "sold", "cancelled", "expired", "unfulfilled", "ended",

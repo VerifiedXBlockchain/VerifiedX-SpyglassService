@@ -203,7 +203,7 @@ def _index_nft_sale(tx):
             return
         next_owner = data.get("NextOwner") if isinstance(data.get("NextOwner"), str) else tx.to_address
         services.start_sale(
-            listing, next_owner=next_owner, amount=rules.parse_amount(data.get("SoldFor")),
+            listing, next_owner=next_owner, amount=rules.storable(rules.parse_amount(data.get("SoldFor"))),
             description_of_tx=description, chain_state=LIVE, at=at, tx_hash=tx.hash,
         )
     elif function in ("Sale_Complete()", "M_Sale_Complete()"):

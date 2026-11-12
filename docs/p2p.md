@@ -25,7 +25,7 @@ The central registry of shops, collections, listings and bids that the web walle
 
 ## Endpoints
 
-JSON, snake_case, amounts as decimal strings with up to 8 places, times ISO 8601 UTC (`2026-11-11T22:00:00Z`). Lists are `{count, next, results}`, where `next` is the next page number or `null`; `?page=` picks a page and `?limit=` its size (30 by default, at most 100). Errors are `{"error": {"code", "message", "fields"}}`, with `fields` mapping a field (Core's names inside `data`, for example `data.DecShop.Name`) to one message, and status 400, 401, 403, 404 or 409.
+JSON, snake_case, amounts as decimal strings with up to 8 places and at most 9999999999999999.99999999 (larger is a 400 on the field), times ISO 8601 UTC (`2026-11-11T22:00:00Z`). Lists are `{count, next, results}`, where `next` is the next page number or `null`; `?page=` picks a page and `?limit=` its size (30 by default, at most 100). Errors are `{"error": {"code", "message", "fields"}}`, with `fields` mapping a field (Core's names inside `data`, for example `data.DecShop.Name`) to one message, and status 400, 401, 403, 404 or 409.
 
 | Method and path | Who | Returns |
 |---|---|---|

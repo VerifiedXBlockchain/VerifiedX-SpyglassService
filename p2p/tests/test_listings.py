@@ -225,3 +225,52 @@ class ListingReadTests(P2PTestCase):
     def test_times_are_utc_iso(self):
         body = self.call("GET", f"/listings/{self.live['id']}/").json()
         self.assertRegex(body["starts_at"], re.compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$"))
+
+
+class LargeAmountTests(P2PTestCase):
+    """Review finding 7: an amount larger than the registry stores is a 400
+    on its field, not a 500 while saving."""
+
+    def setUp(self):
+        super().setUp()
+        self.shop = make_shop(SELLER, "coolstuff")
+        self.collection = self.shop.collections.get()
+        self.owner = sign_in(str(SELLER))
+        make_nft("nft:1", SELLER)
+
+    def test_prices(self):
+        huge = "10000000000000000"
+        for field, prices in (
+            ("buy_now_price", dict(buy_now_price=huge)),
+            ("floor_price", dict(buy_now_price=None, floor_price=huge)),
+            ("reserve_price", dict(buy_now_price=None, floor_price="1", reserve_price=huge)),
+        ):
+            with self.subTest(field=field):
+                body = self.list_nft(self.owner, self.collection.pk, "nft:1", expect=400, **prices)
+                self.assertEqual(body["error"]["code"], "invalid")
+                self.assertIn("At most 9999999999999999.99999999", body["error"]["fields"][field])
+        largest = self.list_nft(self.owner, self.collection.pk, "nft:1", buy_now_price="9999999999999999.99999999")
+        self.assertEqual(largest["buy_now_price"], "9999999999999999.99999999")
+        error = self.assertError(self.call("PATCH", f"/listings/{largest['id']}/",
+                                           {"buy_now_price": "99999999999999999"}, token=self.owner), 400, "invalid")
+        self.assertIn("buy_now_price", error["fields"])
+
+    def test_bids(self):
+        listing = self.list_nft(self.owner, self.collection.pk, "nft:1", buy_now_price=None, floor_price="1")
+        response = self.call("POST", f"/listings/{listing['id']}/bids/",
+                             {"amount": "123456789012345678", "signature": "x"}, token=sign_in(str(BUYER)))
+        error = self.assertError(response, 400, "invalid")
+        self.assertIn("amount", error["fields"])
+
+    def test_an_indexed_sale_with_a_huge_price_still_moves_the_listing(self):
+        from p2p import indexer
+        from p2p.tests.test_indexer import ChainTx
+        from rbx.models import Transaction
+
+        listing = self.list_nft(self.owner, self.collection.pk, "nft:1")
+        Listing.objects.filter(pk=listing["id"]).update(state="awaiting_sale_start")
+        indexer.index_nft_sale(ChainTx()(Transaction.Type.NFT_SALE, SELLER, BUYER, {
+            "Function": "Sale_Start()", "ContractUID": "nft:1", "KeySign": listing["purchase_key"],
+            "NextOwner": str(BUYER), "SoldFor": "1" + "0" * 20}))
+        row = Listing.objects.get(pk=listing["id"])
+        self.assertEqual((row.state, row.sale_amount), ("sale_pending", None))
