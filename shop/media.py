@@ -1,8 +1,6 @@
 from django.conf import settings
-import time
 import boto3
 import logging
-import uuid
 import shutil
 import os
 import paramiko
@@ -12,124 +10,6 @@ import string
 from stat import S_ISDIR, S_ISREG
 from project.utils.safe_fetch import FetchError, UnsafeUrl, check_url, fetch_to_file
 from project.utils.string import get_random_string
-from project.celery import app
-from rbx.exceptions import RBXException
-from shop.models import Listing
-
-
-@app.task(autoretry_for=[RBXException])
-def upload_thumbs(
-    listing_pk: int,
-    sc_uid: str,
-    existing_thumbnails: list[str],
-    force_replace=False,
-    attempt: int = 1,
-    host: str = settings.RBX_SHOP_CRAWLER_ADDRESS,
-) -> list[str]:
-
-    try:
-        listing = Listing.objects.get(pk=listing_pk)
-    except Listing.DoesNotExist:
-        logging.error(f"Listing not found with id of {listing_pk}")
-        return
-
-    existing_filenames = []
-    if not force_replace:
-        for f in existing_thumbnails:
-            parts = f.split("/")
-            filename = parts[len(parts) - 1]
-            existing_filenames.append(filename)
-
-    if settings.LOCAL_ASSETS_PATH:
-        logging.info(f"Using local assets path {settings.LOCAL_ASSETS_PATH}")
-        return _upload_thumbs_local(sc_uid)
-
-    remote_folder = f"{sc_uid.replace(':', '')}/thumbs/"
-    local_folder = scp_down_folder(remote_folder, host)
-
-    thumbs_folder = f"{local_folder}"
-
-    files = [
-        file
-        for file in os.listdir(thumbs_folder)
-        if os.path.isfile(os.path.join(thumbs_folder, file))
-    ]
-
-    txt_files = []
-    asset_files = []
-
-    for file in files:
-        if file.endswith(".txt"):
-            txt_files.append(file)
-        else:
-            asset_files.append(file)
-
-    for f in asset_files:
-        file_name, file_ext = os.path.splitext(f)
-        txt_file = file_name + ".txt"
-        if txt_file not in txt_files:
-            print(f"Missing txt file for {f}. Will Try again in 5 seconds from scratch")
-            time.sleep(5)
-            if attempt < 5:
-                upload_thumbs(
-                    listing_pk, sc_uid, existing_thumbnails, force_replace, attempt + 1
-                )
-                return
-            else:
-                print("After 5 attempts, file did not come through. Removing from list")
-                asset_files.remove(f)
-
-    logging.info(f"Asset Files: {asset_files}")
-
-    urls = []
-    for file in asset_files:
-
-        url = _validate_thumb_and_upload(sc_uid, thumbs_folder, file)
-        if url:
-            urls.append(url)
-
-    logging.info(f"URLs: {urls}")
-
-    listing.thumbnails = urls
-    listing.save()
-
-
-def _validate_thumb_and_upload(
-    sc_uid: str, thumbs_folder: str, file: str, attempt: int = 0
-):
-    logging.info(f"File: {file}")
-
-    path = os.path.join(thumbs_folder, file)
-    size = os.stat(path).st_size
-
-    if size < 10:
-        logging.info("Filesize less than 10. Retrying in 2 seconds")
-        time.sleep(2)
-        if attempt > 10:
-            logging.error("After 10 attempts, file did not come through. Skipping")
-            return None
-
-        return _validate_thumb_and_upload(sc_uid, thumbs_folder, file, attempt + 1)
-
-    url = upload_to_s3(sc_uid, os.path.join(thumbs_folder, file))
-    return url
-
-
-def _upload_thumbs_local(sc_uid: str) -> list[str]:
-
-    directory = f"{settings.LOCAL_ASSETS_PATH}/{sc_uid.replace(':', '')}/"
-    files = [
-        file
-        for file in os.listdir(directory)
-        if os.path.isfile(os.path.join(directory, file))
-    ]
-
-    urls = []
-    for file in files:
-        url = upload_to_s3(sc_uid, os.path.join(directory, file))
-        urls.append(url)
-
-    return urls
 
 
 def upload_to_s3(sc_uid: str, path: str, bucket: str = settings.AWS_BUCKET):

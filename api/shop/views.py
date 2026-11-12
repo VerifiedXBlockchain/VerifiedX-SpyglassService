@@ -35,7 +35,7 @@ from api.shop.querysets import (
     ALL_LISTINGS_QUERYSET,
 )
 from rest_framework.response import Response
-from shop.tasks import submit_bid, import_shop
+from django.db.models import Q
 from connect.email.tasks import send_build_sale_start_tx_email
 from decimal import Decimal
 
@@ -51,21 +51,31 @@ class ShopView(GenericAPIView):
     search_fields = ["url", "name", "owner_address"]
 
 
+def shops_with_url(url: str):
+    """The live rows for a shop URL however it is written: with vfx://, rbx://
+    or no prefix, in any case. Core adds vfx:// to every shop it registers
+    and older shops carry rbx://; its own lookup ignores case."""
+    from p2p.rules import normalize_url
+
+    bare = normalize_url(url)
+    return Shop.objects.filter(is_deleted=False).filter(
+        Q(url__iexact=f"vfx://{bare}") | Q(url__iexact=f"rbx://{bare}") | Q(url__iexact=bare)
+    )
+
+
 class ShopLookupView(RetrieveModelMixin, ShopView):
     def get_object(self):
         url = self.request.query_params.get("url", None)
 
-        if not url:
+        if not url or not url.strip():
             raise exceptions.BadRequest("Param `url` is required.")
-        if not "rbx://" in url:
-            url = f"rbx://{url}"
 
         url = url.strip()
-
-        try:
-            return Shop.objects.get(url=url, is_deleted=False)
-        except Shop.DoesNotExist:
+        # A core (chain-indexed) row first, then the oldest.
+        shop = shops_with_url(url).order_by("is_third_party", "id").first()
+        if shop is None:
             raise exceptions.BadRequest(f"Shop with url '{url}' does not exist.")
+        return shop
 
     def get(self, request, *args, **kwargs):
         return self.retrieve(request, *args, **kwargs)
@@ -73,16 +83,17 @@ class ShopLookupView(RetrieveModelMixin, ShopView):
 
 class ShopAvailableView(GenericAPIView):
     def get(self, request, *args, **kwargs):
+        from p2p.services import url_taken
+        from p2p.rules import normalize_url
+
         url = request.query_params.get("url", None)
 
-        if not url:
+        if not url or not url.strip():
             return Response({}, status=status.HTTP_400_BAD_REQUEST)
 
-        if not "rbx://" in url:
-            url = f"rbx://{url}"
         url = url.strip()
-
-        exists = Shop.objects.filter(url=url, is_deleted=False).exists()
+        # Taken in the old table or in the P2P registry, which mirrors the chain.
+        exists = shops_with_url(url).exists() or url_taken(normalize_url(url), include_legacy=False)
         return Response({"available": not exists}, status=status.HTTP_200_OK)
 
 
@@ -118,37 +129,12 @@ class ShopRetrieveUpdateDestroyView(
         instance.save()
 
 
-class ShopResyncView(RetrieveModelMixin, ShopView):
-    def get_object(self):
-        url = self.request.query_params.get("url", None)
-
-        if not url:
-            raise exceptions.BadRequest("Param `url` is required.")
-        if not "rbx://" in url:
-            url = f"rbx://{url}"
-
-        url = url.strip()
-
-        try:
-            return Shop.objects.get(url=url, is_deleted=False)
-        except Shop.DoesNotExist:
-            raise exceptions.BadRequest(f"Shop with url '{url}' does not exist.")
+class ShopResyncView(GenericAPIView):
+    """Retired with the shop crawler: nothing is crawled any more. It still
+    answers as before so clients that call it (the GUI after a shop change)
+    carry on."""
 
     def get(self, request, *args, **kwargs):
-        delay = request.query_params.get("delay", "35")
-        try:
-            delay = int(delay)
-        except ValueError:
-            delay = 35
-
-        shop = self.get_object()
-        if shop:
-            if shop.is_third_party:
-                raise exceptions.BadRequest(f"This is a third party shop")
-
-            print(f"Resyncing shop in {delay} second(s).")
-            import_shop.apply_async(args=[shop.url], countdown=delay)
-
         return Response({"success": True})
 
 
@@ -274,9 +260,9 @@ class CreateBidView(GenericAPIView):
         from_third_party = serializer.validated_data.get("from_third_party")
         is_buy_now = serializer.validated_data.get("is_buy_now")
         signature = serializer.validated_data.get("signature")
-        pre_signed_sale_complete_tx = serializer.validated_data.get(
-            "pre_signed_sale_complete_tx"
-        )
+        # A pre-signed Sale_Complete is still accepted in the body but never
+        # stored: nothing relays it any more, and a signed transaction kept
+        # here is a bearer instrument for its hour.
 
         try:
             a = Address.objects.get(address=address)
@@ -387,7 +373,6 @@ class CreateBidView(GenericAPIView):
                 status=bid_status,
                 send_receive=Bid.BidSendReceive.SEND,
                 is_third_party=True,
-                pre_signed_sale_complete_tx=pre_signed_sale_complete_tx,
             )
 
             bid.save()
@@ -399,10 +384,6 @@ class CreateBidView(GenericAPIView):
                 # if bid.signature is not None and bid.signature != "NA":
 
                 send_build_sale_start_tx_email.apply_async(args=[bid.pk])
-
-            if listing.collection.shop.is_core:
-
-                submit_bid.apply_async(args=[bid.pk])
 
             if listing.is_auction:
 

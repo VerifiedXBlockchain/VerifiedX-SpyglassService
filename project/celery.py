@@ -40,20 +40,12 @@ def setup_periodic_tasks(sender, **kwargs):
         10 * 60, expire_stale_withdrawals.s(), name="Expire Stale Withdrawals"
     )
 
+    # P2P listings: ended auctions, missed sale starts, NFTs that moved. The
+    # API applies the same checks on read, so this only keeps idle rows right.
+    sender.add_periodic_task(60, close_p2p_listings.s(), name="Close P2P Listings", expires=55)
+
     if settings.HEALTH_CHECK_ENABLED:
         sender.add_periodic_task(3 * 60, health_check.s(), name="Health Check")
-
-    if not settings.MINIMAL_CRON_JOBS:
-        sender.add_periodic_task(
-            10 * 60, shop_online_crawler.s(False), name="Online Shop Crawler (ALL)"
-        )
-        sender.add_periodic_task(
-            60 * 60, shop_online_crawler.s(True), name="Online Shop Crawler (FAVORED)"
-        )
-
-        sender.add_periodic_task(
-            5 * 60, crawl_online_shops.s(), name="Crawl Online Shops"
-        )
 
 
 @app.task(queue="blocks_queue")
@@ -85,20 +77,10 @@ def sync_master_nodes():
 
 
 @app.task
-def shop_online_crawler(all: bool = False):
+def close_p2p_listings():
     from django.core import management
 
-    if all:
-        management.call_command("shop_online_crawler", "--all")
-    else:
-        management.call_command("shop_online_crawler")
-
-
-@app.task
-def crawl_online_shops():
-    from django.core import management
-
-    management.call_command("crawl_online_shops", "--async")
+    management.call_command("close_p2p_listings")
 
 
 @app.task

@@ -26,6 +26,7 @@ INSTALLED_APPS = [
     "connect.apps.ConnectConfig",
     "rbx.apps.RBXConfig",
     "shop.apps.ShopConfig",
+    "p2p.apps.P2PConfig",
     "payment.apps.PaymentConfig",
     "btc.apps.BtcConfig",
     "price.apps.PriceConfig",

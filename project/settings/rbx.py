@@ -12,7 +12,7 @@ RBX_IP_LOCATION_CACHE_TIMEOUT = ENV.int("RBX_IP_LOCATION_CACHE_TIMEOUT", default
 RBX_IP_LOCATION_CACHE_PREFIX = ENV.str("RBX_IP_LOCATION_CACHE_PREFIX", default="iploc_")
 
 RBX_WALLET_ADDRESS = ENV.str("RBX_WALLET_ADDRESS")
-# API token of the node behind RBX_WALLET_ADDRESS / RBX_SHOP_CRAWLER_ADDRESS.
+# API token of the node behind RBX_WALLET_ADDRESS.
 # CLI 8.0 (security audit VX-03) keeps an "openapi" node on loopback unless it
 # has a token, and then wants the header on every route outside a short
 # approved list — so each call to our own node carries it. Empty = no header.
@@ -28,8 +28,6 @@ RBX_SHOP_WALLET_ADDRESS = ENV.str("RBX_SHOP_WALLET_ADDRESS")
 RBX_SHOP_WALLET_API_TOKEN = ENV.str("RBX_SHOP_WALLET_API_TOKEN", default="")
 RBX_SHOP_WALLET_USERNAME = ENV.str("RBX_SHOP_WALLET_USERNAME", default="root")
 RBX_SHOP_KEYPAIR_ADDRESS = ENV.str("RBX_SHOP_KEYPAIR_ADDRESS")
-RBX_SHOP_CRAWLER_ADDRESS = ENV.str("RBX_SHOP_CRAWLER_ADDRESS")
-RBX_SHOP_CRAWLER_KEYPAIR_ADDRESS = ENV.str("RBX_SHOP_CRAWLER_KEYPAIR_ADDRESS")
 
 RBX_WALLET_TEMP_PATH = ENV.str("RBX_WALLET_ASSET_PATH", default="/tmp")
 RBX_SHOP_ASSETS_FOLDER_PATH = ENV.str(
