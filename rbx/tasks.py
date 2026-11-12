@@ -54,6 +54,7 @@ from rbx.utils import get_ip_location, network_metrics
 from dateutil import parser
 from django.conf import settings
 from connect.email.tasks import send_sale_started_email
+from p2p import indexer as p2p_indexer
 from shop.models import Listing as LegacyListing
 
 
@@ -1009,6 +1010,10 @@ def process_transaction(tx: Transaction):
         identifier = parsed["ContractUID"]
         func = parsed["Function"]
 
+        # The P2P registry's sale state, for all five functions. It never
+        # raises and never calls a node.
+        p2p_indexer.index_nft_sale(tx)
+
         if func == "Sale_Start()":
             _enqueue_on_commit(send_sale_started_email, tx.hash)
 
@@ -1451,8 +1456,8 @@ def process_adnr(tx):
 
 
 def process_shop(tx):
-    """A DSTR transaction: the old shop table's row, from the transaction's
-    own data. Nothing is crawled."""
+    """A DSTR transaction: the P2P shop registry, and the old shop table's
+    row for the clients that still read /api/shop/. Neither calls a node."""
     from shop.tasks import apply_legacy_shop_record
 
     if tx.type != Transaction.Type.DST_REGISTRATION:
@@ -1460,6 +1465,8 @@ def process_shop(tx):
         return
 
     logging.info("Dec Shop TX")
+
+    p2p_indexer.index_dstr(tx)
 
     parsed = json.loads(tx.data)
     func = parsed["Function"]
