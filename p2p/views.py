@@ -2,7 +2,7 @@
 
 Reads are public. Every write, POST included, needs a sign-in token
 (p2p.auth), and the token's address is the actor. The views parse and
-shape; the rules and state changes are in p2p.services.
+shape; the rules and state changes are in p2p.services and p2p.dryrun.
 """
 
 from django.conf import settings
@@ -13,7 +13,7 @@ from rest_framework.response import Response
 from rest_framework.settings import api_settings
 from rest_framework.views import APIView
 
-from p2p import serializers as out, services
+from p2p import dryrun, serializers as out, services
 from p2p.auth import SignTokenAuthentication, SignTokenRequired, actor_of
 from p2p.errors import bad_request, exception_handler, not_found
 from p2p.models import Bid, Collection, Listing, Shop
@@ -336,6 +336,54 @@ class MeView(P2PView):
                 "buying": buying,
             }
         )
+
+
+# endregion
+
+# region Dry-run chain steps
+
+
+class DryRunView(P2PView):
+    """404 unless P2P_DRY_RUN is on."""
+
+    def initial(self, request, *args, **kwargs):
+        if not settings.P2P_DRY_RUN:
+            raise not_found("not_found", "Dry runs are off.")
+        super().initial(request, *args, **kwargs)
+
+    def tx(self):
+        data = self.request.data
+        if isinstance(data, dict) and "tx" in data:
+            return data["tx"]
+        return data
+
+    def listing_id(self):
+        data = self.request.data
+        return data.get("listing_id") if isinstance(data, dict) else None
+
+
+class DryRunDstrView(DryRunView):
+    def post(self, request):
+        shop = dryrun.apply_dstr(self.tx(), actor=self.actor())
+        return Response(out.shop_json(shop))
+
+
+class DryRunSaleStartView(DryRunView):
+    def post(self, request):
+        listing = dryrun.apply_sale_start(self.listing_id(), self.tx(), actor=self.actor())
+        return Response(out.listing_json(_listing_or_404(listing.pk), with_bids=True))
+
+
+class DryRunSaleCompleteView(DryRunView):
+    def post(self, request):
+        listing = dryrun.apply_sale_complete(self.listing_id(), self.tx(), actor=self.actor())
+        return Response(out.listing_json(_listing_or_404(listing.pk), with_bids=True))
+
+
+class DryRunSaleCancelView(DryRunView):
+    def post(self, request):
+        listing = dryrun.apply_sale_cancel(self.listing_id(), self.tx(), actor=self.actor())
+        return Response(out.listing_json(_listing_or_404(listing.pk), with_bids=True))
 
 
 # endregion

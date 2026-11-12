@@ -14,6 +14,10 @@ WRITES = [
     ("PATCH", "/listings/1/"),
     ("DELETE", "/listings/1/"),
     ("POST", "/listings/1/bids/"),
+    ("POST", "/dry-run/dstr/"),
+    ("POST", "/dry-run/sale-start/"),
+    ("POST", "/dry-run/sale-complete/"),
+    ("POST", "/dry-run/sale-cancel/"),
 ]
 
 

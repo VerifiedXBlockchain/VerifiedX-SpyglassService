@@ -13,4 +13,8 @@ urlpatterns = [
     path("listings/<int:pk>/", views.ListingDetailView.as_view()),
     path("listings/<int:pk>/bids/", views.ListingBidsView.as_view()),
     path("me/", views.MeView.as_view()),
+    path("dry-run/dstr/", views.DryRunDstrView.as_view()),
+    path("dry-run/sale-start/", views.DryRunSaleStartView.as_view()),
+    path("dry-run/sale-complete/", views.DryRunSaleCompleteView.as_view()),
+    path("dry-run/sale-cancel/", views.DryRunSaleCancelView.as_view()),
 ]
