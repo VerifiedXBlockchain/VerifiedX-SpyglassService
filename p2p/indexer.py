@@ -15,7 +15,7 @@ import logging
 from django.db import transaction
 
 from p2p import rules, services
-from p2p.models import Listing, Shop
+from p2p.models import IndexedTransaction, Listing, Shop
 
 log = logging.getLogger(__name__)
 
@@ -50,9 +50,15 @@ def _data(tx):
 
 
 def _safely(kind, tx, apply):
+    """Apply once: a transaction already in the ledger is skipped, and one
+    applied (or found irrelevant) is recorded with its state change, in one
+    savepoint."""
     try:
         with transaction.atomic():
+            if IndexedTransaction.objects.filter(hash=tx.hash).exists():
+                return
             apply()
+            IndexedTransaction.objects.create(hash=tx.hash, type=tx.type, height=tx.height)
     except Exception:
         log.exception(f"P2P: could not index {kind} {getattr(tx, 'hash', '?')}; skipped")
 
@@ -108,6 +114,8 @@ def _index_dstr(tx):
     )
     unique_id = decshop["UniqueId"][:128]
     shop = registered_shops().filter(unique_id=unique_id).first()
+    if _deleted_later(unique_id, tx):
+        return
     if function == "DecShopCreate()":
         if shop is not None:
             log.warning(f"P2P: DSTR create {tx.hash} repeats live UniqueId {unique_id}; ignored")
@@ -125,8 +133,33 @@ def _index_dstr(tx):
     # chain wins over a dry run.
 
 
+def _deleted_later(unique_id, tx):
+    """Whether the chain deleted this shop after `tx`: a replayed create or
+    update must not bring it back."""
+    if tx.height is None:
+        return False
+    deleted = Shop.objects.filter(unique_id=unique_id, chain_state=Shop.ChainState.DELETED,
+                                  latest_height__gt=tx.height)
+    if deleted.exists():
+        log.info(f"P2P: DSTR {tx.hash} is older than the shop's deletion; skipped")
+        return True
+    return False
+
+
 def registered_shops():
     return Shop.objects.filter(chain_state=REGISTERED)
+
+
+def _behind_listing(listing, tx):
+    """Whether `tx` is older than the latest chain step the listing has
+    applied: indexing it again must not rewind the listing."""
+    heights = [step.get("height") for step in (listing.sale_start, listing.sale_complete, listing.sale_cancel)
+               if isinstance(step, dict) and step.get("hash")]
+    heights = [h for h in heights if isinstance(h, int)]
+    if heights and tx.height is not None and tx.height < max(heights):
+        log.info(f"P2P: NFT_SALE {tx.hash} is older than listing {listing.pk}'s last chain step; skipped")
+        return True
+    return False
 
 
 def _older_than_applied(shop, tx):
@@ -150,13 +183,20 @@ def _index_nft_sale(tx):
     description = describe(tx, data)
     at = tx.date_crafted
     listing = Listing.objects.filter(smart_contract_uid=contract, purchase_key=key).first()
+    if listing is not None and _behind_listing(listing, tx):
+        return
 
     if function in ("Sale_Start()", "M_Sale_Start()"):
         if listing is not None and listing.sale_start_tx == tx.hash:
             return
         # The NFT is locked to NextOwner now: any other open listing of it
-        # can no longer sell.
-        for other in Listing.objects.filter(smart_contract_uid=contract, state__in=Listing.ACTIVE_STATES):
+        # made before this start can no longer sell. One made after it was
+        # made on what the chain showed then (an outside sale that finished,
+        # say), so an old start does not end it.
+        others = Listing.objects.filter(smart_contract_uid=contract, state__in=Listing.ACTIVE_STATES)
+        if at is not None:
+            others = others.filter(created_at__lt=at)
+        for other in others:
             if listing is None or other.pk != listing.pk:
                 services.end_listing(other, "sale_started_elsewhere", at)
         if listing is None:

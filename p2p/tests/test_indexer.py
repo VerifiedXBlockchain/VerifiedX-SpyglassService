@@ -214,3 +214,89 @@ class ReplayTests(TestCase):
             self.assertIn("replayed: 2", out.getvalue())
         shop = Shop.objects.get()
         self.assertEqual((shop.url, shop.name, shop.latest_tx), ("replayed", "Second name", "tx-2"))
+
+
+class ReplaySafetyTests(TestCase):
+    """Review findings 2 and 3: indexing old transactions again must not
+    bring back a deleted shop, end a newer listing, or rewind a sale."""
+
+    def setUp(self):
+        self.chain = ChainTx()
+
+    def replay(self):
+        from io import StringIO
+
+        from django.core.management import call_command
+
+        call_command("p2p_replay_dstr", stdout=StringIO())
+
+    def test_a_deleted_shop_stays_deleted_on_replay(self):
+        from p2p.models import IndexedTransaction
+
+        create = self.chain(Transaction.Type.DST_REGISTRATION, SELLER, "DecShop_Base",
+                            {"Function": "DecShopCreate()", "DecShop": decshop(SELLER, "vfx://gone", unique_id="UG1")})
+        delete = self.chain(Transaction.Type.DST_REGISTRATION, SELLER, "DecShop_Base",
+                            {"Function": "DecShopDelete()", "UniqueId": "UG1"})
+        indexer.index_dstr(create)
+        indexer.index_dstr(delete)
+        for ledger in ("kept", "lost"):
+            with self.subTest(ledger=ledger):
+                if ledger == "lost":
+                    IndexedTransaction.objects.all().delete()
+                self.replay()
+                self.assertEqual(list(Shop.objects.values_list("chain_state", flat=True)), ["deleted"])
+                self.assertFalse(Shop.objects.filter(chain_state__in=Shop.LIVE_STATES).exists())
+
+    def test_an_old_outside_sale_does_not_end_a_newer_listing(self):
+        from p2p.models import IndexedTransaction
+
+        nft = make_nft("nft:art", STRANGER)
+        start = self.chain(Transaction.Type.NFT_SALE, STRANGER, SELLER,
+                           {"Function": "M_Sale_Start()", "ContractUID": "nft:art", "KeySign": "outside1",
+                            "NextOwner": str(SELLER), "SoldFor": 1})
+        indexer.index_nft_sale(start)
+        # The outside sale completed; the buyer lists the NFT here.
+        nft.owner_address = str(SELLER)
+        nft.save()
+        listing = make_listing(nft)
+        for ledger in ("kept", "lost"):
+            with self.subTest(ledger=ledger):
+                if ledger == "lost":
+                    IndexedTransaction.objects.all().delete()
+                indexer.index_nft_sale(start)
+                listing.refresh_from_db()
+                self.assertEqual((listing.state, listing.end_reason), ("live", ""))
+
+    def test_an_old_start_does_not_rewind_a_sold_listing(self):
+        from p2p.models import IndexedTransaction
+
+        listing = make_listing(make_nft("nft:art", SELLER), state="awaiting_sale_start")
+        key = listing.purchase_key
+
+        def sale(function, sender, to, **data):
+            return self.chain(Transaction.Type.NFT_SALE, sender, to,
+                              {"Function": function, "ContractUID": "nft:art", "KeySign": key, **data})
+
+        # Core keeps a key usable after Sale_Cancel, so a sale can start twice.
+        first = sale("Sale_Start()", SELLER, BUYER, NextOwner=str(BUYER), SoldFor=5)
+        cancel = sale("Sale_Cancel()", SELLER, BUYER)
+        second = sale("Sale_Start()", SELLER, BUYER, NextOwner=str(BUYER), SoldFor=5)
+        complete = sale("Sale_Complete()", BUYER, SELLER)
+        for tx in (first, cancel, second, complete):
+            indexer.index_nft_sale(tx)
+        self.assertEqual(Listing.objects.get(pk=listing.pk).state, "sold")
+        IndexedTransaction.objects.all().delete()
+        for tx in (first, cancel):
+            indexer.index_nft_sale(tx)
+        listing.refresh_from_db()
+        self.assertEqual((listing.state, listing.sale_start_tx, listing.sale_complete_tx),
+                         ("sold", second.hash, complete.hash))
+
+    def test_every_applied_transaction_is_recorded_once(self):
+        from p2p.models import IndexedTransaction
+
+        tx = self.chain(Transaction.Type.DST_REGISTRATION, SELLER, "DecShop_Base",
+                        {"Function": "DecShopCreate()", "DecShop": decshop(SELLER, "vfx://once", unique_id="UO1")})
+        indexer.index_dstr(tx)
+        indexer.index_dstr(tx)
+        self.assertEqual(list(IndexedTransaction.objects.values_list("hash", flat=True)), [tx.hash])

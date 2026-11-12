@@ -255,3 +255,18 @@ class Bid(models.Model):
             models.UniqueConstraint(fields=["listing", "signature"], name="p2p_bid_signature_unique_per_listing"),
             models.CheckConstraint(check=Q(amount__gt=0), name="p2p_bid_amount_positive"),
         ]
+
+
+class IndexedTransaction(models.Model):
+    """Every DSTR and NFT_SALE transaction the indexer has applied (or
+    looked at and found nothing to do for). A block indexed again, or
+    p2p_replay_dstr, skips them: replaying an applied transaction must
+    not bring back a deleted shop or end a newer listing."""
+
+    hash = models.CharField(max_length=255, unique=True)
+    type = models.PositiveSmallIntegerField()
+    height = models.BigIntegerField(blank=True, null=True)
+    applied_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return self.hash
