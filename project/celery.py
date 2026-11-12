@@ -40,6 +40,10 @@ def setup_periodic_tasks(sender, **kwargs):
         10 * 60, expire_stale_withdrawals.s(), name="Expire Stale Withdrawals"
     )
 
+    # P2P listings: ended auctions, missed sale starts, NFTs that moved. The
+    # API applies the same checks on read, so this only keeps idle rows right.
+    sender.add_periodic_task(60, close_p2p_listings.s(), name="Close P2P Listings", expires=55)
+
     if settings.HEALTH_CHECK_ENABLED:
         sender.add_periodic_task(3 * 60, health_check.s(), name="Health Check")
 
@@ -70,6 +74,13 @@ def sync_master_nodes():
     from django.core import management
 
     management.call_command("sync_master_nodes", "--async")
+
+
+@app.task
+def close_p2p_listings():
+    from django.core import management
+
+    management.call_command("close_p2p_listings")
 
 
 @app.task
