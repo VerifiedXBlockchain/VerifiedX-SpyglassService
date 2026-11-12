@@ -6,7 +6,7 @@ from decimal import Decimal
 from django.test import TestCase
 from django.utils import timezone
 
-from p2p import indexer
+from p2p import indexer, services
 from p2p.models import Listing, Shop
 from p2p.tests.helpers import BUYER, SELLER, STRANGER, decshop, make_listing, make_nft, make_shop
 from rbx.models import Block, Transaction
@@ -247,9 +247,7 @@ class ReplaySafetyTests(TestCase):
                 self.assertEqual(list(Shop.objects.values_list("chain_state", flat=True)), ["deleted"])
                 self.assertFalse(Shop.objects.filter(chain_state__in=Shop.LIVE_STATES).exists())
 
-    def test_an_old_outside_sale_does_not_end_a_newer_listing(self):
-        from p2p.models import IndexedTransaction
-
+    def test_an_old_outside_sale_replayed_does_not_end_a_newer_listing(self):
         nft = make_nft("nft:art", STRANGER)
         start = self.chain(Transaction.Type.NFT_SALE, STRANGER, SELLER,
                            {"Function": "M_Sale_Start()", "ContractUID": "nft:art", "KeySign": "outside1",
@@ -259,13 +257,35 @@ class ReplaySafetyTests(TestCase):
         nft.owner_address = str(SELLER)
         nft.save()
         listing = make_listing(nft)
-        for ledger in ("kept", "lost"):
-            with self.subTest(ledger=ledger):
-                if ledger == "lost":
-                    IndexedTransaction.objects.all().delete()
-                indexer.index_nft_sale(start)
-                listing.refresh_from_db()
-                self.assertEqual((listing.state, listing.end_reason), ("live", ""))
+        # Its block is indexed again (validate_transactions --fix, a replay):
+        # the ledger knows the start, so nothing moves.
+        for _ in range(2):
+            indexer.index_nft_sale(start)
+        listing.refresh_from_db()
+        self.assertEqual((listing.state, listing.end_reason), ("live", ""))
+
+    def test_a_start_indexed_after_the_seller_relisted_still_wins(self):
+        """Review (PR 87, second pass): the seller broadcasts Sale_Start for
+        the won listing, cancels it here and lists the NFT again before
+        Spyglass indexes the block. The real start must end the newer
+        listing and put the started one in sale_pending."""
+        nft = make_nft("nft:art", SELLER)
+        won = make_listing(nft, state="awaiting_sale_start")
+        start = self.chain(Transaction.Type.NFT_SALE, SELLER, BUYER, {
+            "Function": "Sale_Start()", "ContractUID": "nft:art", "KeySign": won.purchase_key,
+            "NextOwner": str(BUYER), "SoldFor": 5, "BidSignature": "sig"})
+        services.cancel_listing(won, actor=str(SELLER))
+        relisted = make_listing(nft, shop=won.shop)
+        self.assertGreater(relisted.created_at, start.date_crafted)
+
+        indexer.index_nft_sale(start)
+        won.refresh_from_db()
+        relisted.refresh_from_db()
+        self.assertEqual((won.state, won.chain_state, won.sale_start_tx), ("sale_pending", "live", start.hash))
+        self.assertEqual((relisted.state, relisted.end_reason), ("ended", "sale_started_elsewhere"))
+        from p2p.models import IndexedTransaction
+
+        self.assertTrue(IndexedTransaction.objects.filter(hash=start.hash).exists())
 
     def test_an_old_start_does_not_rewind_a_sold_listing(self):
         from p2p.models import IndexedTransaction

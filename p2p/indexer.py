@@ -189,16 +189,17 @@ def _index_nft_sale(tx):
     if function in ("Sale_Start()", "M_Sale_Start()"):
         if listing is not None and listing.sale_start_tx == tx.hash:
             return
-        # The NFT is locked to NextOwner now: any other open listing of it
-        # made before this start can no longer sell. One made after it was
-        # made on what the chain showed then (an outside sale that finished,
-        # say), so an old start does not end it.
+        # The NFT is locked to NextOwner now: no other open listing of it
+        # can sell, whenever it was made (a seller can broadcast the start,
+        # cancel and relist before this block is indexed). They all end
+        # first, so the start never meets the one-active-listing rule. A
+        # replay of an old start is told apart by the ledger (_safely), not
+        # by when a listing was made.
         others = Listing.objects.filter(smart_contract_uid=contract, state__in=Listing.ACTIVE_STATES)
-        if at is not None:
-            others = others.filter(created_at__lt=at)
+        if listing is not None:
+            others = others.exclude(pk=listing.pk)
         for other in others:
-            if listing is None or other.pk != listing.pk:
-                services.end_listing(other, "sale_started_elsewhere", at)
+            services.end_listing(other, "sale_started_elsewhere", at)
         if listing is None:
             return
         next_owner = data.get("NextOwner") if isinstance(data.get("NextOwner"), str) else tx.to_address

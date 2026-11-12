@@ -68,6 +68,25 @@ class DryRunLeavesChainSalesAloneTests(P2PTestCase):
         self.assertError(self.post("/dry-run/sale-start/", tx, self.seller), 409, "sale_on_chain")
         self.assertEqual(Listing.objects.get(pk=self.listing["id"]).state, "awaiting_sale_start")
 
+    def test_a_real_start_indexed_after_a_cancel_and_relist_wins(self):
+        """Broadcast the start, cancel here, relist, then the block is indexed."""
+        start = self.chain(Transaction.Type.NFT_SALE, SELLER, BUYER, {
+            "Function": "Sale_Start()", "ContractUID": "nft:art", "KeySign": self.listing["purchase_key"],
+            "NextOwner": str(BUYER), "SoldFor": 20, "BidSignature": self.signature})
+        self.assertEqual(self.call("DELETE", f"/listings/{self.listing['id']}/", token=self.seller).json()["state"],
+                         "cancelled")
+        relisted = self.list_nft(self.seller, self.default_collection("coolstuff")["id"], "nft:art",
+                                 buy_now_price="30")
+
+        indexer.index_nft_sale(start)
+        original = self.call("GET", f"/listings/{self.listing['id']}/").json()
+        self.assertEqual((original["state"], original["chain_state"]), ("sale_pending", "live"))
+        replacement = self.call("GET", f"/listings/{relisted['id']}/").json()
+        self.assertEqual((replacement["state"], replacement["end_reason"]), ("ended", "sale_started_elsewhere"))
+        self.assertError(self.bid(BUYER, self.buyer, relisted, "30", is_buy_now=True), 409, "listing_not_live")
+        self.assertEqual(Listing.objects.filter(smart_contract_uid="nft:art", state__in=Listing.ACTIVE_STATES)
+                         .values_list("pk", flat=True).get(), self.listing["id"])
+
     def test_a_real_start_supersedes_a_dry_run_completion(self):
         self.post("/dry-run/sale-start/", sale_start(self.listing, SELLER, BUYER, "20", self.signature), self.seller)
         self.post("/dry-run/sale-complete/", sale_complete(self.listing, BUYER, SELLER, "20"), self.buyer)
