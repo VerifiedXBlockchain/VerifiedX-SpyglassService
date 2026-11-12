@@ -18,6 +18,7 @@ urlpatterns = [
     path("adnr/", include("api.adnr.urls")),
     path("price/", include("api.price.urls")),
     path("shop/", include("api.shop.urls")),
+    path("p2p/", include("p2p.urls")),
     path("media/", include("api.media.urls")),
     path("raw/", include("api.raw.urls")),
     path("chat/", include("api.chat.urls")),
