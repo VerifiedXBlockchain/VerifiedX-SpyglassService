@@ -139,8 +139,9 @@ def apply_dstr(raw, *, actor, now=None):
             raise _invalid("data.UniqueId is required.", {"data.UniqueId": "Required."})
         if amount < rules.SHOP_DELETE_AMOUNT:
             raise _invalid("Deleting a shop costs 1 VFX.", {"amount": "At least 1."})
-        shop = _live_shop_for(unique_id, actor)
-        return services.delete_shop(shop, at=now, description_of_tx=description)
+        shop = _live_shop_for(unique_id)
+        return services.delete_shop(shop, at=now, description_of_tx=description,
+                                    check=lambda locked: _check_dry_run_shop(locked, actor))
 
     decshop = _read_decshop(data)
     common = dict(
@@ -160,21 +161,31 @@ def apply_dstr(raw, *, actor, now=None):
             raise _invalid("Registering a shop costs 10 VFX.", {"amount": "At least 10."})
         return services.register_shop(unique_id=decshop["UniqueId"], strict=True, **common)
 
-    shop = _live_shop_for(decshop["UniqueId"], actor)
-    if now - shop.updated_at < rules.SHOP_UPDATE_FREE_AFTER and amount < rules.SHOP_UPDATE_AMOUNT:
-        raise _invalid("A second update within 12 hours costs 1 VFX.", {"amount": "At least 1."})
-    return services.update_shop(shop, strict=True, **common)
+    def check(locked):
+        _check_dry_run_shop(locked, actor)
+        if now - locked.updated_at < rules.SHOP_UPDATE_FREE_AFTER and amount < rules.SHOP_UPDATE_AMOUNT:
+            raise _invalid("A second update within 12 hours costs 1 VFX.", {"amount": "At least 1."})
+
+    shop = _live_shop_for(decshop["UniqueId"])
+    return services.update_shop(shop, strict=True, check=check, **common)
 
 
-def _live_shop_for(unique_id, actor):
+def _live_shop_for(unique_id):
     shop = services.live_shops().filter(unique_id=unique_id).first()
     if shop is None:
         raise not_found("shop_not_found", "No live shop has this UniqueId.")
+    return shop
+
+
+def _check_dry_run_shop(shop, actor):
+    """On the locked row: still live, still the actor's, and a dry run's
+    own (a dry run never changes what the chain registered)."""
+    if not shop.is_live:
+        raise not_found("shop_not_found", "No live shop has this UniqueId.")
     if shop.owner_address != actor:
         raise forbidden("not_shop_owner", "Only the shop's owner can do this.")
-    if shop.chain_state == Shop.ChainState.REGISTERED:
+    if shop.chain_state != Shop.ChainState.DRY_RUN:
         raise conflict("shop_on_chain", "This shop is registered on chain; a dry run cannot change it.")
-    return shop
 
 
 # endregion
@@ -191,6 +202,14 @@ def _listing_for(listing_id):
     if listing is None:
         raise not_found("not_found", "Listing not found.")
     return listing
+
+
+def _require_dry_run_listing(listing):
+    """A dry run never changes a sale the chain owns: once a real Sale_Start
+    is indexed (or the listing was made with dry runs off) only the indexer
+    moves it."""
+    if listing.chain_state != Listing.ChainState.DRY_RUN:
+        raise conflict("sale_on_chain", "This listing's sale is on chain; a dry run cannot change it.")
 
 
 def _require_fields(data, names):
@@ -217,6 +236,7 @@ def apply_sale_start(listing_id, raw, *, actor, now=None):
     listing = services.refresh_listing(listing, now)
     with transaction.atomic():
         listing = services.refresh_listing(listing, now, lock=True)
+        _require_dry_run_listing(listing)
         if listing.seller_address != actor:
             raise forbidden("not_seller", "Only the seller starts the sale.")
         if listing.state != State.AWAITING_SALE_START:
@@ -265,6 +285,7 @@ def apply_sale_complete(listing_id, raw, *, actor, now=None):
     listing = services.refresh_listing(listing, now)
     with transaction.atomic():
         listing = services.refresh_listing(listing, now, lock=True)
+        _require_dry_run_listing(listing)
         if listing.state != State.SALE_PENDING:
             raise conflict("listing_not_sale_pending", f"The listing is {listing.state}.")
         if actor != listing.next_owner:
@@ -360,6 +381,7 @@ def apply_sale_cancel(listing_id, raw, *, actor, now=None):
     listing = services.refresh_listing(listing, now)
     with transaction.atomic():
         listing = services.refresh_listing(listing, now, lock=True)
+        _require_dry_run_listing(listing)
         if listing.seller_address != actor:
             raise forbidden("not_seller", "Only the seller cancels the sale.")
         if listing.state != State.SALE_PENDING:

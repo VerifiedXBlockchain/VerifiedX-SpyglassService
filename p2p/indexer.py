@@ -79,9 +79,10 @@ def _index_dstr(tx):
 
     if function == "DecShopDelete()":
         unique_id = data.get("UniqueId")
-        shop = services.live_shops().filter(unique_id=unique_id).first() if isinstance(unique_id, str) else None
+        shop = registered_shops().filter(unique_id=unique_id).first() if isinstance(unique_id, str) else None
         if shop is None:
-            log.info(f"P2P: DSTR delete {tx.hash} names no live shop ({unique_id})")
+            # A dry-run shop with this UniqueId is not the chain's shop.
+            log.info(f"P2P: DSTR delete {tx.hash} names no registered shop ({unique_id})")
             return
         if _older_than_applied(shop, tx):
             return
@@ -106,7 +107,7 @@ def _index_dstr(tx):
         **meta,
     )
     unique_id = decshop["UniqueId"][:128]
-    shop = services.live_shops().filter(unique_id=unique_id).first()
+    shop = registered_shops().filter(unique_id=unique_id).first()
     if function == "DecShopCreate()":
         if shop is not None:
             log.warning(f"P2P: DSTR create {tx.hash} repeats live UniqueId {unique_id}; ignored")
@@ -120,6 +121,12 @@ def _index_dstr(tx):
         # A shop registered before this registry existed: the update carries
         # the whole record, so the chain's shop is known from here on.
         services.register_shop(unique_id=unique_id, **fields)
+    # register_shop takes over a dry-run shop with the same UniqueId: the
+    # chain wins over a dry run.
+
+
+def registered_shops():
+    return Shop.objects.filter(chain_state=REGISTERED)
 
 
 def _older_than_applied(shop, tx):

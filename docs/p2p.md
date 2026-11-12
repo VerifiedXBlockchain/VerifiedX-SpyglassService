@@ -17,6 +17,7 @@ The central registry of shops, collections, listings and bids that the web walle
 - Shops come from the chain only (`DSTR`, or its dry run). Name, description, URL and owner change only through `DecShopUpdate()` (Q2).
 - A listing's NFT must be owned by the shop owner, who is the token's address (Q3). Tokens and vBTC vault NFTs cannot be listed (Q13).
 - URLs are normalised (`vfx://` or `rbx://` removed, lower case) and held by the first live shop (Q9). A later shop the chain accepted with the same URL is kept with `url_collision` set and is not served by URL.
+- A dry run never changes what the chain owns, and the chain wins over a dry run. A dry-run step refuses a shop registered on chain (`shop_on_chain`) and a listing whose sale is on chain or that was made with dry runs off (`sale_on_chain`), checked on the locked row. A shop the chain registers takes the URL from a dry-run shop that held it (which is then kept aside), and takes over a dry-run shop with its `UniqueId`: the same owner's becomes the registered shop, anyone else's is deleted (`end_reason` `shop_registered_on_chain` for its listings). A chain `DecShopDelete()` only deletes a registered shop. A real `Sale_Start` supersedes a dry-run completion or cancellation.
 
 ## Auth
 

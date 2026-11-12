@@ -79,20 +79,56 @@ def url_availability(raw):
     return normalized, True, None
 
 
+def _url_holder(normalized, *, exclude=None):
+    """The live shop that holds `normalized`, if any."""
+    holders = live_shops().filter(url=normalized, url_collision=False)
+    if exclude is not None:
+        holders = holders.exclude(pk=exclude.pk)
+    return holders.select_for_update().first()
+
+
+def _url_collision_from_chain(normalized, *, exclude=None):
+    """Whether a shop the chain registers with `normalized` is kept aside.
+    The chain wins over a dry run: a dry-run shop holding the URL yields it
+    (and is kept aside itself); a registered one keeps it (Q9)."""
+    holder = _url_holder(normalized, exclude=exclude)
+    if holder is None:
+        return False
+    if holder.chain_state == Shop.ChainState.DRY_RUN:
+        holder.url_collision = True
+        holder.save(update_fields=["url_collision"])
+        return False
+    return True
+
+
 def register_shop(*, unique_id, chain_url, name, description, owner_address, hosting_type, at, chain_state,
                   tx_hash="", height=None, description_of_tx=None, strict=True):
-    """A DecShopCreate(): the shop and its default collection."""
+    """A DecShopCreate(): the shop and its default collection. From the
+    chain (strict=False) it also takes over a dry-run shop with the same
+    UniqueId: the owner's own dry run becomes the registered shop, anyone
+    else's is deleted."""
     normalized = rules.normalize_url(chain_url)
     try:
         with transaction.atomic():
-            if live_shops().filter(unique_id=unique_id).exists():
-                if strict:
-                    raise conflict("unique_id_taken", "A live shop already has this UniqueId.", {"UniqueId": "Taken."})
+            holder = live_shops().select_for_update().filter(unique_id=unique_id).first()
+            if holder is not None and strict:
+                raise conflict("unique_id_taken", "A live shop already has this UniqueId.", {"UniqueId": "Taken."})
+            if holder is not None and holder.chain_state == Shop.ChainState.REGISTERED:
                 log.warning(f"P2P: DSTR create {tx_hash} repeats live UniqueId {unique_id}; ignored")
-                return live_shops().get(unique_id=unique_id)
-            collision = url_taken(normalized, include_legacy=strict)
-            if collision and strict:
-                raise conflict("url_taken", f"vfx://{normalized} is taken.", {"DecShopURL": "Taken."})
+                return holder
+            if holder is not None and holder.owner_address == owner_address:
+                return update_shop(holder, chain_url=chain_url, name=name, description=description,
+                                   owner_address=owner_address, hosting_type=hosting_type, at=at,
+                                   chain_state=chain_state, tx_hash=tx_hash, height=height,
+                                   description_of_tx=description_of_tx, strict=False)
+            if holder is not None:
+                delete_shop(holder, at=at, reason="shop_registered_on_chain")
+            if strict:
+                if url_taken(normalized):
+                    raise conflict("url_taken", f"vfx://{normalized} is taken.", {"DecShopURL": "Taken."})
+                collision = False
+            else:
+                collision = _url_collision_from_chain(normalized)
             shop = Shop.objects.create(
                 unique_id=unique_id,
                 url=normalized,
@@ -120,25 +156,34 @@ def register_shop(*, unique_id, chain_url, name, description, owner_address, hos
 
 
 def update_shop(shop, *, chain_url, name, description, owner_address, hosting_type, at, chain_state,
-                tx_hash="", height=None, description_of_tx=None, strict=True):
-    """A DecShopUpdate(): Core replaces the record, owner included (Q10)."""
+                tx_hash="", height=None, description_of_tx=None, strict=True, check=None):
+    """A DecShopUpdate(): Core replaces the record, owner included (Q10).
+    `check(locked_shop)` runs on the locked row before anything changes:
+    the dry run's owner and chain-state checks."""
     normalized = rules.normalize_url(chain_url)
     with transaction.atomic():
         shop = Shop.objects.select_for_update().get(pk=shop.pk)
-        if normalized != shop.url:
-            taken = url_taken(normalized, exclude=shop, include_legacy=strict)
-            if taken and strict:
-                raise conflict("url_taken", f"vfx://{normalized} is taken.", {"DecShopURL": "Taken."})
+        if check is not None:
+            check(shop)
+        if normalized != shop.url or (not strict and shop.url_collision):
+            if strict:
+                if url_taken(normalized, exclude=shop):
+                    raise conflict("url_taken", f"vfx://{normalized} is taken.", {"DecShopURL": "Taken."})
+                shop.url_collision = False
+            else:
+                shop.url_collision = _url_collision_from_chain(normalized, exclude=shop)
             shop.url = normalized
-            shop.url_collision = taken
         previous_owner = shop.owner_address
         shop.chain_url = chain_url
         shop.name = name
         shop.description = description
         shop.owner_address = owner_address
         shop.hosting_type = hosting_type
-        if chain_state == Shop.ChainState.REGISTERED:
+        if chain_state == Shop.ChainState.REGISTERED and shop.chain_state != Shop.ChainState.REGISTERED:
+            # A dry-run shop the chain now registers.
             shop.chain_state = Shop.ChainState.REGISTERED
+            shop.registered_at = at
+            shop.registered_tx = tx_hash
         shop.updated_at = at
         shop.latest_tx = tx_hash
         shop.latest_height = height
@@ -151,10 +196,13 @@ def update_shop(shop, *, chain_url, name, description, owner_address, hosting_ty
         return shop
 
 
-def delete_shop(shop, *, at, tx_hash="", height=None, description_of_tx=None):
-    """A DecShopDelete(). A sale already started on chain is left to finish."""
+def delete_shop(shop, *, at, tx_hash="", height=None, description_of_tx=None, check=None, reason="shop_deleted"):
+    """A DecShopDelete(). A sale already started on chain is left to finish.
+    `check(locked_shop)` runs on the locked row first, as for update_shop."""
     with transaction.atomic():
         shop = Shop.objects.select_for_update().get(pk=shop.pk)
+        if check is not None:
+            check(shop)
         shop.chain_state = Shop.ChainState.DELETED
         shop.deleted_at = at
         shop.updated_at = at
@@ -162,7 +210,7 @@ def delete_shop(shop, *, at, tx_hash="", height=None, description_of_tx=None):
         shop.latest_height = height
         shop.last_transaction = description_of_tx
         shop.save()
-        _close_open_listings(shop.listings.all(), State.CANCELLED, "shop_deleted", at)
+        _close_open_listings(shop.listings.all(), State.CANCELLED, reason, at)
         return shop
 
 
@@ -580,6 +628,13 @@ def start_sale(listing, *, next_owner, amount, description_of_tx, chain_state, a
         listing.sale_start_tx = tx_hash
         listing.end_reason = ""
         listing.closed_at = None
+        # A new start supersedes what came after an earlier one, a dry run's
+        # completion or cancellation included.
+        listing.sold_price = None
+        listing.sale_complete = None
+        listing.sale_complete_tx = ""
+        listing.sale_cancel = None
+        listing.sale_cancel_tx = ""
         listing.save()
         return listing
 

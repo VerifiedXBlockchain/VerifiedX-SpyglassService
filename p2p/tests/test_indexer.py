@@ -78,7 +78,7 @@ class DstrIndexTests(TestCase):
         self.assertEqual(Shop.objects.get().name, "Second")
 
     def test_a_url_collision_the_chain_accepted_is_kept_aside(self):
-        make_shop(STRANGER, "chain", unique_id="FIRST")
+        make_shop(STRANGER, "chain", unique_id="FIRST", chain_state="registered")
         indexer.index_dstr(self.dstr("DecShopCreate()", SELLER, decshop(SELLER, "vfx://Chain", unique_id="UC1")))
         late = Shop.objects.get(unique_id="UC1")
         self.assertTrue(late.url_collision)
