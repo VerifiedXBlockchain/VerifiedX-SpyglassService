@@ -111,3 +111,38 @@ class WinningBidTests(P2PTestCase):
             with self.subTest(token=token[:6]):
                 self.assertNoSignature(self.call("GET", "/me/", token=token), signature)
         self.assertIn(signature, json.dumps(self.call("GET", "/me/", token=self.seller).json()))
+
+
+    def test_a_started_sale_does_not_publish_it_either(self):
+        listing = self.list_nft(self.seller, self.collection["id"], "nft:art", buy_now_price="20")
+        signature = BUYER.sign_bid(listing["purchase_key"], "20")
+        self.bid(BUYER, self.buyer, listing, "20", is_buy_now=True, signature=signature)
+        started = self.start_from_me(listing)
+        self.assertEqual(started.status_code, 200, started.content)
+        self.assertNoSignature(started, signature)
+        self.assertIsNone(started.json()["sale"]["start"]["data"]["BidSignature"])
+        self.assertEqual(started.json()["sale"]["start"]["data"]["NextOwner"], str(BUYER))
+        for path in (f"/listings/{listing['id']}/", f"/listings/{listing['id']}/bids/", "/shops/coolstuff/listings/"):
+            with self.subTest(path=path):
+                self.assertNoSignature(self.call("GET", path), signature)
+        for token in (self.buyer, self.stranger, self.bidder):
+            with self.subTest(token=token[:6]):
+                self.assertNoSignature(self.call("GET", "/me/", token=token), signature)
+        mine = self.selling(listing["id"])
+        self.assertIsNone(mine["sale"]["start"]["data"]["BidSignature"])
+        self.assertEqual(mine["winning_bid"]["signature"], signature)
+
+    def test_nor_an_indexed_sale_start(self):
+        from p2p import indexer
+        from p2p.tests.test_indexer import ChainTx
+        from rbx.models import Transaction
+
+        listing = self.list_nft(self.seller, self.collection["id"], "nft:art", buy_now_price="20")
+        signature = BUYER.sign_bid(listing["purchase_key"], "20")
+        self.bid(BUYER, self.buyer, listing, "20", is_buy_now=True, signature=signature)
+        indexer.index_nft_sale(ChainTx()(Transaction.Type.NFT_SALE, SELLER, BUYER, {
+            "Function": "Sale_Start()", "ContractUID": "nft:art", "KeySign": listing["purchase_key"],
+            "NextOwner": str(BUYER), "SoldFor": 20, "BidSignature": signature}))
+        body = self.call("GET", f"/listings/{listing['id']}/").json()
+        self.assertEqual((body["state"], body["chain_state"]), ("sale_pending", "live"))
+        self.assertNotIn(signature, json.dumps(body))

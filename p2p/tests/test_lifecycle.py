@@ -61,7 +61,9 @@ class BuyNowLifeCycleTests(P2PTestCase):
         started = started.json()
         self.assertEqual(started["state"], "sale_pending")
         self.assertEqual(started["chain_state"], "dry_run")
-        self.assertEqual(started["sale"]["start"]["data"]["BidSignature"], signature)
+        # Stored as sent; never shown (only the seller's /me/ has it).
+        self.assertIsNone(started["sale"]["start"]["data"]["BidSignature"])
+        self.assertEqual(Listing.objects.get(pk=listing["id"]).sale_start["data"]["BidSignature"], signature)
         self.assertIsNone(started["sale"]["complete"])
         self.assertEqual(self.me(self.buyer)["buying"][0]["action"], "complete_purchase")
         self.assertIsNone(self.me(self.seller)["selling"][0]["action"])

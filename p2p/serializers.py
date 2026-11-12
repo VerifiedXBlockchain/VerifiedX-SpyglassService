@@ -129,6 +129,17 @@ def winning_bid_json(listing):
     return {"amount": money(bid.amount), "address": bid.address, "signature": bid.signature}
 
 
+def public_step(description):
+    """A sale step's transaction description as anyone may see it: a
+    Sale_Start without the winning bid's signature, which only the
+    seller's /me/ carries (winning_bid_json)."""
+    if not isinstance(description, dict) or not isinstance(description.get("data"), dict):
+        return description
+    if "BidSignature" not in description["data"]:
+        return description
+    return {**description, "data": {**description["data"], "BidSignature": None}}
+
+
 def listing_json(listing, *, with_bids=False):
     bids = list(listing.bids.all())
     high = max(bids, key=lambda b: (b.amount, -b.created_at.timestamp(), -b.pk), default=None)
@@ -154,7 +165,7 @@ def listing_json(listing, *, with_bids=False):
         "sale_start_deadline": iso(listing.sale_start_deadline),
         "sold_price": money(listing.sold_price),
         "chain_state": listing.chain_state,
-        "sale": {"start": listing.sale_start, "complete": listing.sale_complete},
+        "sale": {"start": public_step(listing.sale_start), "complete": listing.sale_complete},
         "royalty_enforced": listing.royalty_enforced,
         "end_reason": listing.end_reason or None,
     }
