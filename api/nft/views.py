@@ -60,15 +60,21 @@ class NftMultipleAddressesListView(ListModelMixin, NftView):
 
 
 class ListedNftIdentifiersListView(GenericAPIView):
+    """The NFTs `owner_address` has in an active P2P listing (Nft.is_listed)."""
+
     def get(self, request, *args, **kwargs):
-        from shop.models import Listing
+        from p2p.models import Listing
 
         address = kwargs["owner_address"]
-        listings = Listing.objects.filter(
-            is_deleted=False,
-            owner_address=address,
+        identifiers = list(
+            Listing.objects.filter(
+                seller_address=address,
+                state__in=Listing.ACTIVE_STATES,
+                nft__owner_address=address,
+            )
+            .order_by("created_at", "id")
+            .values_list("smart_contract_uid", flat=True)
         )
-        identifiers = [l.smart_contract_uid for l in listings]
 
         return Response({"results": identifiers})
 

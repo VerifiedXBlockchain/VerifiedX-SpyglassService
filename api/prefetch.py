@@ -30,18 +30,18 @@ def _reserve_function(tx):
 
 def prefetch_nft_listings(nfts):
     """Set Nft.is_listed for these NFTs from one query."""
-    from shop.models import Listing
+    from p2p.models import Listing
 
     nfts = [nft for nft in nfts if nft is not None and not hasattr(nft, PREFETCHED_IS_LISTED)]
     if not nfts:
         return
     listed = set(
-        Listing.objects.filter(nft_id__in={nft.pk for nft in nfts}, is_deleted=False).values_list(
-            "nft_id", flat=True
-        )
+        Listing.objects.filter(smart_contract_uid__in={nft.pk for nft in nfts}, state__in=Listing.ACTIVE_STATES)
+        .order_by()
+        .values_list("smart_contract_uid", "seller_address")
     )
     for nft in nfts:
-        setattr(nft, PREFETCHED_IS_LISTED, nft.pk in listed)
+        setattr(nft, PREFETCHED_IS_LISTED, (nft.pk, nft.owner_address) in listed)
 
 
 def prefetch_transaction_details(transactions):

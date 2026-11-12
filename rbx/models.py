@@ -6,7 +6,6 @@ from django.utils.translation import gettext_lazy as _
 from django.db.models import Count, Max, Sum
 from decimal import Decimal
 from django.conf import settings
-from shop.models import Listing
 from django.db.models import Q
 from django.db.models.functions import Cast, Upper
 import json
@@ -496,10 +495,18 @@ class Nft(models.Model):
 
     @property
     def is_listed(self):
-        # Loaded for a whole page by api.prefetch.prefetch_nft_listings.
+        """Whether the NFT is in an active P2P listing by its current owner
+        (p2p.models.Listing: live, awaiting the sale start, or sale pending).
+        Loaded for a whole page by api.prefetch.prefetch_nft_listings."""
         if hasattr(self, "_prefetched_is_listed"):
             return self._prefetched_is_listed
-        return Listing.objects.filter(nft=self, is_deleted=False).exists()
+        from p2p.models import Listing
+
+        return Listing.objects.filter(
+            smart_contract_uid=self.identifier,
+            seller_address=self.owner_address,
+            state__in=Listing.ACTIVE_STATES,
+        ).exists()
 
     class Meta:
         verbose_name = _("NFT")
