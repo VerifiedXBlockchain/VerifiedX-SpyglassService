@@ -2206,10 +2206,6 @@ class NodeApiTokenTests(TestCase):
             client._node_headers(join_url(client.BASE_URL, "api/V1/SendBlock/1")),
             {"apitoken": "secret"},
         )
-        self.assertEqual(
-            client._node_headers(join_url(client.SHOP_CRAWLER_BASE_URL, "wsapi/WebShopV1/GetDecShopData")),
-            {"apitoken": "secret"},
-        )
         self.assertEqual(client._node_headers("http://203.0.113.9:17292/api/V1/CheckStatus"), {})
 
     @override_settings(RBX_WALLET_API_TOKEN="secret")

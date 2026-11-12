@@ -3,12 +3,14 @@ import json
 from tqdm import tqdm
 from django.core.management.base import BaseCommand, CommandParser
 
-from shop.tasks import import_shop
+from shop.tasks import apply_legacy_shop_record
 from shop.models import Shop
 from rbx.models import Transaction
 
 
 class Command(BaseCommand):
+    help = "Rebuild the old shop table's rows from indexed DSTR transactions (no network)."
+
     def add_arguments(self, parser: CommandParser) -> None:
         parser.add_argument("--wipe", action="store_true")
 
@@ -31,7 +33,7 @@ class Command(BaseCommand):
                     dec_shop = parsed["DecShop"]
                     url = dec_shop["DecShopURL"]
 
-                    import_shop(url, True, dec_shop)
+                    apply_legacy_shop_record(url, dec_shop)
 
                 elif func == "DecShopDelete()":
                     unique_id = parsed["UniqueId"]

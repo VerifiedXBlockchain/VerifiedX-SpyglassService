@@ -35,7 +35,6 @@ from api.shop.querysets import (
     ALL_LISTINGS_QUERYSET,
 )
 from rest_framework.response import Response
-from shop.tasks import submit_bid, import_shop
 from connect.email.tasks import send_build_sale_start_tx_email
 from decimal import Decimal
 
@@ -118,37 +117,12 @@ class ShopRetrieveUpdateDestroyView(
         instance.save()
 
 
-class ShopResyncView(RetrieveModelMixin, ShopView):
-    def get_object(self):
-        url = self.request.query_params.get("url", None)
-
-        if not url:
-            raise exceptions.BadRequest("Param `url` is required.")
-        if not "rbx://" in url:
-            url = f"rbx://{url}"
-
-        url = url.strip()
-
-        try:
-            return Shop.objects.get(url=url, is_deleted=False)
-        except Shop.DoesNotExist:
-            raise exceptions.BadRequest(f"Shop with url '{url}' does not exist.")
+class ShopResyncView(GenericAPIView):
+    """Retired with the shop crawler: nothing is crawled any more. It still
+    answers as before so clients that call it (the GUI after a shop change)
+    carry on."""
 
     def get(self, request, *args, **kwargs):
-        delay = request.query_params.get("delay", "35")
-        try:
-            delay = int(delay)
-        except ValueError:
-            delay = 35
-
-        shop = self.get_object()
-        if shop:
-            if shop.is_third_party:
-                raise exceptions.BadRequest(f"This is a third party shop")
-
-            print(f"Resyncing shop in {delay} second(s).")
-            import_shop.apply_async(args=[shop.url], countdown=delay)
-
         return Response({"success": True})
 
 
@@ -274,9 +248,9 @@ class CreateBidView(GenericAPIView):
         from_third_party = serializer.validated_data.get("from_third_party")
         is_buy_now = serializer.validated_data.get("is_buy_now")
         signature = serializer.validated_data.get("signature")
-        pre_signed_sale_complete_tx = serializer.validated_data.get(
-            "pre_signed_sale_complete_tx"
-        )
+        # A pre-signed Sale_Complete is still accepted in the body but never
+        # stored: nothing relays it any more, and a signed transaction kept
+        # here is a bearer instrument for its hour.
 
         try:
             a = Address.objects.get(address=address)
@@ -387,7 +361,6 @@ class CreateBidView(GenericAPIView):
                 status=bid_status,
                 send_receive=Bid.BidSendReceive.SEND,
                 is_third_party=True,
-                pre_signed_sale_complete_tx=pre_signed_sale_complete_tx,
             )
 
             bid.save()
@@ -399,10 +372,6 @@ class CreateBidView(GenericAPIView):
                 # if bid.signature is not None and bid.signature != "NA":
 
                 send_build_sale_start_tx_email.apply_async(args=[bid.pk])
-
-            if listing.collection.shop.is_core:
-
-                submit_bid.apply_async(args=[bid.pk])
 
             if listing.is_auction:
 

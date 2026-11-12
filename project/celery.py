@@ -43,18 +43,6 @@ def setup_periodic_tasks(sender, **kwargs):
     if settings.HEALTH_CHECK_ENABLED:
         sender.add_periodic_task(3 * 60, health_check.s(), name="Health Check")
 
-    if not settings.MINIMAL_CRON_JOBS:
-        sender.add_periodic_task(
-            10 * 60, shop_online_crawler.s(False), name="Online Shop Crawler (ALL)"
-        )
-        sender.add_periodic_task(
-            60 * 60, shop_online_crawler.s(True), name="Online Shop Crawler (FAVORED)"
-        )
-
-        sender.add_periodic_task(
-            5 * 60, crawl_online_shops.s(), name="Crawl Online Shops"
-        )
-
 
 @app.task(queue="blocks_queue")
 def sync_the_blocks():
@@ -82,23 +70,6 @@ def sync_master_nodes():
     from django.core import management
 
     management.call_command("sync_master_nodes", "--async")
-
-
-@app.task
-def shop_online_crawler(all: bool = False):
-    from django.core import management
-
-    if all:
-        management.call_command("shop_online_crawler", "--all")
-    else:
-        management.call_command("shop_online_crawler")
-
-
-@app.task
-def crawl_online_shops():
-    from django.core import management
-
-    management.call_command("crawl_online_shops", "--async")
 
 
 @app.task
