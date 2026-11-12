@@ -21,7 +21,7 @@ The central registry of shops, collections, listings and bids that the web walle
 
 ## Auth
 
-`POST /api/auth/sign-token/` returns a one-hour token. Every write sends `Authorization: Bearer <token>` (`basic <token>` is still read). The token's address is the actor; no write takes an address from its body. Reads are public; `GET /me/` needs the token. A missing, unknown or expired token on a write is a 401 with code `not_authenticated`, `token_invalid` or `token_expired`.
+`POST /api/auth/sign-token/` returns a one-hour token. Every write sends `Authorization: Bearer <token>` (`basic <token>` is still read). The token's address is the actor; no write takes an address from its body. Reads are public; `GET /me/` needs the token. A missing, unknown or expired token on a write is a 401 with code `not_authenticated`, `token_invalid` or `token_expired`. Ownership is checked on the current state, inside the write, on locked rows (the shop, then the collection, then the listing, the order owner changes and deletions use too): once a `DecShopUpdate()` hands the shop to another address or the NFT moves, the old owner's token no longer passes, and nothing is created under a shop or collection deleted or handed over meanwhile.
 
 ## Endpoints
 
@@ -56,7 +56,7 @@ JSON, snake_case, amounts as decimal strings with up to 8 places, times ISO 8601
 
 `live` goes to `awaiting_sale_start` on a buy-now bid or when an auction ends with a high bid that meets the reserve, then to `sale_pending` (`Sale_Start`) and `sold` (`Sale_Complete`). It leaves as `cancelled` (seller, before `sale_pending`), `expired` (no valid bid at the end), `unfulfilled` (no `Sale_Start` within 48 hours of the win; the seller can list again), or `ended` (`Sale_Cancel`, or the NFT moved or burned). Prices and dates freeze once a bid exists. Each listing gets a new purchase key.
 
-A bid is checked as Core checks it at `Sale_Start`: the bidder's signature over `{purchase_key}_{amount × 1e8}_{address}`, verified here. Then: the listing is live and inside its dates, the bidder is not the seller or a vault (xRBX) address, the indexed balance covers the amount, and the amount is the buy-now price exactly (`is_buy_now`) or at least `next_min_bid` and below any buy-now price. Bid statuses: `winning` (the high bid, reserve met), `accepted` (the high bid, reserve not met), `outbid`, then `won` or `lost`.
+A bid is checked as Core checks it at `Sale_Start`: the bidder's signature over `{purchase_key}_{amount × 1e8}_{address}`, verified here. Then: the listing is live and inside its dates, its shop live and its collection neither deleted nor hidden (`listing_unavailable`), the bidder is not the seller or a vault (xRBX) address, the indexed balance covers the amount, and the amount is the buy-now price exactly (`is_buy_now`) or at least `next_min_bid` and below any buy-now price. Bid statuses: `winning` (the high bid, reserve met), `accepted` (the high bid, reserve not met), `outbid`, then `won` or `lost`.
 
 Time and NFT ownership move listings on in two places: the `close_p2p_listings` command (Celery beat, every minute) and every P2P read, so a listing is right without the beat.
 

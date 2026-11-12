@@ -245,37 +245,59 @@ def _check_collection_fields(name=None, description=None):
         raise bad_request("invalid", "Some fields are not valid.", fields)
 
 
+def _lock_shop(shop_id, actor=None):
+    """The shop row, locked for the rest of the caller's transaction and
+    checked on its current state: a check made before the lock could pass
+    for an owner the chain or a dry run has just replaced. Every write that
+    depends on the shop locks it first (then a collection, then a listing),
+    as owner changes and deletions do."""
+    shop = Shop.objects.select_for_update().get(pk=shop_id)
+    if actor is not None:
+        require_live_shop(shop)
+        require_shop_owner(shop, actor)
+    return shop
+
+
+def _lock_collection(collection_id):
+    collection = Collection.objects.select_for_update().filter(pk=collection_id, is_deleted=False).first()
+    if collection is None:
+        raise not_found("not_found", "Collection not found.")
+    return collection
+
+
 def create_collection(shop, *, actor, name, description="", is_live=True):
-    require_live_shop(shop)
-    require_shop_owner(shop, actor)
     _check_collection_fields(name, description)
-    return Collection.objects.create(shop=shop, name=name.strip(), description=description, is_live=is_live)
+    with transaction.atomic():
+        shop = _lock_shop(shop.pk, actor)
+        return Collection.objects.create(shop=shop, name=name.strip(), description=description, is_live=is_live)
 
 
 def update_collection(collection, *, actor, name=None, description=None, is_live=None):
-    require_live_shop(collection.shop)
-    require_shop_owner(collection.shop, actor)
     _check_collection_fields(name, description)
-    if name is not None:
-        collection.name = name.strip()
-    if description is not None:
-        collection.description = description
-    if is_live is not None:
-        collection.is_live = is_live
-    collection.save()
-    return collection
+    with transaction.atomic():
+        _lock_shop(collection.shop_id, actor)
+        collection = _lock_collection(collection.pk)
+        if name is not None:
+            collection.name = name.strip()
+        if description is not None:
+            collection.description = description
+        if is_live is not None:
+            collection.is_live = is_live
+        collection.save()
+        return collection
 
 
 def delete_collection(collection, *, actor):
-    require_live_shop(collection.shop)
-    require_shop_owner(collection.shop, actor)
-    if collection.is_default:
-        raise conflict("default_collection", "A shop's default collection cannot be deleted.")
-    if collection.listings.filter(state__in=Listing.ACTIVE_STATES).exists():
-        raise conflict("collection_has_active_listings", "Cancel or finish this collection's listings first.")
-    collection.is_deleted = True
-    collection.save()
-    return collection
+    with transaction.atomic():
+        _lock_shop(collection.shop_id, actor)
+        collection = _lock_collection(collection.pk)
+        if collection.is_default:
+            raise conflict("default_collection", "A shop's default collection cannot be deleted.")
+        if collection.listings.filter(state__in=Listing.ACTIVE_STATES).exists():
+            raise conflict("collection_has_active_listings", "Cancel or finish this collection's listings first.")
+        collection.is_deleted = True
+        collection.save()
+        return collection
 
 
 # endregion
@@ -332,57 +354,57 @@ def _listable_nft(smart_contract_uid, actor):
 def create_listing(collection, *, actor, smart_contract_uid, buy_now_price=None, floor_price=None,
                    reserve_price=None, starts_at, ends_at, royalty_enforced=True, chain_state, now=None):
     now = now or timezone.now()
-    if collection.is_deleted:
-        raise not_found("not_found", "Collection not found.")
-    shop = collection.shop
-    require_live_shop(shop)
-    require_shop_owner(shop, actor)
     if rules.is_reserve_address(actor):
         raise forbidden("reserve_address", "A vault (xRBX) address cannot sell.")
     _check_prices(buy_now_price, floor_price, reserve_price, starts_at, ends_at, now)
-    nft = _listable_nft(smart_contract_uid, actor)
-
-    for _ in range(5):
-        try:
-            with transaction.atomic():
-                if Listing.objects.filter(smart_contract_uid=smart_contract_uid, state__in=Listing.ACTIVE_STATES).exists():
-                    raise conflict("nft_already_listed", "This NFT is already in an active listing.")
-                key = generate_purchase_key()
-                if Listing.objects.filter(smart_contract_uid=smart_contract_uid, purchase_key=key).exists():
-                    continue
-                return Listing.objects.create(
-                    shop=shop,
-                    collection=collection,
-                    smart_contract_uid=smart_contract_uid,
-                    nft=nft,
-                    seller_address=actor,
-                    buy_now_price=buy_now_price,
-                    floor_price=floor_price,
-                    reserve_price=reserve_price,
-                    starts_at=starts_at,
-                    ends_at=ends_at,
-                    royalty_enforced=royalty_enforced,
-                    purchase_key=key,
-                    chain_state=chain_state,
-                )
-        except IntegrityError:
-            # The one-active-listing constraint, from a concurrent create.
+    with transaction.atomic():
+        # Locked and checked as they are now, so a deletion or an owner
+        # change cannot slip in between the checks and the insert.
+        shop = _lock_shop(collection.shop_id, actor)
+        collection = _lock_collection(collection.pk)
+        nft = _listable_nft(smart_contract_uid, actor)
+        for _ in range(5):
             if Listing.objects.filter(smart_contract_uid=smart_contract_uid, state__in=Listing.ACTIVE_STATES).exists():
                 raise conflict("nft_already_listed", "This NFT is already in an active listing.")
-    raise conflict("try_again", "Could not make a purchase key. Try again.")
+            key = generate_purchase_key()
+            if Listing.objects.filter(smart_contract_uid=smart_contract_uid, purchase_key=key).exists():
+                continue
+            try:
+                with transaction.atomic():
+                    return Listing.objects.create(
+                        shop=shop,
+                        collection=collection,
+                        smart_contract_uid=smart_contract_uid,
+                        nft=nft,
+                        seller_address=actor,
+                        buy_now_price=buy_now_price,
+                        floor_price=floor_price,
+                        reserve_price=reserve_price,
+                        starts_at=starts_at,
+                        ends_at=ends_at,
+                        royalty_enforced=royalty_enforced,
+                        purchase_key=key,
+                        chain_state=chain_state,
+                    )
+            except IntegrityError:
+                # The one-active-listing constraint, from a concurrent create
+                # in another of the owner's shops; or a key taken meanwhile.
+                continue
+        raise conflict("try_again", "Could not list this NFT. Try again.")
 
 
 EDITABLE_LISTING_FIELDS = ("buy_now_price", "floor_price", "reserve_price", "starts_at", "ends_at", "royalty_enforced")
 
 
 def update_listing(listing, *, actor, changes, now=None):
-    """Prices and dates, only while live with no bids."""
+    """Prices and dates, only while live with no bids, by the seller who
+    still owns the shop and the NFT."""
     now = now or timezone.now()
     # What is due is applied (and kept) before the step, which may be refused.
     listing = refresh_listing(listing, now)
     with transaction.atomic():
+        _lock_shop(listing.shop_id, actor)
         listing = refresh_listing(listing, now, lock=True)
-        require_shop_owner(listing.shop, actor)
         if listing.seller_address != actor:
             raise forbidden("not_seller", "Only the seller can change this listing.")
         if listing.state != State.LIVE:
@@ -404,6 +426,7 @@ def cancel_listing(listing, *, actor, now=None):
     # What is due is applied (and kept) before the step, which may be refused.
     listing = refresh_listing(listing, now)
     with transaction.atomic():
+        _lock_shop(listing.shop_id)
         listing = refresh_listing(listing, now, lock=True)
         if listing.seller_address != actor:
             raise forbidden("not_seller", "Only the seller can cancel this listing.")
@@ -458,6 +481,8 @@ def place_bid(listing, *, actor, amount, is_buy_now, signature, now=None):
         listing = refresh_listing(listing, now, lock=True)
         if listing.state != State.LIVE:
             raise conflict("listing_not_live", f"The listing is {listing.state}.")
+        if not listing.shop.is_live or listing.collection.is_deleted or not listing.collection.is_live:
+            raise conflict("listing_unavailable", "The listing's shop or collection is not open.")
         if now < listing.starts_at:
             raise conflict("listing_not_started", "The listing has not started.")
         if now >= listing.ends_at:
