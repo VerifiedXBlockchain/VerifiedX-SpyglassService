@@ -1,0 +1,65 @@
+{
+  "generated_by": "vfx-web-sdk 9.1.3 signMessage",
+  "vectors": [
+    {
+      "key_label": "spyglass-p2p-test-key-1",
+      "private_key": "0ab54ba69813a742c3af21e93eb418435845e7989183e9e8e47ba9917d90934e",
+      "network": "testnet",
+      "address": "xDrBeJBpp2mnEGafkVUUTN5vPs7pE1JB7W",
+      "purchase_key": "QwErTyUiOp1762900000",
+      "amount": "12.5",
+      "message": "QwErTyUiOp1762900000_1250000000_xDrBeJBpp2mnEGafkVUUTN5vPs7pE1JB7W",
+      "signature": "MEQCIFDxvvgcc78POtDmUabjcOcXhc+1sI4+Ffc67EG6eSQbAiB0a8j+0LiXkazf54IVrfKrg7hzhKKUx1a7wSlF1idNgg==.64RSpaC5tXGKZtnCmeJ5cUM635nQUZFRuPuhVK7WfWNnBxKfXUBGKeSGRq9CAxeGc8CM7VP3PGiDXtCV5cAzoz5m"
+    },
+    {
+      "key_label": "spyglass-p2p-test-key-1",
+      "private_key": "0ab54ba69813a742c3af21e93eb418435845e7989183e9e8e47ba9917d90934e",
+      "network": "testnet",
+      "address": "xDrBeJBpp2mnEGafkVUUTN5vPs7pE1JB7W",
+      "purchase_key": "QwErTyUiOp1762900000",
+      "amount": "1",
+      "message": "QwErTyUiOp1762900000_100000000_xDrBeJBpp2mnEGafkVUUTN5vPs7pE1JB7W",
+      "signature": "MEUCIQCFIA6k3IebvEWAu1LgYMVTmFG/bnTduXltuws0Az55xQIgLKUR3X6GHQCk1ZhIrQ3WH0OEZmfnvYNTEMCkdre7bA0=.64RSpaC5tXGKZtnCmeJ5cUM635nQUZFRuPuhVK7WfWNnBxKfXUBGKeSGRq9CAxeGc8CM7VP3PGiDXtCV5cAzoz5m"
+    },
+    {
+      "key_label": "spyglass-p2p-test-key-2",
+      "private_key": "eeb8a0e80c1d42c93f896ba297606387635a071850004f73adf390aa4cc7cb94",
+      "network": "testnet",
+      "address": "xTDqxperBoeVWgk49WQZhwHZnLRM4oVJbT",
+      "purchase_key": "AsDfGhJkLz1762900123",
+      "amount": "0.00000001",
+      "message": "AsDfGhJkLz1762900123_1_xTDqxperBoeVWgk49WQZhwHZnLRM4oVJbT",
+      "signature": "MEUCIQDWZyu9oyWnUDCSR3oVUKScZi+bTw3TnY4v+m2v1W6FLQIgKBejrh1Dg3HasPBSgnSw1Lw5uzZabjuj4phIpBo+ggs=.359cTVBSdfGMZGe1URWyR2essQkajoTixZ1XwHZH5nrHn8u3yZrtAX2xeg5YifB28A1Rw5AyqP6Psm3zS8EyGj7j"
+    },
+    {
+      "key_label": "spyglass-p2p-test-key-2",
+      "private_key": "eeb8a0e80c1d42c93f896ba297606387635a071850004f73adf390aa4cc7cb94",
+      "network": "testnet",
+      "address": "xTDqxperBoeVWgk49WQZhwHZnLRM4oVJbT",
+      "purchase_key": "AsDfGhJkLz1762900123",
+      "amount": "123456.78901234",
+      "message": "AsDfGhJkLz1762900123_12345678901234_xTDqxperBoeVWgk49WQZhwHZnLRM4oVJbT",
+      "signature": "MEQCIC7juvdQgS6iWl3OPAIuR7Qv/O+m0kpOt9tYqIV7pY8mAiBV5MCGpG9gjh68IdwqT5HRH0SZGLmOi+vyR13cbxRj7A==.359cTVBSdfGMZGe1URWyR2essQkajoTixZ1XwHZH5nrHn8u3yZrtAX2xeg5YifB28A1Rw5AyqP6Psm3zS8EyGj7j"
+    },
+    {
+      "key_label": "spyglass-p2p-test-key-3",
+      "private_key": "1e5e83d0edc37490b6d82e9d867ba999e6f199981f20e16a3db105574cae3809",
+      "network": "testnet",
+      "address": "xRwfoA8xhaTpKcuzbbPvDaHq25Ta881KVC",
+      "purchase_key": "ZxCvBnMqWe1762901000",
+      "amount": "250",
+      "message": "ZxCvBnMqWe1762901000_25000000000_xRwfoA8xhaTpKcuzbbPvDaHq25Ta881KVC",
+      "signature": "MEUCIQDa6NzAo7uGQHT5hPsOfiu2lWK1HAd1/VhizVLy2Ve7zwIgV67RC1G06Va8vopPO/H3W7It6+HDMcvluCD2N7ThRZo=.439TdVd6ni9UQre4D5Cvs68QEKPTamyHU7m29gPmEJCG6ZGuS99QskvYAAjALcJD9xDWosUK3QgwMYETJigk7yEg"
+    },
+    {
+      "key_label": "spyglass-p2p-test-key-4",
+      "private_key": "89aeb7956dae8b8282fadbdb790eac3370efbf7d4c7a5e3e6f9c6cceb66f5510",
+      "network": "mainnet",
+      "address": "RYJaVAFTfCSqpdNZNnt6bsNUX1eBMNMkbu",
+      "purchase_key": "PoIuYtReWq1762902000",
+      "amount": "38.12345678",
+      "message": "PoIuYtReWq1762902000_3812345678_RYJaVAFTfCSqpdNZNnt6bsNUX1eBMNMkbu",
+      "signature": "MEQCICxN4zVbj7HAZaG6EFP2qHEPQMm6jb5ktbrtxT+rFrs3AiAw+S0TelPoNsSXuCzBO/DT7hGrVCdsRnQtdKmSRVzhDg==.2Z3vGLyXuNYcQwEsstXdMGQYfGeRd788YV8qQbStAd3RMsNTa7rtKMVkoJexzbyZkpBJXwsbnMQqvSEpf8gRDGqo"
+    }
+  ]
+}

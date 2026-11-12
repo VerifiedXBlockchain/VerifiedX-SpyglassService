@@ -1,3 +1,4 @@
+base58==2.1.1
 boto3==1.26.102
 celery==5.3.1
 kombu==5.3.1
@@ -17,6 +18,7 @@ django==4.0.5
 djangorestframework==3.13.1
 drf-api-logger==1.1.10
 drf-yasg==1.21.3
+ecdsa==0.19.1
 geoip2==4.6.0
 gunicorn==20.1.0
 humanize==4.2.0
