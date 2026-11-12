@@ -1,5 +1,5 @@
 """The old /api/shop/ endpoints after the crawler's removal: still readable,
-nothing crawled, relayed or sent to a shop."""
+vfx:// URLs found, nothing crawled, relayed or sent to a shop."""
 
 from decimal import Decimal
 from unittest.mock import patch
@@ -8,12 +8,55 @@ from django.core.cache import cache
 from django.test import TestCase
 from django.utils import timezone
 
+from p2p.tests.helpers import make_shop
 from shop.models import Auction, Bid, Collection, Listing, Shop
 
 
 def legacy_shop(url, *, unique_id="u1", third_party=False, deleted=False):
     return Shop.objects.create(shop_id=1, unique_id=unique_id, name=f"Shop {url}", url=url, description="",
                                owner_address="RSELLER", is_third_party=third_party, is_deleted=deleted)
+
+
+class LookupTests(TestCase):
+    def setUp(self):
+        cache.clear()
+
+    def lookup(self, url):
+        return self.client.get("/api/shop/url/", {"url": url})
+
+    def test_a_vfx_shop_is_found_however_the_url_is_written(self):
+        legacy_shop("vfx://HA")
+        for url in ("vfx://HA", "HA", "ha", "rbx://ha", " vfx://ha "):
+            with self.subTest(url=url):
+                response = self.lookup(url)
+                self.assertEqual(response.status_code, 200, response.content)
+                self.assertEqual(response.json()["url"], "vfx://HA")
+
+    def test_an_rbx_shop_still_is(self):
+        legacy_shop("rbx://oldshop")
+        self.assertEqual(self.lookup("oldshop").json()["url"], "rbx://oldshop")
+        self.assertEqual(self.lookup("vfx://OldShop").json()["url"], "rbx://oldshop")
+
+    def test_a_core_row_wins_over_a_web_row_and_deleted_rows_are_skipped(self):
+        legacy_shop("rbx://dup", unique_id="web", third_party=True)
+        legacy_shop("vfx://dup", unique_id="core")
+        legacy_shop("vfx://gone", unique_id="gone", deleted=True)
+        self.assertEqual(self.lookup("dup").json()["unique_id"], "core")
+        self.assertEqual(self.lookup("gone").status_code, 400)
+        self.assertEqual(self.lookup("").status_code, 400)
+
+    def test_availability(self):
+        legacy_shop("vfx://HA")
+        make_shop("RP2POWNER", "fresh")
+
+        def available(url):
+            return self.client.get("/api/shop/url/available/", {"url": url}).json()["available"]
+
+        self.assertFalse(available("vfx://HA"))
+        self.assertFalse(available("ha"))
+        self.assertFalse(available("fresh"))
+        self.assertTrue(available("vfx://free"))
+        self.assertEqual(self.client.get("/api/shop/url/available/").status_code, 400)
 
 
 class CrawlerRetiredTests(TestCase):
