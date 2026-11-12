@@ -43,13 +43,13 @@ JSON, snake_case, amounts as decimal strings with up to 8 places, times ISO 8601
 | `DELETE /p2p/listings/{id}/` | seller, before `sale_pending` | the cancelled `Listing` |
 | `GET /p2p/listings/{id}/bids/` | anyone | `BidSummary[]` |
 | `POST /p2p/listings/{id}/bids/` `{amount, is_buy_now, signature}` | bidder | `{bid: BidSummary, listing: Listing}` (201) |
-| `GET /p2p/me/` | token | `{shop, selling, buying}` |
+| `GET /p2p/me/` | token | `{shop, selling, buying}`; `selling` carries the winning bid's signature |
 | `POST /p2p/dry-run/dstr/` `{tx}` | `tx.from_address` | `Shop` |
 | `POST /p2p/dry-run/sale-start/` `{listing_id, tx}` | seller | `Listing` (`sale_pending`) |
 | `POST /p2p/dry-run/sale-complete/` `{listing_id, tx}` | buyer | `Listing` (`sold`) |
 | `POST /p2p/dry-run/sale-cancel/` `{listing_id, tx}` | seller | `Listing` (`ended`) |
 
-`Listing` carries the design's fields plus `royalty_enforced` (as listed) and `end_reason` (why it closed without a sale: `nft_moved`, `nft_burned`, `shop_deleted`, `shop_owner_changed`, `sale_cancelled`, `sale_started_elsewhere`, or null). In `/me/`, each of `selling` has `action: "start_sale"` while `awaiting_sale_start`, and each of `buying` is `{listing, my_high_bid, action}` with `action: "complete_purchase"` once the sale is started for that buyer.
+`Listing` carries the design's fields plus `royalty_enforced` (as listed) and `end_reason` (why it closed without a sale: `nft_moved`, `nft_burned`, `shop_deleted`, `shop_owner_changed`, `sale_cancelled`, `sale_started_elsewhere`, or null). In `/me/`, each of `selling` has `action: "start_sale"` while `awaiting_sale_start`, and `winning_bid: {amount, address, signature}` once the listing has a winner (`awaiting_sale_start`, `sale_pending` and `sold`; null before): the seller's wallet builds `Sale_Start` from it, and the dry run requires `NextOwner`, `SoldFor` and `BidSignature` to be exactly that bid's. A bid's signature appears nowhere else: no `Listing` or `BidSummary`, and no one else's `/me/`. Each of `buying` is `{listing, my_high_bid, action}` with `action: "complete_purchase"` once the sale is started for that buyer.
 
 ## Listings and bids
 

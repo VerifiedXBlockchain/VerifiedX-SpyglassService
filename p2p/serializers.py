@@ -115,6 +115,20 @@ def bid_json(bid, listing, high):
     }
 
 
+WINNING_BID_STATES = (Listing.State.AWAITING_SALE_START, Listing.State.SALE_PENDING, Listing.State.SOLD)
+
+
+def winning_bid_json(listing):
+    """The winning bid with its signature, which the seller's Sale_Start
+    carries as BidSignature. For the seller's own /me/ only: a bid's
+    signature stays between its bidder and the seller, so no public payload
+    (Listing, BidSummary) has one. Null until the listing has a winner."""
+    bid = listing.winning_bid if listing.state in WINNING_BID_STATES else None
+    if bid is None:
+        return None
+    return {"amount": money(bid.amount), "address": bid.address, "signature": bid.signature}
+
+
 def listing_json(listing, *, with_bids=False):
     bids = list(listing.bids.all())
     high = max(bids, key=lambda b: (b.amount, -b.created_at.timestamp(), -b.pk), default=None)

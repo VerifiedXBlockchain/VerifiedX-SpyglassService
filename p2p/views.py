@@ -301,9 +301,11 @@ class MeView(P2PView):
         selling = []
         for listing in _listing_rows(
             mine.filter(Q(state__in=Listing.ACTIVE_STATES) | Q(closed_at__gte=recent)).order_by("-updated_at", "-id")
-        )[: self.LIMIT]:
+        ).select_related("winning_bid")[: self.LIMIT]:
             body = out.listing_json(listing)
             body["action"] = "start_sale" if listing.state == State.AWAITING_SALE_START else None
+            # Only here, to the seller: Sale_Start carries it as BidSignature.
+            body["winning_bid"] = out.winning_bid_json(listing)
             selling.append(body)
 
         bid_on = Listing.objects.filter(pk__in=Bid.objects.filter(address=me).values("listing_id"))
