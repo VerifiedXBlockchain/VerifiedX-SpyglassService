@@ -1,387 +1,70 @@
-import time
 import json
 import requests
 import pdf2image
 from project.celery import app
 from rbx.exceptions import RBXException
 import logging
-from rbx.client import get_shop, get_shop_data, send_raw_bid, connect_to_shop
 from project.utils.string import get_random_string
 import string
-from .models import Shop, Collection, Listing, Auction, Bid
-from rbx.models import Nft
-from .media import upload_thumbs, scp_down_file, upload_to_s3
+from .models import Shop, Listing, Bid
+from .media import scp_down_file, upload_to_s3
 from django.conf import settings
-from django.utils import timezone
+from django.db import transaction
 from connect.email.tasks import send_build_sale_start_tx_email
-from decimal import Decimal
-import os
 from moviepy.video.io.VideoFileClip import VideoFileClip
 from PIL import Image
 
 
-@app.task(autoretry_for=[RBXException])
-def import_shop(url: str, shop_only: bool = False, data: dict = None):
-    if not data:
-        url = url.strip()
-        if "rbx://" not in url:
-            url = f"rbx://{url}"
+def apply_legacy_shop_record(url: str, data: dict):
+    """The old shop table's row for an indexed DecShopCreate() or
+    DecShopUpdate(), from the transaction's own data: what import_shop did
+    with the data passed in, without the crawl. It keeps /api/shop/ finding
+    shops registered on chain; the P2P registry (p2p app) is what the new
+    API reads. Never raises: it runs inside block sync."""
+    try:
+        with transaction.atomic():
+            _apply_legacy_shop_record(url, data)
+    except Exception:
+        logging.exception(f"Could not mirror shop {url} into the old shop table")
 
-        response = get_shop(url)
 
-        if not response:
-            logging.error(f"Could not get data for shop {url}")
-            return
-
-        if "Success" not in response or response["Success"] != True:
-            logging.error(f"Success was not true. Message: {response['Message']}")
-            return
-
-        if "DecShop" not in response:
-            logging.error("Key 'DecShop' not in response")
-            return
-
-        data = response["DecShop"]
-
+def _apply_legacy_shop_record(url: str, data: dict):
     is_third_party = (
-        "ThirdPartyBaseURL" in data
-        and data["ThirdPartyBaseURL"] is not None
-        and data["ThirdPartyAPIURL"] is not None
-        and data["HostingType"] == 2
+        data.get("ThirdPartyBaseURL") is not None
+        and data.get("ThirdPartyAPIURL") is not None
+        and data.get("HostingType") == 2
     )
 
     if is_third_party:
-
-        try:
-            shop = Shop.objects.get(unique_id=data["UniqueId"])
-        except Shop.DoesNotExist:
-            return
-
-        if not shop.is_third_party:
+        shop = Shop.objects.filter(unique_id=data["UniqueId"]).first()
+        if shop is not None and not shop.is_third_party:
             print("Updating to third party shop and wiping their data.")
             shop.is_third_party = True
             shop.collections.all().update(is_deleted=True)
             for collection in shop.collections.all():
                 collection.listings.all().update(is_deleted=True)
             shop.save()
-            return
-        else:
-            print("Third Party Shop. Skipping")
-            return
+        return
 
-    ip_address = data["IP"]
-
-    try:
-        shop = Shop.objects.get(unique_id=data["UniqueId"], is_third_party=False)
-        logging.info("Shop Unique ID found in database. Updating now.")
-    except Shop.DoesNotExist:
-        logging.info("Shop not found in database. Creating now.")
+    shop = Shop.objects.filter(unique_id=data["UniqueId"], is_third_party=False).first()
+    if shop is None:
         shop = Shop()
-
-        # check to see if there is already a shop with this IP or URL
-
-        try:
-            existing_ip_shop = Shop.objects.filter(
-                ip_address=ip_address, is_third_party=False
-            )
-            logging.info("Shop with the same IP Found. Deleting now.")
-            existing_ip_shop.update(is_deleted=True)
-        except Shop.DoesNotExist:
-            pass
-
-        try:
-            existing_url_shop = Shop.objects.filter(
-                url=data["DecShopURL"], is_third_party=False
-            )
-            logging.info("Shop with the same URL Found. Deleting now.")
-            existing_url_shop.update(is_deleted=True)
-        except Shop.DoesNotExist:
-            pass
+        # Another core shop with the same IP or URL is the old record of this one.
+        if data.get("IP"):
+            Shop.objects.filter(ip_address=data["IP"], is_third_party=False).update(is_deleted=True)
+        Shop.objects.filter(url=data["DecShopURL"], is_third_party=False).update(is_deleted=True)
 
     shop.url = url
-    shop.shop_id = data["Id"]
+    shop.shop_id = data.get("Id") or 0
     shop.unique_id = data["UniqueId"]
     shop.name = data["Name"]
     shop.description = data["Description"]
     shop.owner_address = data["OwnerAddress"]
     shop.is_published = True
-    shop.ip_address = data["IP"]
+    shop.ip_address = data.get("IP")
     shop.is_deleted = False
     shop.offline_at = None
-
     shop.save()
-
-    logging.info("Shop saved")
-
-    if not shop_only:
-        _import_shop_data(data["UniqueId"])
-
-
-def _import_shop_data(shop_unique_id: str, attempt: int = 1):
-
-    if attempt > 15:
-        logging.error("Too many attempts. Stopping.")
-        return
-
-    try:
-        shop = Shop.objects.get(unique_id=shop_unique_id)
-    except Shop.DoesNotExist:
-        logging.info(f"Shop not found with unique_id of {shop_unique_id}.")
-        return
-
-    logging.info("Getting shop data...")
-    data = get_shop_data(shop.url)
-
-    if not data:
-        logging.error("Could not get shop data response")
-        return
-
-    shop.offline_at = None
-    shop.save()
-
-    expected_collection_count = data["DecShop"]["CollectionCount"]
-    expected_listing_count = data["DecShop"]["ListingCount"]
-
-    if "Collections" in data and data["Collections"] is not None:
-
-        # if expected_collection_count > len(data["Collections"]):
-        #     logging.error(
-        #         f"Expected {expected_collection_count} collections but got {len(data['Collections'])}. Waiting 5 seconds."
-        #     )
-        #     if attempt % 5 == 0:
-        #         logging.info("Reconnecting to shop...")
-        #         connect_to_shop(shop.url, force_new_connection=True)
-
-        #     time.sleep(5)
-        #     _import_shop_data(shop_unique_id, attempt + 1)
-        #     return
-
-        collection_ids = []
-        for c in data["Collections"]:
-            collection_ids.append(c["Id"])
-            logging.info(f"Importing collection {c['Id']}...")
-            try:
-                collection = Collection.objects.get(
-                    shop__unique_id=shop_unique_id,
-                    collection_id=c["Id"],
-                    is_deleted=False,
-                )
-            except Collection.DoesNotExist:
-                collection = Collection()
-
-            collection.shop = shop
-            collection.collection_id = c["Id"]
-            collection.name = c["Name"]
-            collection.description = c["Description"]
-            collection.is_deleted = False
-            collection.save()
-
-        # Set hidden collections to deleted
-        shop_collections = Collection.objects.filter(shop=shop)
-        for c in shop_collections:
-            if c.collection_id not in collection_ids:
-                c.is_deleted = True
-                c.save()
-
-    if "Collections" in data and data["Collections"] is None:
-        shop_collections = Collection.objects.filter(shop=shop)
-        shop_collections.update(is_deleted=True)
-
-    if "Listings" in data and data["Listings"] is not None:
-
-        # if expected_listing_count > len(data["Listings"]):
-        #     logging.error(
-        #         f"Expected {expected_listing_count} listings but got {len(data['Listings'])}. Waiting 5 seconds"
-        #     )
-        #     if attempt % 5 == 0:
-        #         logging.info("Reconnecting to shop...")
-        #         connect_to_shop(shop.url, force_new_connection=True)
-
-        #     time.sleep(5)
-        #     _import_shop_data(shop_unique_id, attempt + 1)
-        #     return
-
-        listing_ids = []
-        for l in data["Listings"]:
-            logging.info(f"Importing listing {l['Id']}...")
-            listing_ids.append(l["Id"])
-
-            sc_id = l["SmartContractUID"]
-
-            try:
-                listing = Listing.objects.get(
-                    collection__shop__unique_id=shop_unique_id,
-                    listing_id=l["Id"],
-                    smart_contract_uid=sc_id,
-                    is_deleted=False,
-                )
-            except Listing.DoesNotExist:
-                listing = Listing()
-
-                # remove any listings with the same id but different sc id
-                existing = Listing.objects.filter(
-                    collection__shop__unique_id=shop_unique_id, listing_id=l["Id"]
-                )
-                if existing:
-                    existing.update(is_deleted=True)
-
-            collection_id = l["CollectionId"]
-            try:
-                collection = Collection.objects.get(
-                    shop__unique_id=shop_unique_id, collection_id=collection_id
-                )
-            except Collection.DoesNotExist:
-                logging.error(
-                    f"Collection not found with id of {collection_id} and shop with unique_id of {shop_unique_id}"
-                )
-                continue
-
-            smart_contract_uid = l["SmartContractUID"]
-            try:
-                nft = Nft.objects.get(identifier=smart_contract_uid)
-            except Nft.DoesNotExist:
-                logging.error(f"NFT with sc id of {smart_contract_uid} not found")
-                continue
-
-            listing.collection = collection
-            listing.nft = nft
-            listing.listing_id = l["Id"]
-            listing.smart_contract_uid = l["SmartContractUID"]
-            listing.owner_address = l["AddressOwner"]
-            listing.buy_now_price = (
-                Decimal(l["BuyNowPrice"])
-                if "BuyNowPrice" in l and l["BuyNowPrice"]
-                else None
-            )
-            listing.floor_price = (
-                Decimal(l["FloorPrice"])
-                if "FloorPrice" in l and l["FloorPrice"]
-                else None
-            )
-            listing.reserve_price = (
-                Decimal(l["ReservePrice"])
-                if "ReservePrice" in l and l["ReservePrice"]
-                else None
-            )
-            listing.start_date = l["StartDate"]
-            listing.end_date = l["EndDate"]
-            listing.is_visible_before_start_date = l["IsVisibleBeforeStartDate"]
-            listing.is_visible_after_end_date = l["IsVisibleAfterEndDate"]
-            listing.final_price = l["FinalPrice"]
-            listing.winning_address = l["WinningAddress"]
-            listing.purchase_key = l["PurchaseKey"]
-            listing.is_deleted = False
-            listing.save()
-
-            # TODO: could try and check the nft multiasset stuff to count expected files
-
-            if not listing.thumbnails or len(listing.thumbnails) < 1:
-
-                existing_thumbnails = listing.thumbnails if listing.thumbnails else []
-                logging.info("launching thumbs async tasks (15 sec countdown)")
-
-                upload_thumbs.apply_async(
-                    args=[listing.pk, smart_contract_uid, existing_thumbnails],
-                    countdown=30,
-                )
-
-        # Set hidden listings to deleted
-        shop_listings = Listing.objects.filter(
-            collection__shop__unique_id=shop_unique_id
-        )
-        for l in shop_listings:
-            l.is_deleted = l.listing_id not in listing_ids
-            l.save()
-
-    if "Listings" in data and data["Listings"] is None:
-        shop_listings = Listing.objects.filter(
-            collection__shop__unique_id=shop_unique_id
-        ).update(is_deleted=True)
-
-    if "Auctions" in data and data["Auctions"] is not None:
-        for a in data["Auctions"]:
-            logging.info(f"Importing auction for {a['ListingId']}")
-
-            try:
-                auction = Auction.objects.get(
-                    listing__listing_id=a["ListingId"],
-                    listing__collection__shop__unique_id=shop_unique_id,
-                )
-            except Auction.DoesNotExist:
-                auction = Auction()
-
-            try:
-                listing = Listing.objects.get(
-                    listing_id=a["ListingId"],
-                    collection__shop__unique_id=shop_unique_id,
-                    is_deleted=False,
-                    is_sale_complete=False,
-                )
-            except Listing.DoesNotExist:
-                logging.error(
-                    f"(AUCTIONS) Listing not found with id of {a['ListingId']} and shop with unique_id of {shop_unique_id}"
-                )
-                continue
-
-            if listing.is_auction:
-                auction.auction_id = a["Id"]
-                auction.listing = listing
-                auction.current_bid_price = a["CurrentBidPrice"]
-                auction.is_auction_over = a["IsAuctionOver"]
-                auction.current_winning_address = a["CurrentWinningAddress"]
-                auction.save()
-
-    if "Bids" in data and data["Bids"] is not None:
-        for b in data["Bids"]:
-            logging.info(f"Importing bid for {b['ListingId']}")
-
-            try:
-                bid = Bid.objects.get(
-                    bid_id=b["Id"],
-                    listing__listing_id=b["ListingId"],
-                    listing__collection__shop__unique_id=shop_unique_id,
-                )
-            except Bid.DoesNotExist:
-                bid = Bid()
-
-            try:
-                listing = Listing.objects.get(
-                    listing_id=b["ListingId"],
-                    collection__shop__unique_id=shop_unique_id,
-                )
-            except Listing.DoesNotExist:
-                logging.error(
-                    f"(BIDS) Listing not found with id of {b['ListingId']} and shop with unique_id of {shop_unique_id}"
-                )
-                continue
-
-            bid.bid_id = b["Id"]
-            bid.listing = listing
-            bid.address = b["BidAddress"]
-            bid.signature = b["BidSignature"]
-            bid.amount = b["BidAmount"]
-            bid.is_buy_now = b["IsBuyNow"]
-            bid.purchase_key = b["PurchaseKey"]
-            bid.status = b["BidStatus"]
-            bid.send_receive = b["BidSendReceive"]
-            bid.send_time = b["BidSendTime"]
-            bid.is_processed = b["IsProcessed"]
-            bid.save()
-
-    shop.last_crawled = timezone.now()
-    shop.save()
-
-
-@app.task(autoretry_for=[RBXException])
-def submit_bid(bid_pk: int):
-
-    try:
-        bid = Bid.objects.get(id=bid_pk)
-    except Bid.DoesNotExist:
-        logging.error(f"Bid with pk of {bid_pk} does not exist")
-        return
-
-    send_raw_bid(bid)
 
 
 @app.task(autoretry_for=[RBXException])
@@ -488,60 +171,6 @@ def complete_auction(listing_pk: int) -> bool:
 
     listing.is_sale_complete = True
     listing.save()
-
-
-@app.task(autoretry_for=[RBXException])
-def handle_auction_sale_complete_tx(tx_hash: str, dryrun: bool = False):
-    from rbx.models import Transaction
-    from rbx.client import tx_send
-
-    try:
-        tx = Transaction.objects.get(hash=tx_hash)
-    except Transaction.DoesNotExist:
-        logging.error(f"Auction sale start transaction {tx_hash} is not indexed.")
-        return False
-
-    parsed = json.loads(tx.data)
-    bid_signature = parsed["BidSignature"] if "BidSignature" in parsed else None
-    if not bid_signature:
-        print("No bid signature")
-        return
-
-    try:
-        bid = Bid.objects.get(signature=bid_signature)
-    except Bid.DoesNotExist:
-        print("No bid found with signature")
-        return False
-
-    # if bid.is_buy_now:
-    #     print("is buy now, no need to complete")
-    #     return False
-
-    tx_payload_str = bid.pre_signed_sale_complete_tx
-    if not tx_payload_str:
-        print("no tx payload string")
-        return False
-
-    if dryrun:
-        return True
-
-    tx_payload = json.loads(tx_payload_str)
-
-    response = tx_send(tx_payload)
-
-    if isinstance(response, dict) and response.get("Result") == "Success":
-        return True
-
-    # The node answers a refused transaction with {"Result": "Fail", ...},
-    # which is truthy, so only an explicit "Success" counts as settled.
-    message = response.get("Message") if isinstance(response, dict) else response
-    listing = bid.listing
-    logging.error(
-        f"Auction sale complete TX refused for listing {listing.pk} "
-        f"(listing_id {listing.listing_id}, {listing.smart_contract_uid}), "
-        f"bid {bid.bid_id}: {message}"
-    )
-    return False
 
 
 @app.task(autoretry_for=[RBXException])

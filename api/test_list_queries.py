@@ -27,7 +27,8 @@ from rbx.models import (
     VbtcV2WithdrawalRequest,
 )
 from rbx.tests import add_transfer, add_withdrawal, make_block, make_token
-from shop.models import Collection, Listing, Shop
+from p2p.models import Listing
+from p2p.tests.helpers import make_listing
 
 USER = "RUSER"
 OTHER = "ROTHER"
@@ -66,22 +67,9 @@ def tx(block, tx_hash, tx_type, from_address, to_address, data=None, nft_row=Non
 
 
 def list_nft(nft_row, deleted=False):
-    shop, _ = Shop.objects.get_or_create(
-        shop_id=1, unique_id="u1", name="Shop", url="vfx://shop", description="", owner_address="SELLER"
-    )
-    collection, _ = Collection.objects.get_or_create(shop=shop, collection_id=1, name="C", description="")
-    Listing.objects.create(
-        collection=collection,
-        listing_id=Listing.objects.count() + 1,
-        smart_contract_uid=nft_row.identifier,
-        nft=nft_row,
-        owner_address=nft_row.owner_address,
-        start_date=timezone.now(),
-        end_date=timezone.now(),
-        is_visible_before_start_date=True,
-        is_visible_after_end_date=True,
-        is_deleted=deleted,
-    )
+    """An active P2P listing of the NFT by its owner, or with deleted a
+    cancelled one (which does not list it)."""
+    make_listing(nft_row, state="cancelled" if deleted else "live")
 
 
 @contextmanager

@@ -54,8 +54,8 @@ from rbx.utils import get_ip_location, network_metrics
 from dateutil import parser
 from django.conf import settings
 from connect.email.tasks import send_sale_started_email
-from shop.tasks import handle_auction_sale_complete_tx
-from shop.models import Listing
+from p2p import indexer as p2p_indexer
+from shop.models import Listing as LegacyListing
 
 
 @app.task(autoretry_for=[RBXException])
@@ -1010,14 +1010,12 @@ def process_transaction(tx: Transaction):
         identifier = parsed["ContractUID"]
         func = parsed["Function"]
 
+        # The P2P registry's sale state, for all five functions. It never
+        # raises and never calls a node.
+        p2p_indexer.index_nft_sale(tx)
+
         if func == "Sale_Start()":
-            can_complete = handle_auction_sale_complete_tx(tx.hash, True)
-            if can_complete:
-                _enqueue_on_commit(
-                    handle_auction_sale_complete_tx, tx.hash, False, countdown=60
-                )
-            else:
-                _enqueue_on_commit(send_sale_started_email, tx.hash)
+            _enqueue_on_commit(send_sale_started_email, tx.hash)
 
         if func == "Sale_Complete()":
             sub_transactions = parsed["Transactions"]
@@ -1040,17 +1038,12 @@ def process_transaction(tx: Transaction):
 
                 nft.save()
 
-                try:
-                    listing = Listing.objects.get(
-                        smart_contract_uid=identifier, owner_address=tx.to_address
-                    )
-                    listing.is_sale_complete = True
-                    listing.save()
-                except Listing.DoesNotExist:
-                    logging.error(
-                        f"Listing with identifier {identifier} and owner of {tx.to_address} not found."
-                    )
-                    return
+                # The old shop's listings of this NFT by the seller. An
+                # update, not .get(): the seller may have listed it twice,
+                # and nothing here may raise inside block sync.
+                LegacyListing.objects.filter(
+                    smart_contract_uid=identifier, owner_address=tx.to_address
+                ).update(is_sale_complete=True)
 
     elif tx.type == Transaction.Type.NFT_BURN:
         logging.info(f"NFT Burn: {tx.hash}")
@@ -1463,8 +1456,9 @@ def process_adnr(tx):
 
 
 def process_shop(tx):
-    from shop.tasks import import_shop
-    from shop.models import Shop
+    """A DSTR transaction: the P2P shop registry, and the old shop table's
+    row for the clients that still read /api/shop/. Neither calls a node."""
+    from shop.tasks import apply_legacy_shop_record
 
     if tx.type != Transaction.Type.DST_REGISTRATION:
         print("Not a DST TX")
@@ -1472,29 +1466,22 @@ def process_shop(tx):
 
     logging.info("Dec Shop TX")
 
+    p2p_indexer.index_dstr(tx)
+
     parsed = json.loads(tx.data)
     func = parsed["Function"]
 
     if func in ["DecShopCreate()", "DecShopUpdate()"]:
         dec_shop = parsed["DecShop"]
-        url = dec_shop["DecShopURL"]
-
-        # Post-commit and off this worker: the shop import crawls the shop
-        # over the network with retries/sleeps, which must not run inside
-        # the block's DB transaction holding row locks for the duration.
-        _enqueue_on_commit(import_shop, url, func == "DecShopCreate()", dec_shop)
+        apply_legacy_shop_record(dec_shop["DecShopURL"], dec_shop)
 
     elif func == "DecShopDelete()":
+        from shop.models import Shop
+
         unique_id = parsed["UniqueId"]
-
-        try:
-            shop = Shop.objects.get(unique_id=unique_id)
-        except Shop.DoesNotExist:
+        updated = Shop.objects.filter(unique_id=unique_id).update(is_deleted=True)
+        if not updated:
             logging.error(f"Could not find shop with unique id of {unique_id}")
-            return
-
-        shop.is_deleted = True
-        shop.save()
 
 
 @app.task(autoretry_for=[RBXException])

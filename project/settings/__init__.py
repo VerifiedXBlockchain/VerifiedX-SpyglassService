@@ -18,6 +18,7 @@ from .i18n import *
 from .logging import *
 from .middleware import *
 from .moonpay import *
+from .p2p import *
 from .rbx import *
 from .security import *
 from .session import *
