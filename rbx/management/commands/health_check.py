@@ -2,6 +2,7 @@ import logging
 from datetime import datetime, timedelta
 
 from django.db.models import Q, Sum
+from django.core.cache import cache
 from django.core.management.base import BaseCommand
 from django.utils import timezone
 from rbx.models import Transaction, VbtcV2WithdrawalRequest
@@ -17,6 +18,9 @@ python manage.py health_check
 
 THRESHOLD_SECONDS = 250
 STALE_WITHDRAWAL_HOURS = 24
+# One Sentry event per stuck withdrawal per day. This command runs every
+# 3 minutes, and one withdrawal stuck since July produced 87K identical events.
+STALE_WITHDRAWAL_ALERT_TTL = 24 * 60 * 60
 ALERT_NUMBERS = [
     "+14169974264",
     "+19729982871",
@@ -60,7 +64,7 @@ class Command(BaseCommand):
 
         # Isolated from the node check above: a DB hiccup here must not
         # page "Explorer Wallet is Unreachable". Alerts via Sentry
-        # (logging.error), not SMS — this runs every 3 minutes undeduped.
+        # (logging.error), not SMS, once per withdrawal per day.
         try:
             self.check_stale_withdrawals()
         except Exception:
@@ -74,12 +78,31 @@ class Command(BaseCommand):
         ).select_related("token")
 
         for withdrawal in stale:
+            if not self.first_report_today(withdrawal.pk):
+                continue
             logging.error(
                 f"vBTC v2 withdrawal {withdrawal.pk} on token "
                 f"{withdrawal.token.sc_identifier} stuck in 'requested' since "
                 f"{withdrawal.created_at:%Y-%m-%d %H:%M} "
                 f"({withdrawal.amount} BTC to {withdrawal.btc_address})"
             )
+
+    @staticmethod
+    def first_report_today(withdrawal_pk):
+        """True the first time a withdrawal is seen stuck each day.
+
+        cache.add only succeeds when the key is absent. If the cache itself is
+        down, report anyway: a Redis outage must not hide a stuck withdrawal.
+        """
+        alert_key = f"health_check:stale_withdrawal:{withdrawal_pk}"
+        try:
+            return cache.add(alert_key, 1, STALE_WITHDRAWAL_ALERT_TTL)
+        except Exception:
+            logging.warning(
+                "health_check: alert cache unavailable, reporting without dedupe",
+                exc_info=True,
+            )
+            return True
 
     def handle_problem(self, height, delta):
         print(f"PROBLEM. Last block is {height}")
