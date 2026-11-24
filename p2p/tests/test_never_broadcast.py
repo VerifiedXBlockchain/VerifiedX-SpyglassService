@@ -189,7 +189,7 @@ class NeverBroadcastTests(P2PTestCase):
     def test_the_guard_trips(self):
         """The tripwires work: a send through the client is caught."""
         with self.guarded(), self.assertRaises(NodeCallMade):
-            node_client.tx_send({"Hash": "x"})
+            node_client.tx_send('{"Hash": "x"}')
         with self.guarded(), self.assertRaises(NodeCallMade):
             import requests
 
