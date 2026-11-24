@@ -291,7 +291,9 @@ def _reopen_withdrawals(fork, hashes):
     )
     requests = VbtcV2WithdrawalRequest.objects.filter(request_transaction__block_id__lte=fork).filter(changed)
     tokens = set()
-    for request in requests.select_related("token"):
+    # Locked: the signing endpoint writes signed_at on these rows, and the
+    # reopened status is chosen from it.
+    for request in requests.select_for_update(of=("self",)).select_related("token"):
         completed = request.completion_transaction_id is not None and request.completion_transaction_id not in hashes
         cancelled = request.cancel_transaction_id is not None and request.cancel_transaction_id not in hashes
         if not completed:
