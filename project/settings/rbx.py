@@ -52,6 +52,10 @@ RBX_WEB_BASE_URL = ENV.str("RBX_WEB_BASE_URL")
 # variable name as the node farm so one webhook can serve every repo.
 DISCORD_ALERT_WEBHOOK_URL = ENV.str("DISCORD_ALERT_WEBHOOK_URL", default="")
 
+# The most blocks sync_blocks removes to follow a node whose chain was rewound
+# (rbx/chain_rewind.py). A deeper fork stops the sync and posts an alert.
+CHAIN_REWIND_MAX_DEPTH = ENV.int("CHAIN_REWIND_MAX_DEPTH", default=2000)
+
 
 with open(RBX_WALLET_SSH_KEY_PATH, "w+") as file:
     file.write(base64.b64decode(ENV.str("RBX_WALLET_SSH_KEY_B64")).decode("utf-8"))

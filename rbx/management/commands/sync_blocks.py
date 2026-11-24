@@ -7,7 +7,7 @@ from django.core.management.base import BaseCommand
 from rbx.client import get_block
 from rbx.tasks import sync_block
 from rbx.utils import get_local_max_height, get_remote_max_height
-from rbx import balance_cache
+from rbx import balance_cache, chain_rewind
 from rbx.models import Block, Callback, Recovery
 
 # Modest concurrency so a bulk catch-up doesn't hammer the CLI.
@@ -41,6 +41,11 @@ class Command(BaseCommand):
 
         local_max_height = get_local_max_height()
         remote_max_height = get_remote_max_height()
+
+        if not sync_all:
+            # The node's chain may have been rewound under the stored blocks:
+            # roll the index back to where the two agree before going on.
+            local_max_height = chain_rewind.follow_node(local_max_height, remote_max_height)
 
         start_height = (
             0 if sync_all or local_max_height is None else local_max_height + 1
