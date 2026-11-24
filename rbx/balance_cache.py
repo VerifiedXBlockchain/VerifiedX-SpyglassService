@@ -195,6 +195,18 @@ def invalidated_through():
         return None
 
 
+def reset_after_rewind():
+    """After blocks were removed (rbx.chain_rewind): drop every cached
+    balance and forget the marker, which names a height whose block is gone.
+    The next synced block starts the marker again (mark_invalidated_through
+    drops the cache once more when it finds none)."""
+    invalidate_all()
+    try:
+        cache.delete(INVALIDATED_THROUGH_KEY)
+    except Exception:
+        logging.exception("Clearing the balance invalidation marker failed")
+
+
 def invalidate_all():
     """Drop every cached balance (a new epoch). True when it was written."""
     try:
