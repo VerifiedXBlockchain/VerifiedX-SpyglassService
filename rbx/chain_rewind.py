@@ -30,7 +30,9 @@ What a rollback undoes, in one database transaction:
 - the voided flag of earlier sends that an abandoned CallBack() or Recover()
   voided, and the refusal of reserve vBTC sends that fell due in an
   abandoned block;
-- a vBTC V2 contract's pending owner set by an abandoned transfer;
+- a vBTC V2 contract's pending owner set by an abandoned transfer, and the
+  completion, cancel or approving vote an abandoned block gave an earlier
+  withdrawal request (the request is open again);
 - the validators' block counts, the forged-VFX burn if its block is gone,
   and the vBTC rewind mark;
 - Address.balance of every address an abandoned transaction touched,
@@ -211,6 +213,10 @@ def rollback_to(fork):
                 from_recovery=True, transaction_id__in=list(outstanding), from_address=new_address
             ).exclude(transaction_id__in=hashes).delete()
 
+        # Before the blocks go: a request's completion and cancel links
+        # cascade, and would take an older request with them.
+        _reopen_withdrawals(fork, hashes)
+
         VbtcV2Token.objects.filter(pending_owner_transaction_id__in=hashes).update(
             pending_owner_address=None, pending_owner_transaction=None
         )
@@ -266,6 +272,61 @@ def rollback_to(fork):
             logging.exception(f"Reading the watched vaults' backing after the rollback to block {fork} failed")
 
     return {"fork": fork, "blocks": removed, "transactions": len(hashes), "types": doomed_types}
+
+
+def _reopen_withdrawals(fork, hashes):
+    """A request made at or below the fork that an abandoned block completed,
+    cancelled or voted closed: those steps are undone and it is open again
+    (CANCELLATION_REQUESTED when its cancel request remains). The watched
+    vaults' requests are then read from the node again (rollback_to)."""
+    fork_time = Block.objects.filter(height=fork).values_list("date_crafted", flat=True).first()
+    if fork_time is None:
+        return
+    Status = VbtcV2WithdrawalRequest.Status
+    changed = (
+        Q(completion_transaction_id__in=hashes)
+        | Q(cancel_transaction_id__in=hashes)
+        | Q(completed_at__gt=fork_time)
+        | Q(cancelled_at__gt=fork_time)
+    )
+    requests = VbtcV2WithdrawalRequest.objects.filter(request_transaction__block_id__lte=fork).filter(changed)
+    tokens = set()
+    for request in requests.select_related("token"):
+        completed = request.completion_transaction_id is not None and request.completion_transaction_id not in hashes
+        cancelled = request.cancel_transaction_id is not None and request.cancel_transaction_id not in hashes
+        if not completed:
+            request.completion_transaction = None
+            request.btc_transaction_hash = ""
+            request.completed_at = None
+        if not cancelled:
+            request.cancel_transaction = None
+        if request.cancelled_at is not None and (not cancelled or request.cancelled_at > fork_time):
+            request.cancelled_at = None
+            request.refunded_amount = None
+            request.closed_because = ""
+        if completed:
+            request.status = Status.COMPLETED
+        elif request.cancelled_at is not None:
+            request.status = Status.CANCELLED
+        elif cancelled:
+            request.status = Status.CANCELLATION_REQUESTED
+        else:
+            request.status = Status.PENDING_BTC if request.signed_at else Status.REQUESTED
+        request.save(
+            update_fields=[
+                "completion_transaction",
+                "cancel_transaction",
+                "btc_transaction_hash",
+                "completed_at",
+                "cancelled_at",
+                "refunded_amount",
+                "closed_because",
+                "status",
+            ]
+        )
+        tokens.add(request.token)
+    for token in tokens:
+        token.recompute_pending_withdrawal(current_height=fork)
 
 
 def _still_voided(tx):

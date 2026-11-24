@@ -13,8 +13,8 @@ from django.test import TestCase, override_settings
 from django.utils import timezone
 
 from rbx import chain_rewind
-from rbx.models import Address, Block, Callback, MasterNode, Nft, Transaction, VbtcV2Token
-from rbx.tests import make_block, make_token, make_tx
+from rbx.models import Address, Block, Callback, MasterNode, Nft, Transaction, VbtcV2Token, VbtcV2WithdrawalRequest
+from rbx.tests import add_withdrawal, make_block, make_token, make_tx
 
 BASE_TIME = 1700000000
 
@@ -283,3 +283,45 @@ class RollbackTests(TestCase):
         validator.refresh_from_db()
         self.assertEqual(validator.block_count, 2)
         reconcile.assert_called_once_with(after_rewind=True)
+
+    def test_an_older_withdrawal_closed_in_an_abandoned_block_is_open_again(self):
+        kept = make_block(1)
+        gone = make_block(2)
+        Block.objects.filter(height=1).update(date_crafted=gone.date_crafted - timedelta(seconds=10))
+        Status = VbtcV2WithdrawalRequest.Status
+        vault = make_token(owner="xOWNER", sc_identifier="sc:vault")
+
+        completed = add_withdrawal(
+            vault, make_tx(kept, "req-1", Transaction.Type.VBTC_V2_WITHDRAWAL_REQUEST), "xOWNER", "0.1", Status.COMPLETED
+        )
+        completed.completion_transaction = make_tx(gone, "done-1", Transaction.Type.VBTC_V2_WITHDRAWAL_COMPLETE)
+        completed.btc_transaction_hash = "btc-1"
+        completed.completed_at = gone.date_crafted
+        completed.save()
+
+        # Cancel requested before the fork, approved by a vote after it.
+        voted = add_withdrawal(
+            vault, make_tx(kept, "req-2", Transaction.Type.VBTC_V2_WITHDRAWAL_REQUEST), "xOWNER", "0.2", Status.CANCELLED
+        )
+        voted.cancel_transaction = make_tx(kept, "cancel-2", Transaction.Type.VBTC_V2_WITHDRAWAL_CANCEL)
+        voted.cancelled_at = gone.date_crafted
+        voted.closed_because = "Cancelled"
+        voted.save()
+
+        with patch("rbx.chain_rewind.vbtc_dispatch.reconcile_all_watched_vaults"), patch(
+            "rbx.chain_rewind.vbtc_dispatch.refresh_all_watched_backings"
+        ):
+            chain_rewind.rollback_to(1)
+
+        completed.refresh_from_db()
+        self.assertEqual(completed.status, Status.REQUESTED)
+        self.assertIsNone(completed.completion_transaction_id)
+        self.assertIsNone(completed.completed_at)
+        self.assertEqual(completed.btc_transaction_hash, "")
+        voted.refresh_from_db()
+        self.assertEqual(voted.status, Status.CANCELLATION_REQUESTED)
+        self.assertEqual(voted.cancel_transaction_id, "cancel-2")
+        self.assertIsNone(voted.cancelled_at)
+        self.assertEqual(voted.closed_because, "")
+        vault.refresh_from_db()
+        self.assertTrue(vault.is_pending_withdrawal)
