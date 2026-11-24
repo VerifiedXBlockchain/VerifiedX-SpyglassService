@@ -1,37 +1,83 @@
 import requests
 from rest_framework.generics import GenericAPIView
+from rest_framework.parsers import JSONParser
 from rest_framework.response import Response
 from rest_framework import status
+from rest_framework.settings import api_settings
 from typing import Tuple
 
 import rbx.client as client
+from api.raw.parsers import JSON_TEXT, TextKeepingJSONParser
 from api.raw.serializers import RawTransactionSerializer
+from rbx.raw_json import member_spans
 from project.utils.safe_fetch import FetchFailed, UnsafeUrl
 from rbx.exceptions import RBXException, UnsafeAssetFileName
 from shop.tasks import remote_nft_media_to_urls
 
 
-class TransactionView(GenericAPIView):
-    serializer_class = RawTransactionSerializer
+def _is_number(value) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
 
-    def process(self, transaction) -> Tuple[dict, int]:
+
+class TransactionView(GenericAPIView):
+    """Hands the node the request's `transaction` as the client wrote it.
+
+    The serializer validates a parsed copy; the forwarded text is cut out of
+    the request body, so numbers, key order, spacing and escapes (in Data
+    too) reach the node unchanged.
+    """
+
+    serializer_class = RawTransactionSerializer
+    parser_classes = [
+        TextKeepingJSONParser if parser is JSONParser else parser
+        for parser in api_settings.DEFAULT_PARSER_CLASSES
+    ]
+    # The hash, verify and send routes refuse a transaction that is not an
+    # object with a numeric Amount (and Fee, when present) with the 500 body
+    # api.exceptions has always answered it with.
+    requires_numeric_amount = True
+
+    def process(self, transaction: str) -> Tuple[dict, int]:
         raise NotImplemented()
 
     def post(self, request, *args, **kwargs):
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        transaction = serializer.validated_data.get("transaction")
-        data = self.process(transaction)
+        if self.requires_numeric_amount and not self._has_numeric_amount(
+            serializer.validated_data.get("transaction")
+        ):
+            return Response({"detail": "Server error"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+        data = self.process(self._transaction_text(request))
         if not data:
             return Response({}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
         return Response(data, status=status.HTTP_200_OK)
+
+    @staticmethod
+    def _has_numeric_amount(transaction) -> bool:
+        return (
+            isinstance(transaction, dict)
+            and _is_number(transaction.get("Amount"))
+            and ("Fee" not in transaction or _is_number(transaction["Fee"]))
+        )
+
+    @staticmethod
+    def _transaction_text(request) -> str:
+        json_text = request.parser_context.get(JSON_TEXT)
+        if json_text is None:
+            # A form post carries the transaction as a JSON string field.
+            return request.data["transaction"]
+        start, end = member_spans(json_text)["transaction"]
+        return json_text[start:end]
 
     class Meta:
         abstract = True
 
 
 class RetrieveTransactionFeeView(TransactionView):
+    requires_numeric_amount = False
+
     def process(self, transaction) -> Tuple[dict, int]:
         return client.tx_get_fee(transaction)
 

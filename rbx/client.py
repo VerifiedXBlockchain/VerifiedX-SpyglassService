@@ -1,4 +1,5 @@
 import json
+import re
 import threading
 import time
 import unicodedata
@@ -14,6 +15,7 @@ from django.utils import timezone
 from project.utils.url import join_url
 from rbx.exceptions import RBXException, UnsafeAssetFileName
 from rbx.models import Nft
+from rbx.raw_json import member_spans
 import logging
 from shop.media import scp_up_url
 
@@ -100,23 +102,33 @@ def _get_session() -> requests.Session:
     return session
 
 
-def _fix_amount(amount):
-    if amount == 0:
-        return 0.0
-
-    return amount * 1.0
+_WHOLE_NUMBER = re.compile(r"-?\d+")
 
 
-def _fix_decimals(transaction: dict) -> dict:
-    """Write Amount and Fee as floats so a whole number keeps a decimal point.
+def _with_decimal_points(transaction: str) -> str:
+    """Give a whole-number Amount or Fee a decimal point; change nothing else.
 
-    The wallet's JSON arrives through DRF, which keeps 1 as an integer, and
-    the CLI refuses a non-zero Fee written without decimal places (NEW-23).
+    The CLI refuses a non-zero Fee written without decimal places (NEW-23),
+    and a JavaScript wallet writes 1.0 as 1. Only those two top-level numbers
+    change, "1" becoming "1.0" (what the proxy has always sent for them);
+    every other byte, Data included, reaches the node as the client sent it.
     """
-    transaction["Amount"] = _fix_amount(transaction["Amount"])
-    if "Fee" in transaction:
-        transaction["Fee"] = _fix_amount(transaction["Fee"])
+    spans = member_spans(transaction)
+    # Right to left, so an insertion does not move the span still to edit.
+    for start, end in sorted((spans[name] for name in ("Amount", "Fee") if name in spans), reverse=True):
+        if _WHOLE_NUMBER.fullmatch(transaction, start, end):
+            transaction = f"{transaction[:end]}.0{transaction[end:]}"
     return transaction
+
+
+def _post_transaction(url: str, transaction: str, timeout) -> requests.Response:
+    """POST the transaction's JSON text to the node as the body, byte for byte."""
+    return _http.post(
+        url,
+        data=transaction.encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        timeout=timeout,
+    )
 
 
 def get_status() -> str:
@@ -184,10 +196,11 @@ def get_block(height: int) -> Optional[dict]:
         return None
 
 
-def tx_get_fee(transaction: dict, *args) -> Tuple[dict, int]:
+def tx_get_fee(transaction: str, *args) -> Tuple[dict, int]:
+    """`transaction` is the transaction's JSON text, forwarded unchanged."""
     url = join_url(BASE_URL, "txapi/txV1/GetRawTxFee")
 
-    response = _http.post(url, json=transaction, timeout=RAW_TX_TIMEOUT)
+    response = _post_transaction(url, transaction, RAW_TX_TIMEOUT)
     if response.status_code != 200:
         raise RBXException
 
@@ -197,11 +210,11 @@ def tx_get_fee(transaction: dict, *args) -> Tuple[dict, int]:
         return None
 
 
-def tx_get_hash(transaction: dict) -> Tuple[dict, int]:
+def tx_get_hash(transaction: str) -> Tuple[dict, int]:
+    """`transaction` is the transaction's JSON text (see _with_decimal_points)."""
     url = join_url(BASE_URL, "txapi/txV1/GetTxHash")
-    data = _fix_decimals(transaction)
 
-    response = _http.post(url, json=data, timeout=RAW_TX_TIMEOUT)
+    response = _post_transaction(url, _with_decimal_points(transaction), RAW_TX_TIMEOUT)
     if response.status_code != 200:
         raise RBXException
 
@@ -211,12 +224,11 @@ def tx_get_hash(transaction: dict) -> Tuple[dict, int]:
         return None
 
 
-def tx_verify(transaction: dict) -> Tuple[dict, int]:
+def tx_verify(transaction: str) -> Tuple[dict, int]:
+    """`transaction` is the transaction's JSON text (see _with_decimal_points)."""
     url = join_url(BASE_URL, "txapi/txV1/VerifyRawTransaction")
 
-    data = _fix_decimals(transaction)
-
-    response = _http.post(url, json=data, timeout=RAW_TX_SEND_TIMEOUT)
+    response = _post_transaction(url, _with_decimal_points(transaction), RAW_TX_SEND_TIMEOUT)
     if response.status_code != 200:
         raise RBXException
 
@@ -226,12 +238,11 @@ def tx_verify(transaction: dict) -> Tuple[dict, int]:
         return None
 
 
-def tx_send(transaction: dict) -> Tuple[dict, int]:
+def tx_send(transaction: str) -> Tuple[dict, int]:
+    """`transaction` is the transaction's JSON text (see _with_decimal_points)."""
     url = join_url(BASE_URL, "txapi/txV1/SendRawTransaction")
 
-    data = _fix_decimals(transaction)
-
-    response = _http.post(url, json=data, timeout=RAW_TX_SEND_TIMEOUT)
+    response = _post_transaction(url, _with_decimal_points(transaction), RAW_TX_SEND_TIMEOUT)
 
     if response.status_code != 200:
         raise RBXException
