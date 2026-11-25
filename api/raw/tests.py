@@ -4,6 +4,7 @@ from unittest.mock import MagicMock, patch
 import requests
 from django.test import Client, TestCase
 
+from api.raw.views import TransactionView
 from rbx import client
 
 
@@ -156,7 +157,7 @@ class RawTransactionForwardedVerbatimTests(TestCase):
             for body in bodies:
                 with self.subTest(url=url, body=body):
                     response, post = self._forward(url, body)
-                    self.assertEqual((response.status_code, response.json()), (500, {"detail": "Server error"}))
+                    self.assertEqual((response.status_code, response.json()), (400, {"detail": TransactionView.numeric_amount_detail}))
                     post.assert_not_called()
 
     def test_the_fee_route_forwards_without_an_amount_as_before(self):
