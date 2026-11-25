@@ -33,9 +33,11 @@ class TransactionView(GenericAPIView):
         for parser in api_settings.DEFAULT_PARSER_CLASSES
     ]
     # The hash, verify and send routes refuse a transaction that is not an
-    # object with a numeric Amount (and Fee, when present) with the 500 body
-    # api.exceptions has always answered it with.
+    # object with a numeric Amount (and Fee, when present). It is the client's
+    # input that is wrong, so the answer is a 400 that says so, not the 500
+    # these routes gave before (a 500 reads as "try again" to the SDK).
     requires_numeric_amount = True
+    numeric_amount_detail = "transaction must be a JSON object whose Amount (and Fee, when present) are JSON numbers"
 
     def process(self, transaction: str) -> Tuple[dict, int]:
         raise NotImplemented()
@@ -46,7 +48,7 @@ class TransactionView(GenericAPIView):
         if self.requires_numeric_amount and not self._has_numeric_amount(
             serializer.validated_data.get("transaction")
         ):
-            return Response({"detail": "Server error"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            return Response({"detail": self.numeric_amount_detail}, status=status.HTTP_400_BAD_REQUEST)
 
         data = self.process(self._transaction_text(request))
         if not data:
